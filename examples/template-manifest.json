@@ -1,0 +1,23 @@
+{
+  "threshold": 0.83,
+  "regions": {
+    "home": {"capture": "home.png", "box": [1139, 633, 1260, 682]},
+    "live_menu": {"capture": "live_menu.png", "box": [637, 175, 814, 322]},
+    "song_select": {"capture": "song_select.png", "box": [934, 560, 1087, 625]},
+    "prepare": {"capture": "prepare.png", "box": [45, 135, 300, 172]},
+    "playing": {"capture": "playfield.png", "box": [1194, 16, 1252, 73]},
+    "live_clear": {"capture": "live_clear.png", "box": [137, 280, 970, 395]},
+    "master_selected": {"capture": "song_select.png", "box": [1138, 538, 1211, 557]},
+    "auto_on": {"capture": "prepare.png", "box": [518, 643, 629, 693]},
+    "auto_off": {"capture": "prepare_off.png", "box": [518, 643, 629, 693]},
+    "recovery_dialog": {"capture": "recovery_popup_1.png", "box": [680, 27, 963, 63]},
+    "recovery_item_tab": {"capture": "recovery_popup_1.png", "box": [360, 87, 560, 121]},
+    "recovery_small_row": {"capture": "recovery_popup_1.png", "box": [420, 179, 731, 223]},
+    "recovery_large_row": {"capture": "recovery_popup_1.png", "box": [420, 314, 731, 359]},
+    "recovery_small_zero": {"capture": "recovery_popup_1.png", "box": [838, 222, 932, 274]},
+    "recovery_large_zero": {"capture": "recovery_popup_1.png", "box": [838, 359, 932, 414]},
+    "recovery_small_selected": {"capture": "recovery_small_preview.png", "box": [838, 222, 932, 274]},
+    "recovery_large_selected": {"capture": "recovery_large_preview.png", "box": [838, 359, 932, 414]},
+    "recovery_confirm_enabled": {"capture": "recovery_small_preview.png", "box": [658, 634, 862, 679]}
+  }
+}

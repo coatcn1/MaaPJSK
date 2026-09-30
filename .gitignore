@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.local/
+*.pyc
+*.log
+*.png
+*.jpg
+*.mp4
+*.sus
+charts/private/

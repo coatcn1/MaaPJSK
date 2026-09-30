@@ -1,0 +1,53 @@
+{
+  "AutoLive": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "next": ["AutoLiveRecoveryModeConfig"]
+  },
+  "AutoLiveRecoveryModeConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiRecoveryModeConfig",
+    "custom_action_param": {"mode": "off"},
+    "next": ["AutoLiveRecoveryLimitConfig"]
+  },
+  "AutoLiveRecoveryLimitConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiRecoveryLimitConfig",
+    "custom_action_param": {"limit": 1},
+    "next": ["AutoLiveSongModeConfig"]
+  },
+  "AutoLiveSongModeConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSongModeConfig",
+    "custom_action_param": {"mode": "current"},
+    "next": ["AutoLiveRun"]
+  },
+  "AutoLiveRun": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiAutoLive",
+    "custom_action_param": {"count": 1},
+    "focus": {
+      "Node.Action.Starting": {
+        "content": "正在通过 MFA 连接的设备开始自动演出",
+        "display": ["log"]
+      },
+      "Node.Action.Succeeded": {
+        "content": "自动演出任务完成",
+        "display": ["log", "toast"]
+      },
+      "Node.Action.Failed": {
+        "content": "自动演出中止",
+        "display": ["log", "toast"]
+      }
+    }
+  },
+  "AutoLiveLog": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "post_delay": 0
+  }
+}
