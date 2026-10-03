@@ -105,3 +105,5 @@ python scripts/test_solo_live.py --difficulty easy --count 1 --bonus-consumption
 18:29 的完整部署版验收采用 MFA 保存的 MuMu extras、默认输入方式及完整 MaaAgentBinary，0 体力、NORMAL、触控偏移 +30 ms、自动用药关闭。点击开始后 12.966 秒匹配开场身份，四帧首音轨迹建立透视锚点；2413 个动作全部派发并确认触点释放。实际 LIVE CLEAR，243 PERFECT / 33 GREAT / 105 GOOD / 0 BAD / 0 MISS，总数 381 与元数据一致，PERFECT 占比 63.78%，命中率 100%，JSON 与 CSV 已记录，完成 1/1 并返回主页。派发延迟 95 分位约 1.36 ms，最大 7.70 ms；这些是调度数据，不代表游戏判定偏差。连续等待与完整流程通过，精度校准仍需完善。零体力验收后恢复测试前的 5 体力设置，未使用饮料。
 
 晚间 Native MASTER、每局 5 体力测试采用手动 −51 ms：排练 928 PERFECT / 2 GREAT / 零 GOOD、BAD、MISS；正式验证 929 PERFECT / 0 GREAT / 1 MISS。用户接受当前精度，部署为手动偏移模式；正式验证含 MISS，自动校准配置未启用。生命零后的暂停、退出和返回主页已用独立 0 体力故障场景实测；完整记录见 [Native 与校准](native-calibration.md)。
+
+2026-10-04 00:36 的用户运行记录确认 163「the EmpErroR」MASTER Lv.36 完整完成：Native 手动 −51 ms，1591 PERFECT / 2 GREAT / 零 GOOD、BAD、MISS，满连 1593；4575 个动作全部执行、零断粮、本轮释放及回主页确认。开场采用同步版本 3 的五帧拟合，三帧短窗口分支仍需单独实机验证。该局为正常单人任务，没有改变自动校准门槛或启用校准配置。
