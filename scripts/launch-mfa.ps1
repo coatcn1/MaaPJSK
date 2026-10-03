@@ -2,12 +2,13 @@
     [string]$RuntimeSource,
     [string]$Python,
     [switch]$StageOnly,
+    [switch]$VerifyAdbEndpoint,
     [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
 if ($Help) {
-    Write-Host 'maapjsk [-RuntimeSource <MFA目录>] [-Python <python.exe>] [-StageOnly]'
+    Write-Host 'powershell -NoProfile -ExecutionPolicy Bypass -File "<项目目录>\scripts\launch-mfa.ps1" [-VerifyAdbEndpoint] [-RuntimeSource <MFA目录>] [-Python <python.exe>] [-StageOnly]'
     return
 }
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -101,6 +102,39 @@ if (Test-Path -LiteralPath $compactLibrary -PathType Leaf) {
 }
 
 Write-Host "MaaPJSK MFA 已部署：$targetRoot"
+if ($VerifyAdbEndpoint) {
+    # 检查最后使用实例保存的端点，不自动替换设备，也不发送游戏输入。
+    $instanceId = $settings.'Instances.LastActive'
+    if (-not $instanceId) { $instanceId = 'default' }
+    if ($instanceId -notmatch '^[A-Za-z0-9_-]+$') { throw 'MFA 已保存实例 ID 无效，请在界面重新选择实例。' }
+    $instancePath = Join-Path $targetRoot "config\instances\$instanceId.json"
+    $savedDevice = $null
+    if (Test-Path -LiteralPath $instancePath) {
+        $instance = Get-Content -LiteralPath $instancePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $savedDevice = $instance.AdbDevice
+    }
+    if ($savedDevice -and $savedDevice.AdbPath -and $savedDevice.AdbSerial) {
+        $adbPath = [string]$savedDevice.AdbPath
+        if (-not (Test-Path -LiteralPath $adbPath -PathType Leaf)) {
+            Write-Warning '保存的 ADB 程序不存在，启动后请在 MFA 中刷新并重新选择模拟器。'
+        } else {
+            # 尚未连接的 TCP 设备不会出现在 ADB 列表中；诊断失败不能阻止 MFA 自己建立连接。
+            $savedErrorPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $endpointState = & $adbPath -s ([string]$savedDevice.AdbSerial) get-state 2>&1
+                $endpointExitCode = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $savedErrorPreference }
+            if ($endpointExitCode -ne 0 -or ($endpointState -join "`n").Trim() -ne 'device') {
+                Write-Warning '保存的 ADB 端点尚不可用，启动后请在 MFA 中刷新或重新连接 MuMu。'
+            } else {
+                Write-Host '已保存 ADB 端点检查通过。'
+            }
+        }
+    } else {
+        Write-Host '尚未保存 ADB 端点，请在 MFA 窗口中选择模拟器。'
+    }
+}
 if ($StageOnly) { return }
 
 $env:PATH = "$(Split-Path -Parent $Python);$env:PATH"

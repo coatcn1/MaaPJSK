@@ -38,20 +38,15 @@ powershell -ExecutionPolicy Bypass -File scripts/launch-mfa.ps1 -RuntimeSource "
 
 ## 在任意目录启动
 
-在项目目录安装一次命令入口（只写入当前用户 PATH，无需管理员权限）：
+直接使用脚本的完整路径，无需安装命令入口或修改 PATH、PowerShell Profile：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-launcher.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "<项目完整路径>\scripts\launch-mfa.ps1" -VerifyAdbEndpoint
 ```
 
-新开 PowerShell 或 CMD 窗口后，在任意目录输入：
+`-VerifyAdbEndpoint` 在启动前只读检查最后使用实例保存的 ADB 端点是否处于 `device` 状态；首次使用尚未保存设备时，进入 MFA 后选择模拟器。已保存端点尚不可用时会提示在 MFA 中刷新或重新连接，仍允许打开窗口。该参数不点击游戏、不启动演出。
 
-```powershell
-maapjsk
-maapjsk -Help
-```
-
-`maapjsk` 支持上述 `-RuntimeSource`、`-Python`、`-StageOnly` 参数。项目根目录的 `MaaPJSK.cmd` 也可通过完整路径调用；两种入口均按脚本所在目录定位项目。程序已打开时直接提示已运行。移动项目后重新运行安装脚本更新入口；卸载入口使用 `scripts/install-launcher.ps1 -Uninstall`。
+脚本按自身目录定位资源，支持 `-RuntimeSource`、`-Python`、`-StageOnly` 和 `-Help`；不依赖当前命令行所在目录。启动前关闭其他 MFA / MaaBanGDream 实例；重新部署前停止任务并关闭本项目窗口。
 
 ## 演出进度与通知
 
@@ -63,7 +58,7 @@ MFA 任务日志在开始时显示 `自动演出：已完成 0 / 总数 N`，每
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-compact-toasts.ps1 -MfaSource "<MFA源码目录>" -RuntimeSource "<通用MFA目录>"
-maapjsk -RuntimeSource "<通用MFA目录>" -Python "<python.exe路径>"
+powershell -NoProfile -ExecutionPolicy Bypass -File "<项目完整路径>\scripts\launch-mfa.ps1" -RuntimeSource "<通用MFA目录>" -Python "<python.exe路径>"
 ```
 
 脚本从固定标签导出 SukiUI，仅修改通知样式，生成到 `.local/compact-toasts/`；部署前检查原始 UI 库的 SHA256 是否与构建时一致。升级 MFA 后须重新确认兼容性和构建。删除 `.local/compact-toasts/SukiUI.dll` 后重新部署，可恢复通用 MFA 的默认通知样式。MFA/SukiUI 的源码和许可证保留在原项目中，构建不修改本地 MFA 仓库。
