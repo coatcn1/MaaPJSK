@@ -2,11 +2,13 @@
   "threshold": 0.83,
   "regions": {
     "home": {"capture": "home.png", "box": [1139, 633, 1260, 682]},
+    "title_screen": {"capture": "title_screen.png", "box": [540, 602, 740, 634]},
     "live_menu": {"capture": "live_menu.png", "box": [637, 175, 814, 322]},
     "song_select": {"capture": "song_select.png", "box": [934, 560, 1087, 625]},
     "prepare": {"capture": "prepare.png", "box": [45, 135, 300, 172]},
     "playing": {"capture": "playfield.png", "box": [1194, 16, 1252, 73]},
     "live_clear": {"capture": "live_clear.png", "box": [137, 280, 970, 395]},
+    "live_failed": {"capture": "solo_live_failed.png", "box": [137, 280, 970, 395]},
     "master_selected": {"capture": "song_select.png", "box": [1138, 538, 1211, 557]},
     "auto_on": {"capture": "prepare.png", "box": [518, 643, 629, 693]},
     "auto_off": {"capture": "prepare_off.png", "box": [518, 643, 629, 693]},

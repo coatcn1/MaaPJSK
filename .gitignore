@@ -8,3 +8,11 @@ __pycache__/
 *.mp4
 *.sus
 charts/private/
+resource/charts/
+resource/models/song_title_ocr/
+**/bin/
+**/obj/
+*.pyd
+project_sekai/native/*.lib
+project_sekai/native/*.pdb
+native/build/

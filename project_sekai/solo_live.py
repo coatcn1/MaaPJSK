@@ -1,0 +1,761 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import datetime
+import csv
+import json
+from pathlib import Path
+import re
+import time
+from uuid import uuid4
+
+import cv2
+import numpy as np
+
+from .chart_catalog import ChartRepository, _write_json
+from .chart_player import ChartPlayer, StartAnchor, compile_touches
+from .calibration import verify_profile_anchor
+from .life_monitor import LifeDepleted, LifeGuard
+from .navigator import Navigator
+from .ocr import LineOcr, Reading
+from .song_identity import SongMatcher, normalize_title, write_image
+from .sus_chart import parse_sus
+
+
+DIFFICULTY_POINTS = {"easy": (854, 488), "normal": (934, 492), "hard": (1016, 497),
+                     "expert": (1094, 501), "master": (1175, 504)}
+
+
+def numeric(reading: Reading) -> int:
+    # 引号等字形边缘噪声不参与数值；多组数字或低置信度不能当作已确认结果。
+    groups = re.findall(r"\d+", reading.text.replace(",", ""))
+    if len(groups) != 1 or reading.confidence < .75:
+        raise ValueError(f"数字未稳定识别：{reading.text!r}，置信度={reading.confidence:.3f}")
+    return int(groups[0])
+
+
+def is_light_mode(reading: Reading) -> bool:
+    # 本机字体的「軽」会被多语 OCR 解码为繁体「輕」，只接受完整的已知字形变体。
+    return reading.confidence >= .7 and normalize_title(reading.text) in {"軽量", "輕量", "轻量"}
+
+
+def append_result_index(root: Path, directory: Path, report: dict):
+    if "judgements" not in report:
+        return
+    identity = report.get("preparation_identity", {})
+    values = report["judgements"]
+    row = {"run": directory.name, "started_at": report["started_at"], "song_id": identity.get("song_id"),
+           "title": identity.get("title"), "difficulty": report["requested_difficulty"],
+           "completed": report.get("completed", False), "live_status": report.get("live_status", "unknown"),
+           **{key: values.get(key) for key in ("perfect", "great", "good", "bad", "miss", "total", "perfect_rate", "hit_rate",
+                                             "combo", "score", "late", "fast", "flick", "total_matches_chart")}}
+    path = root / "results.csv"
+    existing = path.is_file() and path.stat().st_size > 0
+    with path.open("a", encoding="utf-8-sig" if not existing else "utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        if not existing:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+@dataclass(frozen=True)
+class LiveResult:
+    perfect: int
+    great: int
+    good: int
+    bad: int
+    miss: int
+    late: int | None = None
+    fast: int | None = None
+    flick: int | None = None
+    combo: int | None = None
+    score: int | None = None
+
+    def to_dict(self) -> dict:
+        total = self.perfect + self.great + self.good + self.bad + self.miss
+        if total <= 0 or min(self.perfect, self.great, self.good, self.bad, self.miss) < 0:
+            raise ValueError("判定数据无效")
+        return {**asdict(self), "total": total, "perfect_rate": self.perfect / total,
+                "hit_rate": (total - self.miss) / total}
+
+
+class SoloLive:
+    def __init__(self, device, template_config: Path, chart_root: Path, model_root: Path, report_root: Path,
+                 *, stop_requested=lambda: False, log_message=print) -> None:
+        self.device, self.stop_requested, self.log = device, stop_requested, log_message
+        self.navigator = Navigator(device, template_config, stop_requested=stop_requested, log_message=log_message)
+        self.repository = ChartRepository(chart_root)
+        self.ocr = LineOcr(model_root)
+        self.matcher = SongMatcher(self.repository, self.ocr)
+        self.report_root = report_root
+        self.completed_rounds = 0
+
+    def screenshot(self):
+        self.navigator._check_stop()
+        frame = self.device.screenshot()
+        self.navigator._check_title_screen(frame)
+        if (self.navigator.match(frame, "playing")[0] < self.navigator.threshold
+                and self.navigator.match(frame, "home")[0] < self.navigator.threshold):
+            # 标题文字会淡入，模板可能被透明度干扰；在未知页面用文字复核一次。
+            title = self.ocr.read(frame, (529, 599, 752, 637))
+            if title.confidence >= .8 and normalize_title(title.text) == "taptostart":
+                raise RuntimeError("游戏已返回 TAP TO START 标题页，停止结算返回")
+        return frame
+
+    def pause(self, seconds: float):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.navigator._check_stop()
+            time.sleep(min(.04, max(0, end - time.monotonic())))
+
+    def select(self, difficulty: str, song_mode: str):
+        self.navigator.return_to_home()
+        self.navigator.tap(1194, 649, "主页 Live")
+        self.navigator.wait("live_menu")
+        self.navigator.tap(722, 235, "单人 Live")
+        frame = self.navigator.wait("song_select")
+        selected = self.matcher.match(frame, difficulty, "song_select") if song_mode == "current" else None
+        group = self.ocr.read(frame, (971, 529, 1059, 560))
+        if group.confidence < .7 or normalize_title(group.text) not in {"hard", "append"}:
+            raise RuntimeError(f"选曲页难度组未确认：{group.text!r}")
+        wanted_group = "append" if difficulty == "append" else "hard"
+        if normalize_title(group.text) != wanted_group:
+            self.navigator.tap(*( (1224, 505) if difficulty == "append" else (803, 485)), "切换谱面难度组")
+            self.pause(.4)
+            frame = self.navigator.wait("song_select")
+            group = self.ocr.read(frame, (971, 529, 1059, 560))
+            if group.confidence < .7 or normalize_title(group.text) != wanted_group:
+                raise RuntimeError("选曲页未切换到请求的难度组")
+        if song_mode == "random":
+            self.navigator._select_random_song(frame)
+        if difficulty == "append":
+            # Append 组只显示中央一个难度按钮，与普通五难度组的坐标不同。
+            self.navigator.tap(1015, 500, "Append 难度")
+        else:
+            self.navigator.tap(*DIFFICULTY_POINTS[difficulty], f"{difficulty.upper()} 难度")
+        self.pause(.4)
+        self.navigator.tap(1007, 590, "选曲确认")
+        frame = self.navigator.wait("prepare")
+        prepared = self.matcher.match(frame, difficulty, "prepare")
+        if selected is not None and selected.song_id != prepared.song_id:
+            raise RuntimeError("切换难度后当前歌曲发生变化，拒绝演出其他歌曲")
+        return prepared, frame
+
+    def prepare_bonus(self, consumption: str | int, report: dict, directory: Path, *, setup_playback=True, return_page="prepare"):
+        if setup_playback:
+            self.navigator.ensure_auto(False)
+        self.navigator.tap(1150, 42, "打开体力消耗设置")
+        self.pause(.4)
+        # 游戏会记住上次的回复标签；两个标签标题始终可见，不能只凭标题确认消耗页。
+        self.navigator.tap(470, 42, "选择体力消耗标签")
+        self.pause(.35)
+        for _ in range(6):
+            frame = self.screenshot()
+            heading = self.ocr.read(frame, (365, 27, 650, 66))
+            description = self.ocr.read(frame, (436, 150, 845, 198))
+            if (heading.confidence >= .7 and description.confidence >= .7
+                    and "消費" in heading.text and "消費量" in description.text):
+                break
+            # 标签切换的淡入帧会短暂误读汉字，先等待文字稳定，不重复点标签或操作滑条。
+            self.pause(.2)
+        else:
+            raise RuntimeError(f"未到达体力消耗页：{heading.text!r}，{description.text!r}")
+        original = None
+        for _ in range(12):
+            try:
+                original = self.read_bonus(frame)[0]
+                break
+            except ValueError:
+                # 标题和正文就绪不代表消耗数字的动画已结束；读数不清时等待，不调整数量。
+                self.pause(.2)
+                frame = self.screenshot()
+        if original is None:
+            raise RuntimeError("每局体力消耗数字未稳定确认，拒绝调整和开演")
+        target = original if consumption == "current" else consumption
+        # 沿用模式不调整滑条；指定数量只按用户设置调整，不因体力不足改成零或更小的数。
+        if original != target:
+            self.adjust_bonus_count(target, frame)
+        readings = []
+        for _ in range(2):
+            frame = self.screenshot()
+            value, reading = self.read_bonus(frame)
+            if value != target:
+                raise RuntimeError(f"未确认用户指定的 {target} 体力消耗，拒绝开演")
+            readings.append(asdict(reading))
+            self.pause(.12)
+        write_image(directory / "bonus.png", frame)
+        report["bonus"] = {"requested_consumption": consumption, "consumption": target,
+                           "confirmed": True, "readings": readings, "original_consumption": original}
+        self.navigator.tap(762, 655, f"保存 {target} 体力消耗")
+        frame = self.navigator.wait(return_page)
+        if not setup_playback:
+            return
+        # 轻量背景提供固定开场锚点，不修改用户的流速或游戏判定偏移。
+        for _ in range(5):
+            mode = self.ocr.read(frame, (43, 647, 153, 685))
+            if is_light_mode(mode):
+                report["background"] = asdict(mode)
+                break
+            self.navigator.tap(94, 665, "切换到轻量演出")
+            self.pause(.3)
+            frame = self.screenshot()
+        else:
+            raise RuntimeError("未确认轻量演出，拒绝使用未知背景开演")
+        self.navigator.ensure_auto(False)
+        self.log(f"每局消耗 {target} 体力已确认：AUTO 关闭、轻量背景")
+
+    def restore_calibration_bonus(self, consumption: int, directory: Path):
+        frame = self.screenshot()
+        if self.navigator.match(frame, "home")[0] < self.navigator.threshold:
+            raise RuntimeError("校准尚未返回主页，无法安全恢复原体力消耗")
+        restoration = {}
+        self.prepare_bonus(consumption, restoration, directory, setup_playback=False, return_page="home")
+        return restoration["bonus"]
+
+    def read_bonus(self, frame):
+        # 10 的第二位超出单数字矩形；保留完整两位，瓶子图标由粉色掩码排除。
+        hsv = cv2.cvtColor(frame[247:289, 630:710], cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (140, 75, 140), (179, 255, 255))
+        digits = cv2.cvtColor(255 - mask, cv2.COLOR_GRAY2BGR)
+        digits = cv2.copyMakeBorder(digits, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        reading = self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0]))
+        if reading.confidence < .75:
+            # 原图补读排除瓶子图标；保留完整两位数字，不降低低置信度门槛。
+            reading = self.ocr.read(frame, (642, 247, 710, 289))
+        if not re.fullmatch(r"\d{1,2}", reading.text.strip().strip("'\"")):
+            raise ValueError(f"体力消耗数字不完整：{reading.text!r}")
+        value = numeric(reading)
+        if not 0 <= value <= 10:
+            raise ValueError("体力消耗读数超出 0 到 10")
+        return value, reading
+
+    def adjust_bonus_count(self, target: int, frame: np.ndarray) -> int:
+        if isinstance(target, bool) or not isinstance(target, int) or not 0 <= target <= 10:
+            raise ValueError("每局体力消耗必须为 0 到 10 的整数")
+        current, _ = self.read_bonus(frame)
+        for _ in range(25):
+            if current == target:
+                return current
+            self.navigator.tap(837 if current < target else 442, 320, f"调整为 {target} 体力消耗")
+            # 加减按钮会去抖，逐次读取后再操作，不能按预定次数连续连点。
+            self.pause(.3)
+            updated, _ = self.read_bonus(self.screenshot())
+            if abs(updated - current) > 1 or not 0 <= updated <= 10:
+                raise RuntimeError("调整体力消耗时读数异常，停止调整")
+            current = updated
+        raise RuntimeError("用户指定的体力消耗数量未确认，停止调整")
+
+    def read_available_bonus(self, frame: np.ndarray) -> tuple[int, Reading]:
+        box = (1057, 27, 1128, 59)
+        raw = self.ocr.read(frame, box)
+        x1, y1, x2, y2 = box
+        hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 0, 190), (179, 95, 255))
+        digits = cv2.cvtColor(255 - mask, cv2.COLOR_GRAY2BGR)
+        digits = cv2.copyMakeBorder(digits, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        processed = self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0]))
+        values = []
+        for reading in (raw, processed):
+            match = re.fullmatch(r"(\d{1,4})[/／](\d{1,4})", re.sub(r"\s+", "", reading.text))
+            if reading.confidence >= .75 and match and int(match[2]) > 0:
+                values.append((int(match[1]), reading))
+        # 只读取顶部实际体力，不识别饮料库存或已选瓶数；冲突读数不能触发用药。
+        if not values or len({value for value, _ in values}) != 1:
+            raise ValueError(f"当前体力无法确认：{raw}，{processed}")
+        return values[0]
+
+    def wait_available_bonus(self) -> tuple[np.ndarray, int, list[dict]]:
+        deadline = time.monotonic() + 8
+        last_value = None
+        readings = []
+        while time.monotonic() < deadline:
+            frame = self.screenshot()
+            if self.navigator.match(frame, "prepare")[0] >= self.navigator.threshold:
+                try:
+                    value, reading = self.read_available_bonus(frame)
+                except ValueError:
+                    last_value, readings = None, []
+                else:
+                    if value == last_value:
+                        return frame, value, readings + [asdict(reading)]
+                    last_value, readings = value, [asdict(reading)]
+            else:
+                last_value, readings = None, []
+            self.pause(.2)
+        raise RuntimeError("当前体力未稳定确认，停止开演和自动用药")
+
+    def ensure_bonus_available(self, mode: str, count: int, report: dict, directory: Path):
+        consumption = report["bonus"]["consumption"]
+        if consumption == 0:
+            report["bonus"]["availability"] = "not_required"
+            return
+        before, available, readings = self.wait_available_bonus()
+        report["bonus"].update(available_before=available, availability_readings=readings)
+        if available >= consumption:
+            report["bonus"]["availability"] = "sufficient"
+            return
+        report["bonus"]["availability"] = "insufficient"
+        if mode == "off":
+            raise RuntimeError(f"当前体力 {available}，每局需要 {consumption}；自动用药已关闭，请补充体力或修改任务设置")
+        report["recovery"] = {"mode": mode, "requested_bottles": count, "available_before": available,
+                              "status": "started"}
+        _write_json(directory / "report.json", report)
+        self.log(f"体力不足：当前 {available} / 每局需要 {consumption}，按用户设置自动回复")
+        self.navigator.tap(1086, 42, "打开体力回复")
+        self.navigator._recover_and_verify(before, mode, count)
+        frame, after, readings = self.wait_available_bonus()
+        write_image(directory / "recovery-after.png", frame)
+        report["recovery"].update(available_after=after, completed_bottles=count, readings=readings, status="confirmed")
+        report["bonus"]["available_after"] = after
+        if after < consumption:
+            # 每次只执行用户规定的一批瓶数；不足时停止，不追加瓶数，也不降低每局消耗。
+            raise RuntimeError(f"已按设置使用 {count} 瓶饮料，当前体力 {after} 仍不足 {consumption}；请调整每次回复瓶数")
+        report["bonus"]["availability"] = "recovered"
+        self.navigator.ensure_auto(False)
+        self.log(f"体力回复已确认：当前 {after}，继续按每局 {consumption} 体力开演")
+
+    def start(self, chart, identity, report: dict, directory: Path) -> float:
+        self.device.preflight()
+        self.navigator.tap(1013, 563, "开始单人谱面演出")
+        clicked_at = time.perf_counter()
+        deadline = time.monotonic() + 120
+        final = None
+        # 优先使用四帧；慢截图来不及取得第四帧时，只允许三帧低残差拟合且留足启动余量。
+        anchor = StartAnchor(chart.first, minimum_samples=4 if report.get("engine") == "native" else 2)
+        loading_saved = False
+        last_error = ""
+        problem_priority = (-1, -1.0)
+        samples = []
+        captured_frames = []
+
+        def save_anchor_frames():
+            report["anchor_frames"] = []
+            for index, (when, screenshot) in enumerate(captured_frames):
+                name = f"anchor-frame-{index:02d}.png"
+                write_image(directory / name, screenshot)
+                report["anchor_frames"].append({"captured_at": when, "path": name})
+
+        while time.monotonic() < deadline:
+            before = time.perf_counter()
+            frame = self.screenshot()
+            # 帧在设备开始 screencap 时生成，gzip 传输及 Agent 图像解码不是拍摄时间。
+            captured_at = before
+            if not loading_saved and np.mean(frame[:560].min(axis=2) > 230) > .94:
+                self.loading_frame = frame.copy()
+                loading_saved = True
+            if final is None:
+                try:
+                    candidate = self.matcher.match(frame, identity.difficulty, "final")
+                    if candidate.song_id != identity.song_id:
+                        raise RuntimeError("准备页与最终封面的歌曲不同，拒绝触控")
+                    # 准备页与开场页已提供两次独立确认；开场窗口短，不额外要求连拍两帧。
+                    final = candidate
+                    report["final_identity"] = candidate.to_dict()
+                    report["opening_detection"] = {"seconds_after_start": captured_at - clicked_at,
+                                                   "captured_at": captured_at}
+                    self.final_frame = frame.copy()
+                    # 点开始后持续取帧，加载时间不决定就绪；开场临界区不执行嵌套日志或编码图片。
+                    print(f"开场身份已确认：{candidate.song_id} {candidate.title} {candidate.difficulty.upper()}", flush=True)
+                except ValueError as error:
+                    last_error = str(error)
+                    attempts = report.setdefault("final_identity_attempts", [])
+                    if len(attempts) < 24:
+                        attempts.append({"captured_at": captured_at, "error": last_error})
+                    # 保留最接近封面的失败帧，避免只保存超时后的暂停页而丢失实际开场证据。
+                    score = re.search(r"最佳=([\d.]+)", last_error)
+                    candidate_score = float(score[1]) if score else None
+                    priority = (0, candidate_score) if score else (1, 0.0)
+                    if priority > problem_priority:
+                        problem_priority = priority
+                        report["unconfirmed_identity"] = {"captured_at": captured_at, "error": last_error,
+                                                          "cover_score": candidate_score}
+                        self.identity_problem_frame = frame.copy()
+                if final is None:
+                    self.pause(.02)
+                    continue
+            if self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
+                if len(captured_frames) < 32:
+                    captured_frames.append((captured_at, frame.copy()))
+                try:
+                    epoch = anchor.observe(frame, captured_at, capture_seconds=time.perf_counter() - before)
+                except Exception:
+                    save_anchor_frames()
+                    raise
+                if len(anchor.samples) > len(samples):
+                    samples = list(anchor.samples)
+                    report["anchor_attempt"] = {"samples": samples}
+                if epoch is not None:
+                    report["start_anchor"] = {"epoch": epoch, "first_note_time": chart.first.start,
+                                              "samples": samples, "capture_seconds": time.perf_counter() - before,
+                                              "capture_clock": "request_start", "fit": anchor.fit}
+                    if len(samples) >= 2:
+                        origin = samples[0][0]
+                        report["start_anchor"]["trajectory_rate"] = float(np.polyfit(
+                            np.array([when - origin for when, _ in samples]),
+                            np.log(np.array([y + 30 for _, y in samples])), 1)[0])
+                    # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
+                    print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
+                    # 锚点建立后不在触控前编码截图，避免错过第一音；结算时再保存证据。
+                    self.anchor_frames = captured_frames
+                    return epoch
+            self.pause(.002)
+        write_image(directory / "start-failure.png", frame)
+        save_anchor_frames()
+        raise RuntimeError(f"开场封面或第一音锚点未确认，未派发谱面输入：{last_error}")
+
+    def read_result(self, frame: np.ndarray) -> LiveResult | None:
+        label = self.ocr.read(frame, (151, 393, 290, 434))
+        if "PERFECT" not in label.text.upper():
+            return None
+        boxes = {"perfect": (302, 391, 384, 434), "great": (302, 435, 384, 475),
+                 "good": (302, 479, 384, 519), "bad": (302, 522, 384, 562), "miss": (302, 565, 384, 605)}
+        try:
+            values = {key: self.read_judgement_number(frame, box) for key, box in boxes.items()}
+            for key, box in {"late": (448, 514, 554, 542), "fast": (556, 514, 638, 542),
+                             "flick": (609, 557, 643, 590), "combo": (536, 390, 668, 435),
+                             "score": (282, 205, 670, 274)}.items():
+                try:
+                    values[key] = self.read_optional_number(frame, box)
+                except ValueError:
+                    values[key] = None
+            return LiveResult(**values)
+        except ValueError:
+            return None
+
+    def read_judgement_number(self, frame: np.ndarray, box: tuple[int, int, int, int]) -> int:
+        raw = self.ocr.read(frame, box)
+        x1, y1, x2, y2 = box
+        crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        # 灰色前导零在深色判定面板上对比不足；统一转成黑字白底后再读数。
+        digits = cv2.cvtColor(255 - cv2.threshold(crop, 145, 255, cv2.THRESH_BINARY)[1], cv2.COLOR_GRAY2BGR)
+        digits = cv2.copyMakeBorder(digits, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        processed = self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0]))
+        values = []
+        for reading in (raw, processed):
+            try:
+                values.append(numeric(reading))
+            except ValueError:
+                continue
+        if not values or len(set(values)) != 1:
+            raise ValueError(f"判定数字无法确认或两种读法冲突：{raw}，{processed}")
+        return values[0]
+
+    def read_optional_number(self, frame: np.ndarray, box: tuple[int, int, int, int]) -> int:
+        raw = self.ocr.read(frame, box)
+        try:
+            return numeric(raw)
+        except ValueError:
+            x1, y1, x2, y2 = box
+            hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+            # FAST/LATE 的蓝色条会干扰浅色单个零；只保留白色数字后重读。
+            mask = cv2.inRange(hsv, (0, 0, 200), (179, 60, 255))
+            points = cv2.findNonZero(mask)
+            if points is None:
+                raise ValueError("可选结算数字为空")
+            x, y, width, height = cv2.boundingRect(points)
+            mask = mask[y:y + height, x:x + width]
+            digits = cv2.cvtColor(255 - mask, cv2.COLOR_GRAY2BGR)
+            # 单个零需要足够横向留白，过窄的二值区域会被多语模型误读为字母 O。
+            # 窄笔画的 1 需要更紧的横向留白；保留置信度门槛，不能将低置信度强行确认为数字。
+            vertical, horizontal = (4, 4) if width <= 6 else (6, 12)
+            digits = cv2.copyMakeBorder(digits, vertical, vertical, horizontal, horizontal,
+                                       cv2.BORDER_CONSTANT, value=(255, 255, 255))
+            return numeric(self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0])))
+
+    def observe_play_state(self, directory: Path):
+        requested_at = time.perf_counter()
+        frame = self.screenshot()
+        if requested_at - self.life_epoch < 8:
+            self.life_frames.append((requested_at - self.life_epoch, frame))
+        if self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] < self.navigator.threshold:
+            write_image(directory / "playback-interrupted.png", frame)
+            if self.navigator.match(frame, "live_failed")[0] >= self.navigator.threshold:
+                self.life_guard.zero_confirmed = True
+                raise LifeDepleted("游戏已确认 LIVE FAILED，停止输入并退出演出")
+            raise RuntimeError("演奏场提前消失，停止谱面输入")
+        def read_zero(image):
+            try:
+                return self.read_optional_number(image, (1090, 8, 1187, 37)) == 0
+            except ValueError:
+                return False
+        if self.life_guard.observe(frame, read_zero):
+            write_image(directory / "life-zero.png", frame)
+            raise LifeDepleted("连续两帧确认生命归零，停止输入并退出演出")
+
+    def dialog_action(self, frame, labels):
+        # 只在已经暂停或退出确认的场景定位白色按钮，避免把游戏场景文字当成操作入口。
+        mask = cv2.inRange(frame, (245, 245, 245), (255, 255, 255))
+        mask |= cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), (75, 55, 150), (95, 255, 255))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            if (200 <= x <= 1080 and 250 <= y <= 650 and 80 <= width <= 420 and 28 <= height <= 110
+                    and cv2.contourArea(contour) > width * height * .65):
+                candidates.append((x, y, width, height))
+        for x, y, width, height in sorted(candidates, key=lambda item: item[1], reverse=True)[:16]:
+            reading = self.ocr.read(frame, (x, y, x + width, y + height))
+            if reading.confidence >= .75 and normalize_title(reading.text) in labels:
+                return x + width // 2, y + height // 2
+        return None
+
+    def exit_depleted_live(self, report: dict, directory: Path):
+        self.navigator._check_stop()
+        report["live_status"] = "life_depleted"
+        report["completed"] = False
+        self.log("生命归零：触点已释放，暂停并退出本局；本局不计入完成次数")
+        frame = self.screenshot()
+        if (self.dialog_action(frame, {"リタイア"}) is None
+                and self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] >= self.navigator.threshold):
+            self.navigator.tap(1223, 44, "生命归零后暂停演出")
+            self.pause(.4)
+        deadline = time.monotonic() + 25
+        for attempt in range(48):
+            if time.monotonic() >= deadline:
+                break
+            frame = self.screenshot()
+            write_image(directory / f"life-exit-{attempt:02d}.png", frame)
+            if self.navigator.match(frame, "home")[0] >= self.navigator.threshold:
+                report["life_exit"] = {"confirmed": True, "page": "home"}
+                return
+            if any(self.navigator.match(frame, page)[0] >= self.navigator.threshold
+                   for page in ("song_select", "prepare", "live_menu")):
+                self.navigator.return_to_home()
+                report["life_exit"] = {"confirmed": True, "page": "home"}
+                return
+            point = self.dialog_action(frame, {"リタイア", "あきらめる", "終了", "はい", "ok", "確認"})
+            if point is not None:
+                self.navigator.tap(*point, "暂停页退出或退出确认")
+            elif self.navigator.match(frame, "live_failed")[0] >= self.navigator.threshold:
+                self.device.back()
+            self.pause(.6)
+        raise RuntimeError("生命归零已停止触控，但退出页面未确认；保留截图并停止任务")
+
+    def play(self, events, epoch: float, offset_ms: int, report: dict, directory: Path):
+        def observe_state():
+            self.observe_play_state(directory)
+
+        player = ChartPlayer(self.device.controller, self.stop_requested, idle_observer=observe_state)
+        try:
+            report["playback"] = player.play(events, epoch, offset_ms)
+        finally:
+            if "playback" not in report:
+                report["playback"] = {"release_confirmed": not player.active,
+                                      "active_contacts": sorted(player.active), "sent_actions": player.sent_actions,
+                                      "planned_actions": len(events),
+                                      "lateness_ms_max": max(player.lateness, default=0) * 1000}
+
+    def collect(self, report: dict, directory: Path):
+        deadline = time.monotonic() + 120
+        completed = False
+        failed = False
+        result = None
+        last_candidate = None
+        stable = 0
+        settlement_index = 0
+
+        def inspect_settlement(frame):
+            nonlocal stable, last_candidate, result, completed, failed
+            clear_score = self.navigator.match(frame, "live_clear")[0]
+            failed_score = self.navigator.match(frame, "live_failed")[0] if "live_failed" in self.navigator.templates else 0
+            if clear_score >= self.navigator.threshold and clear_score > failed_score + .04:
+                completed = True
+                report["live_status"] = "cleared"
+                write_image(directory / "live-clear.png", frame)
+            if failed_score >= self.navigator.threshold and failed_score > clear_score + .04:
+                failed = True
+                report["live_status"] = "failed"
+                write_image(directory / "live-failed.png", frame)
+            candidate = self.read_result(frame)
+            if candidate is not None:
+                stable = stable + 1 if candidate == last_candidate else 1
+                last_candidate = candidate
+                if stable >= 2:
+                    result = candidate.to_dict()
+                    expected_total = report.get("chart", {}).get("total_note_count")
+                    result["expected_total"] = expected_total
+                    result["total_matches_chart"] = result["total"] == expected_total if expected_total else None
+                    report["judgements"] = result
+                    write_image(directory / "result.png", frame)
+            return candidate
+
+        while time.monotonic() < deadline:
+            frame = self.screenshot()
+            candidate = inspect_settlement(frame)
+            if self.navigator.match(frame, "home")[0] >= self.navigator.threshold:
+                if failed:
+                    report["result_status"] = "recorded" if result else "unreadable"
+                    raise RuntimeError("游戏判定演出失败，本局未计入完成次数")
+                if not completed:
+                    raise RuntimeError("未确认演出完成，已返回主页")
+                if result is None:
+                    report["result_status"] = "unreadable"
+                    raise RuntimeError("已确认 LIVE CLEAR，但判定数字未完整读取；保留截图并停止后续局")
+                if result.get("total_matches_chart") is False:
+                    report["result_status"] = "note_count_mismatch"
+                    raise RuntimeError("结算音符总数与本地谱面元数据不同；保留实际数字并停止后续局")
+                report["completed"] = True
+                report["live_status"] = "cleared"
+                report["result_status"] = "recorded" if result else "unreadable"
+                return
+            write_image(directory / "settlement-last.png", frame)
+            if self.navigator.match(frame, "playing")[0] >= self.navigator.threshold and not completed:
+                self.pause(.4)
+                continue
+            if settlement_index < 40:
+                settlement_index += 1
+                write_image(directory / f"settlement-{settlement_index:02d}.png", frame)
+            # 判定页先采集两帧；其余结算只用安全像素加速与 BACK 推进。
+            if candidate is not None and stable < 2:
+                self.pause(.3)
+                continue
+            self.device.tap(1279, 719)
+            # 奖励退出动画会先显示模糊主页；留出切换时间后再读，避免旧帧诱发多余 BACK。
+            self.pause(1.2)
+            confirmation = self.screenshot()
+            # 判定页也可能在这张复查帧才出现，先取得两帧数字再返回。
+            confirmation_candidate = inspect_settlement(confirmation)
+            if confirmation_candidate is not None and stable < 2:
+                self.pause(.3)
+                continue
+            # 动画加速点击可能已切换到主页；必须重新检查后才能发送 BACK。
+            if self.navigator.match(confirmation, "home")[0] >= self.navigator.threshold:
+                continue
+            if np.mean(confirmation.max(axis=2) < 15) > .95:
+                self.pause(.6)
+                continue
+            self.device.back()
+            self.pause(1.0)
+        raise TimeoutError("结算返回超时")
+
+    def run(self, count: int, difficulty: str, song_mode: str, offset_ms: int = 0, *,
+            bonus_consumption: str | int = "current", recovery_mode: str = "off", recovery_count: int = 1,
+            engine: str = "legacy", latency_offsets: dict | None = None, calibration_profile: dict | None = None):
+        if difficulty not in {*DIFFICULTY_POINTS, "append"} or song_mode not in {"current", "random"}:
+            raise ValueError("单人谱面任务选项无效")
+        if (bonus_consumption != "current" and (isinstance(bonus_consumption, bool)
+                or not isinstance(bonus_consumption, int) or not 0 <= bonus_consumption <= 10)):
+            raise ValueError("每局体力消耗只能沿用游戏设置或指定 0 到 10")
+        if (recovery_mode not in {"off", "small", "large"} or isinstance(recovery_count, bool)
+                or not isinstance(recovery_count, int) or not 1 <= recovery_count <= 99):
+            raise ValueError("自动用药配置无效")
+        self.device.preflight()
+        if engine not in {"legacy", "native"}:
+            raise ValueError("演奏引擎无效")
+        self.completed_rounds = 0
+        reports = []
+        consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
+        recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
+        self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}")
+        for round_index in range(1, count + 1):
+            native_player = None
+            self.life_guard = LifeGuard()
+            self.life_frames = []
+            directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
+            directory.mkdir(parents=True)
+            report = {"schema_version": 1, "started_at": datetime.now().astimezone().isoformat(),
+                      "requested_difficulty": difficulty, "song_mode": song_mode, "round": round_index,
+                      "total_rounds": count, "completed": False, "timing_offset_ms": offset_ms,
+                      "requested_bonus_consumption": bonus_consumption,
+                      "recovery_settings": {"mode": recovery_mode, "count": recovery_count}}
+            report["engine"] = engine
+            self.last_report = report
+            report["report_path"] = str(directory / "report.json")
+            try:
+                identity, frame = self.select(difficulty, song_mode)
+                report["preparation_identity"] = identity.to_dict()
+                write_image(directory / "prepare.png", frame)
+                entry = self.repository.songs[identity.song_id]["charts"][difficulty]
+                report["chart"] = {key: entry[key] for key in ("music_id", "difficulty", "sha256", "path", "total_note_count")}
+                chart = parse_sus(self.repository.load_chart(identity.song_id, difficulty))
+                events = compile_touches(chart)
+                report["chart"]["duration"] = chart.duration
+                report["chart"]["planned_actions"] = len(events)
+                self.prepare_bonus(bonus_consumption, report, directory)
+                self.ensure_bonus_available(recovery_mode, recovery_count, report, directory)
+                if engine == "native":
+                    from .native_player import NativePlayer
+                    native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
+                                                 latency_offsets=latency_offsets,
+                                                 idle_observer=lambda: self.observe_play_state(directory))
+                    # 设备连接和探测在点击开演之前完成；开场窗口只承担身份确认与首音同步。
+                    native_player.prepare()
+                self.log("点击开始后持续等待加载与开场封面；确认歌曲、标题和难度后同步首音")
+                epoch = self.start(chart, identity, report, directory)
+                self.life_epoch = epoch
+                if calibration_profile is not None:
+                    verify_profile_anchor(calibration_profile, report)
+                _write_json(directory / "report.json", report)
+                playback_error = None
+                try:
+                    if native_player is not None:
+                        report["playback"] = native_player.report
+                        try:
+                            native_player.play(epoch, offset_ms)
+                        finally:
+                            native_player.close()
+                            native_player = None
+                    else:
+                        self.play(events, epoch, offset_ms, report, directory)
+                except Exception as error:
+                    if self.stop_requested():
+                        raise
+                    playback_error = error
+                    report["playback_error"] = f"{type(error).__name__}: {error}"
+                report["life_monitor"] = {"samples": self.life_guard.samples,
+                                           "zero_confirmed": self.life_guard.zero_confirmed}
+                if isinstance(playback_error, LifeDepleted):
+                    if not report.get("playback", {}).get("release_confirmed"):
+                        raise RuntimeError("生命归零后的触点释放未确认，禁止继续点击退出")
+                    self.exit_depleted_live(report, directory)
+                    raise playback_error
+                report["phase"] = "settlement"
+                _write_json(directory / "report.json", report)
+                self.collect(report, directory)
+                if playback_error is not None:
+                    report["completed"] = False
+                    raise playback_error
+                self.completed_rounds += 1
+                self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")
+                if report.get("judgements"):
+                    values = report["judgements"]
+                    self.log(f"PERFECT {values['perfect']}，GREAT {values['great']}，GOOD {values['good']}，BAD {values['bad']}，MISS {values['miss']}；PERFECT 占比 {values['perfect_rate']:.2%}")
+            except Exception as error:
+                report["error"] = f"{type(error).__name__}: {error}"
+                report["cancelled"] = self.stop_requested()
+                if not self.stop_requested():
+                    try:
+                        write_image(directory / "failure.png", self.device.screenshot())
+                    except Exception:
+                        pass
+                raise
+            finally:
+                if native_player is not None:
+                    report["playback"] = native_player.report
+                    try:
+                        native_player.close()
+                    except Exception as release_error:
+                        report["release_error"] = f"{type(release_error).__name__}: {release_error}"
+                        _write_json(directory / "report.json", report)
+                        raise
+                for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
+                                        ("identity_problem_frame", "identity-unconfirmed.png")):
+                    frame = getattr(self, attribute, None)
+                    if frame is not None:
+                        write_image(directory / name, frame)
+                        delattr(self, attribute)
+                for index, (when, frame) in enumerate(getattr(self, "anchor_frames", [])):
+                    name = f"anchor-frame-{index:02d}.png"
+                    write_image(directory / name, frame)
+                    report.setdefault("anchor_frames", []).append({"captured_at": when, "path": name})
+                self.anchor_frames = []
+                for index, (when, frame) in enumerate(self.life_frames):
+                    name = f"life-frame-{index:02d}.png"
+                    write_image(directory / name, frame)
+                    report.setdefault("life_frames", []).append({"elapsed_s": when, "path": name})
+                self.life_frames = []
+                report["finished_at"] = datetime.now().astimezone().isoformat()
+                _write_json(directory / "report.json", report)
+                append_result_index(self.report_root, directory, report)
+            reports.append(report)
+        return reports

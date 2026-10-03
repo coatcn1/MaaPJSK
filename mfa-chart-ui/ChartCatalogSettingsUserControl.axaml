@@ -1,0 +1,25 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:suki="https://github.com/kikipoulet/SukiUI"
+             xmlns:settings="clr-namespace:MFAAvalonia.ViewModels.UsersControls.Settings"
+             x:Class="MFAAvalonia.Views.UserControls.Settings.ChartCatalogSettingsUserControl"
+             x:DataType="settings:ChartCatalogSettingsUserControlModel">
+    <suki:GlassCard Padding="24,18">
+        <StackPanel Spacing="14">
+            <TextBlock Text="日服谱面管理" FontSize="18" FontWeight="SemiBold" />
+            <TextBlock Text="同步已公开歌曲的 SUS 谱面与封面，包含实际存在的 Easy / Normal / Hard / Expert / Master / Append。"
+                       TextWrapping="Wrap" />
+            <TextBlock Text="单人谱面演出与 Native 校准任务从本地谱面库读取歌曲、难度及封面。" TextWrapping="Wrap" />
+            <TextBlock Text="{Binding CatalogText}" TextWrapping="Wrap" />
+            <WrapPanel>
+                <Button Content="同步 / 更新全部日服谱面" Command="{Binding SyncCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,12,8" />
+                <Button Content="取消同步" Command="{Binding CancelCommand}" IsEnabled="{Binding IsSyncing}" Margin="0,0,12,8" />
+                <Button Content="刷新本地状态" Command="{Binding RefreshCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,0,8" />
+            </WrapPanel>
+            <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsSyncing}" Height="4" />
+            <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" />
+            <TextBox Text="{Binding ProgressText, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True"
+                     TextWrapping="Wrap" Height="250" ScrollViewer.VerticalScrollBarVisibility="Auto" />
+        </StackPanel>
+    </suki:GlassCard>
+</UserControl>

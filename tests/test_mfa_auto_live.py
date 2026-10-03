@@ -26,7 +26,7 @@ class AutoLiveConfigurationTests(unittest.TestCase):
     def test_recovery_options_are_part_of_auto_live_task(self) -> None:
         interface_path = Path(__file__).resolve().parents[1] / "interface.json"
         interface = json.loads(interface_path.read_text(encoding="utf-8"))
-        self.assertEqual([task["name"] for task in interface["task"]], ["AutoLive"])
+        self.assertEqual([task["name"] for task in interface["task"]], ["AutoLive", "SoloChartLive", "SoloChartCalibration"])
         self.assertEqual(
             interface["task"][0]["option"],
             ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryCount"],
@@ -104,12 +104,37 @@ class SongSelectionTests(unittest.TestCase):
 
 
 class RecoveryGuardTests(unittest.TestCase):
+    def test_remembered_consumption_tab_is_switched_before_selecting_drinks(self) -> None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        navigator = Navigator.__new__(Navigator)
+        navigator.threshold = 0.83
+        state = {"page": "consumption"}
+        taps = []
+        navigator.wait = lambda _name: frame
+        navigator._save_failure = lambda *_args: None
+        navigator.match = lambda _frame, name, _area=None: (
+            1.0 if name == "recovery_dialog" or state["page"] == "item" else 0.0, (0, 0)
+        )
+
+        def tap(x, y, _reason):
+            taps.append((x, y))
+            if (x, y) == (802, 42):
+                state["page"] = "item"
+
+        navigator.tap = tap
+        # 在真正选择饮料前停止，专门验证同一弹窗两个顶部标签的入口切换。
+        navigator._check_stop = lambda: (_ for _ in ()).throw(InterruptedError("入口已确认"))
+        with patch("project_sekai.navigator.time.sleep"), self.assertRaisesRegex(InterruptedError, "入口已确认"):
+            navigator.recover_bonus_from_dialog("large")
+        self.assertEqual(taps, [(802, 42)])
+
     def test_disabled_recovery_never_selects_item(self) -> None:
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         device = SimpleNamespace(screenshot=lambda: frame)
         navigator = Navigator.__new__(Navigator)
         navigator.device = device
         navigator.stop_requested = lambda: False
+        navigator.templates = {}
         navigator.threshold = 0.83
         navigator.match = lambda _frame, name, _area=None: (1.0 if name == "recovery_dialog" else 0.0, (0, 0))
         navigator.tap = lambda *_args: self.fail("关闭恢复时不应点击道具或确认")

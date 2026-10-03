@@ -1,0 +1,154 @@
+{
+  "SoloChartLive": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "next": [
+      "SoloChartLiveDifficultyConfig"
+    ]
+  },
+  "SoloChartLiveDifficultyConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "difficulty": "easy"
+    },
+    "next": [
+      "SoloChartLiveSongConfig"
+    ]
+  },
+  "SoloChartLiveSongConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "song_mode": "current"
+    },
+    "next": [
+      "SoloChartLiveCountConfig"
+    ]
+  },
+  "SoloChartLiveCountConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "count": 1
+    },
+    "next": [
+      "SoloChartLiveRecoveryModeConfig"
+    ]
+  },
+  "SoloChartLiveRecoveryModeConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "recovery_mode": "off"
+    },
+    "next": [
+      "SoloChartLiveRecoveryCountConfig"
+    ]
+  },
+  "SoloChartLiveRecoveryCountConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "recovery_count": 1
+    },
+    "next": [
+      "SoloChartLiveRun"
+    ]
+  },
+  "SoloChartLiveRun": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLive",
+    "custom_action_param": {},
+    "focus": {
+      "Node.Action.Starting": {
+        "content": "单人谱面演出开始：按用户体力设置，读取本地 SUS",
+        "display": [
+          "log"
+        ]
+      },
+      "Node.Action.Succeeded": {
+        "content": "单人谱面演出完成，请查看本局判定报告",
+        "display": [
+          "log",
+          "toast"
+        ]
+      },
+      "Node.Action.Failed": {
+        "content": "单人谱面演出中止，请查看本局报告",
+        "display": [
+          "log",
+          "toast"
+        ]
+      }
+    }
+  },
+  "SoloChartLiveLog": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "post_delay": 0
+  },
+  "SoloChartCalibration": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "next": [
+      "SoloChartCalibrationDifficultyConfig"
+    ]
+  },
+  "SoloChartCalibrationDifficultyConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "difficulty": "easy"
+    },
+    "next": [
+      "SoloChartCalibrationSongConfig"
+    ]
+  },
+  "SoloChartCalibrationSongConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "song_mode": "current"
+    },
+    "next": [
+      "SoloChartCalibrationRun"
+    ]
+  },
+  "SoloChartCalibrationRun": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiNativeCalibration",
+    "custom_action_param": {},
+    "focus": {
+      "Node.Action.Starting": {
+        "content": "Native 校准开始：0 体力，排练 + 正式验证",
+        "display": [
+          "log"
+        ]
+      },
+      "Node.Action.Succeeded": {
+        "content": "Native 校准通过，已保存当前环境与难度的配置",
+        "display": [
+          "log",
+          "toast"
+        ]
+      },
+      "Node.Action.Failed": {
+        "content": "Native 校准中止，详情见任务日志与校准报告",
+        "display": [
+          "log",
+          "toast"
+        ]
+      }
+    }
+  }
+}

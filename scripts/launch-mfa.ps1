@@ -26,6 +26,14 @@ foreach ($path in @($sourceExe, $Python, $templateConfig)) {
     }
 }
 
+$agentBinarySource = Join-Path $RuntimeSource 'libs\MaaAgentBinary'
+if (-not (Test-Path -LiteralPath $agentBinarySource -PathType Container)) {
+    $agentBinarySource = & $Python -c 'from pathlib import Path; from maa.controller import AdbController; print(Path(AdbController.AGENT_BINARY_PATH).resolve())'
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $agentBinarySource -PathType Container)) {
+        throw '缺少 MaaFramework 输入运行文件，请先安装项目 Python 依赖。'
+    }
+}
+
 $otherProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'MaaBanGDream.exe' OR Name = 'MFAAvalonia.exe'" | Where-Object {
     $_.ExecutablePath -and (Split-Path -Parent $_.ExecutablePath) -ine $targetRoot
 })
@@ -44,6 +52,10 @@ if ($current.Count -gt 0) {
 }
 
 New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
+# MFA 实际从 libs/MaaAgentBinary 加载输入文件，且启动时会清理根目录的同名目录。
+$agentBinaryTarget = Join-Path $targetRoot 'libs'
+New-Item -ItemType Directory -Force -Path $agentBinaryTarget | Out-Null
+Copy-Item -LiteralPath $agentBinarySource -Destination $agentBinaryTarget -Recurse -Force
 Get-ChildItem -LiteralPath $RuntimeSource -File | Where-Object { $_.Name -notin @('interface.json', 'appsettings.json') } | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $targetRoot -Force
 }
@@ -66,7 +78,8 @@ if (Test-Path -LiteralPath $sourceLayout -PathType Leaf) {
 $agentTarget = Join-Path $targetRoot 'agent'
 $packageTarget = Join-Path $targetRoot 'project_sekai'
 $resourceTarget = Join-Path $targetRoot 'resource'
-foreach ($directory in @($agentTarget, $packageTarget, $resourceTarget, (Join-Path $targetRoot 'config'), (Join-Path $targetRoot 'debug'))) {
+$scriptsTarget = Join-Path $targetRoot 'scripts'
+foreach ($directory in @($agentTarget, $packageTarget, $resourceTarget, $scriptsTarget, (Join-Path $targetRoot 'config'), (Join-Path $targetRoot 'debug'))) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 $interface = Get-Content -LiteralPath (Join-Path $projectRoot 'interface.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -81,10 +94,32 @@ $settings.NoAutoStart = 'True'
 $settings | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $settingsPath -Encoding UTF8
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\server.py') -Destination $agentTarget -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\auto_live.py') -Destination $agentTarget -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\solo_live.py') -Destination $agentTarget -Force
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'project_sekai') -Filter '*.py' | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $packageTarget -Force
 }
-Copy-Item -Path (Join-Path $projectRoot 'resource\*') -Destination $resourceTarget -Recurse -Force
+$nativeSource = Join-Path $projectRoot 'project_sekai\native'
+if (Test-Path -LiteralPath $nativeSource -PathType Container) {
+    Copy-Item -LiteralPath $nativeSource -Destination $packageTarget -Recurse -Force
+}
+# 设置只在首次移动选项时迁移；后续部署保留 MFA 设置页保存的值。
+Push-Location -LiteralPath $projectRoot
+try { & $Python -X utf8 -m project_sekai.performance_settings --migrate-root $targetRoot }
+finally { Pop-Location }
+if ($LASTEXITCODE -ne 0) { throw '演奏设置迁移失败，已停止启动。' }
+Get-ChildItem -LiteralPath (Join-Path $projectRoot 'resource') | Where-Object { $_.Name -ne 'charts' } | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $resourceTarget -Recurse -Force
+}
+# 本地谱面库共用源码目录中的一份数据；部署不复制整库，避免重复占用空间或覆盖更新结果。
+Copy-Item -LiteralPath (Join-Path $projectRoot 'scripts\sync_sekai_catalog.py') -Destination $scriptsTarget -Force
+$chartRoot = Join-Path $projectRoot 'resource\charts'
+@{
+    child_exec = $Python
+    script_path = Join-Path $scriptsTarget 'sync_sekai_catalog.py'
+    working_directory = $targetRoot
+    output_root = $chartRoot
+    manifest_path = Join-Path $chartRoot 'manifest.json'
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $targetRoot 'config\chart-sync.json') -Encoding UTF8
 Copy-Item -LiteralPath $templateConfig -Destination (Join-Path $targetRoot 'config\maapjsk-templates.json') -Force
 $templateTarget = Join-Path $targetRoot 'config\templates'
 New-Item -ItemType Directory -Force -Path $templateTarget | Out-Null
@@ -99,6 +134,15 @@ if (Test-Path -LiteralPath $compactLibrary -PathType Leaf) {
         throw 'MFA UI 库已变化，请重新运行 build-compact-toasts.ps1 后部署。'
     }
     Copy-Item -LiteralPath $compactLibrary -Destination (Join-Path $targetRoot 'libs\SukiUI.dll') -Force
+}
+$chartSettingsLibrary = Join-Path $projectRoot '.local\chart-settings\MFAAvalonia.Core.dll'
+if (Test-Path -LiteralPath $chartSettingsLibrary -PathType Leaf) {
+    $compatibility = Get-Content -LiteralPath (Join-Path $projectRoot '.local\chart-settings\compatibility.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $stockHash = (Get-FileHash -LiteralPath (Join-Path $RuntimeSource 'libs\MFAAvalonia.Core.dll') -Algorithm SHA256).Hash
+    if ($compatibility.stock_sha256 -ne $stockHash) {
+        throw 'MFA Core 库已变化，请重新运行 build-chart-settings.ps1 后部署。'
+    }
+    Copy-Item -LiteralPath $chartSettingsLibrary -Destination (Join-Path $targetRoot 'libs\MFAAvalonia.Core.dll') -Force
 }
 
 Write-Host "MaaPJSK MFA 已部署：$targetRoot"

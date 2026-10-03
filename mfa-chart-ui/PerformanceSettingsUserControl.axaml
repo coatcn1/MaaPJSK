@@ -1,0 +1,42 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:suki="https://github.com/kikipoulet/SukiUI"
+             xmlns:settings="clr-namespace:MFAAvalonia.ViewModels.UsersControls.Settings"
+             x:Class="MFAAvalonia.Views.UserControls.Settings.PerformanceSettingsUserControl"
+             x:DataType="settings:PerformanceSettingsUserControlModel">
+    <suki:GlassCard Padding="24,18">
+        <StackPanel Spacing="14">
+            <TextBlock Text="单人谱面演奏设置" FontSize="18" FontWeight="SemiBold" />
+            <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto,Auto" RowSpacing="16">
+                <TextBlock Grid.Row="0" Text="演奏引擎" VerticalAlignment="Center" />
+                <ComboBox Grid.Row="0" Grid.Column="1" SelectedIndex="{Binding EngineIndex, Mode=TwoWay}">
+                    <ComboBoxItem Content="MaaFramework 逐条触控" />
+                    <ComboBoxItem Content="Native 设备端定时演奏" />
+                </ComboBox>
+                <TextBlock Grid.Row="1" Text="谱面触控偏移（ms）" VerticalAlignment="Center" />
+                <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding TouchOffsetMs, Mode=TwoWay}"
+                               Minimum="-300" Maximum="300" Increment="1" FormatString="0" />
+                <TextBlock Grid.Row="2" Text="每局体力消耗检测" VerticalAlignment="Center" />
+                <ComboBox Grid.Row="2" Grid.Column="1" SelectedIndex="{Binding BonusIndex, Mode=TwoWay}">
+                    <ComboBoxItem Content="沿用游戏当前数量" />
+                    <ComboBoxItem Content="0 体力" /><ComboBoxItem Content="1 体力" /><ComboBoxItem Content="2 体力" />
+                    <ComboBoxItem Content="3 体力" /><ComboBoxItem Content="4 体力" /><ComboBoxItem Content="5 体力" />
+                    <ComboBoxItem Content="6 体力" /><ComboBoxItem Content="7 体力" /><ComboBoxItem Content="8 体力" />
+                    <ComboBoxItem Content="9 体力" /><ComboBoxItem Content="10 体力" />
+                </ComboBox>
+            </Grid>
+            <CheckBox Content="自动使用当前设备、难度已通过验证的 Native 校准配置"
+                      IsChecked="{Binding UseCalibrationProfile, Mode=TwoWay}" />
+            <TextBlock Text="实际偏移 = 已验证的校准偏移 + 上方手动偏移。正值延后触控，负值提前触控。每局开演前锁定；每局体力由所选数量决定，不足时按任务中的用药设置处理。"
+                       TextWrapping="Wrap" />
+            <TextBlock Text="Native 校准按上方体力数量完成一局排练和一局正式验证，校准期间关闭用药。MASTER 要求 GREAT 不超过 10，通过后保存当前设备和难度的配置。"
+                       TextWrapping="Wrap" />
+            <TextBlock Text="{Binding CalibrationText}" TextWrapping="Wrap" />
+            <WrapPanel>
+                <Button Content="保存演奏设置" Command="{Binding SaveCommand}" Margin="0,0,12,8" />
+                <Button Content="刷新设置与校准状态" Command="{Binding RefreshCommand}" Margin="0,0,0,8" />
+            </WrapPanel>
+            <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" />
+        </StackPanel>
+    </suki:GlassCard>
+</UserControl>

@@ -54,6 +54,7 @@ class Navigator:
         while time.monotonic() < deadline:
             self._check_stop()
             frame = self.device.screenshot()
+            self._check_title_screen(frame)
             score, _ = self.match(frame, name)
             best = max(best, score)
             if score >= self.threshold:
@@ -65,6 +66,12 @@ class Navigator:
     def _check_stop(self) -> None:
         if self.stop_requested():
             raise InterruptedError("用户已停止任务")
+
+    def _check_title_screen(self, frame: np.ndarray) -> None:
+        # 返回标题页后无法确认本局结果，继续 ESC 既不能登录，也不能可靠地增加完成次数。
+        if "title_screen" in self.templates and self.match(frame, "title_screen")[0] >= self.threshold:
+            self._save_failure(frame, "unexpected_title")
+            raise RuntimeError("游戏已返回 TAP TO START 标题页，无法确认演出结果；停止 ESC 返回，完成次数保持不变")
 
     def _save_failure(self, frame: np.ndarray, name: str) -> None:
         destination = self.config_path.parent / f"failure-{name}.png"
@@ -81,10 +88,13 @@ class Navigator:
         for backs in range(max_backs + 1):
             self._check_stop()
             frame = self.device.screenshot()
+            self._check_title_screen(frame)
             if self.match(frame, "home")[0] >= self.threshold:
                 time.sleep(0.4)
                 self._check_stop()
-                if self.match(self.device.screenshot(), "home")[0] >= self.threshold:
+                confirmation = self.device.screenshot()
+                self._check_title_screen(confirmation)
+                if self.match(confirmation, "home")[0] >= self.threshold:
                     return
             if "playing" in self.templates and self.match(frame, "playing")[0] >= self.threshold:
                 raise RuntimeError("当前仍在演奏中，停止主页返回，请待演出结束后再启动")
@@ -186,7 +196,12 @@ class Navigator:
         frame = self.wait("recovery_dialog")
         # 默认已在道具页时不重复切换标签，避免页面刷新吞掉紧接着的加号点击。
         if self.match(frame, "recovery_item_tab")[0] < self.threshold:
-            self.tap(461, 104, "道具恢复页")
+            # 消耗与回复标题始终可见，标题匹配不能证明回复页已打开；先切换顶部标签。
+            self.tap(802, 42, "选择体力回复标签")
+            time.sleep(0.4)
+            frame = self.wait("recovery_dialog")
+            if self.match(frame, "recovery_item_tab")[0] < self.threshold:
+                self.tap(461, 104, "道具恢复页")
         frame = self.wait("recovery_item_tab")
         row = f"recovery_{mode}_row"
         if self.match(frame, row)[0] < self.threshold:
@@ -302,6 +317,7 @@ class Navigator:
         while time.monotonic() < deadline:
             self._check_stop()
             frame = self.device.screenshot()
+            self._check_title_screen(frame)
             if self.match(frame, "playing")[0] >= self.threshold:
                 return
             if self.match(frame, "recovery_dialog")[0] >= self.threshold:
@@ -317,20 +333,25 @@ class Navigator:
         raise TimeoutError("开演后未出现演奏场或已知体力恢复页")
 
     def collect_with_back(self, *, timeout: float = 180) -> None:
-        # 结算中只检查主页终点。右下角像素用于加速动画，BACK 负责推进页面。
+        # 主页仍是结算终点；标题页表示结果无法确认，必须停止而不能把重新登录计为完成。
         deadline = time.monotonic() + timeout
         backs = 0
         while time.monotonic() < deadline:
             self._check_stop()
             frame = self.device.screenshot()
+            self._check_title_screen(frame)
             if self.match(frame, "home")[0] >= self.threshold:
                 time.sleep(0.5)
-                if self.match(self.device.screenshot(), "home")[0] >= self.threshold:
+                self._check_stop()
+                confirmation = self.device.screenshot()
+                self._check_title_screen(confirmation)
+                if self.match(confirmation, "home")[0] >= self.threshold:
                     print(f"已回到主页，BACK 次数={backs}", flush=True)
                     return
             self.tap(1279, 719, "结算动画安全像素")
             time.sleep(0.25)
             frame = self.device.screenshot()
+            self._check_title_screen(frame)
             if self.match(frame, "home")[0] >= self.threshold:
                 continue
             print("结算 Android BACK（ESC）", flush=True)
