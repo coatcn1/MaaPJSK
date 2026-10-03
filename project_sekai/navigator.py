@@ -11,6 +11,10 @@ import numpy as np
 from .device import AdbDevice
 
 
+class AutoEnableRejected(RuntimeError):
+    """点击 AUTO 后未进入开启状态，需要关闭提示并处理体力。"""
+
+
 class Navigator:
     def __init__(self, device: AdbDevice, config_path: str | Path, *, dry_run: bool = False,
                  stop_requested: Callable[[], bool] | None = None,
@@ -140,58 +144,116 @@ class Navigator:
         self.tap(565, 669, "自动演奏开关")
         if not self.dry_run:
             time.sleep(0.5)
-            frame = self.wait("prepare")
-            if self.match(frame, wanted)[0] < self.threshold:
-                raise RuntimeError("AUTO LIVE 未启用；请检查 Live Bonus 是否至少设置为 1")
+            frame = self.device.screenshot()
+            if (self.match(frame, "prepare")[0] < self.threshold or
+                    self.match(frame, wanted)[0] < self.threshold):
+                if enabled:
+                    raise AutoEnableRejected("点击 AUTO 后未开启")
+                raise RuntimeError("AUTO 开关未进入指定状态")
+            self.log_message("AUTO 已开启" if enabled else "AUTO 已关闭")
+
+    def _dismiss_auto_prompt(self) -> None:
+        self._dismiss_bonus_notice("关闭 AUTO 体力不足提示")
+
+    def _dismiss_bonus_notice(self, reason: str) -> np.ndarray:
+        # 这两类通知均由 BACK 关闭；只发一次，随后确认准备页，避免连续返回。
+        self._check_stop()
+        self.log_message(f"{reason}：ESC/BACK")
+        self._check_stop()
+        self.device.back()
+        time.sleep(0.5)
+        return self.wait("prepare")
+
+    def prepare_auto(self, mode: str, count: int = 1) -> None:
+        before = self.wait("prepare")
+        try:
+            self.ensure_auto(True)
+            return
+        except AutoEnableRejected:
+            self.log_message("AUTO 未开启，关闭提示后按设置回复体力")
+            self._dismiss_auto_prompt()
+            if mode == "off":
+                raise RuntimeError("AUTO 未开启；自动回复体力已关闭")
+            self.tap(1086, 42, "打开体力回复")
+            self._recover_and_verify(before, mode, count)
+        # 本次规定数量全部回复后只重试一次，避免其他错误导致无限用药。
+        self.ensure_auto(True)
 
     def recover_bonus_from_dialog(self, mode: str) -> None:
-        # 只允许已确认的道具页和一瓶饮料；水晶页不在自动恢复路径中。
+        # 道具页每次通过滑条复位和一次加号选择一瓶，不识别数字；水晶页不在恢复路径中。
         if mode not in {"small", "large"}:
             raise ValueError("体力恢复仅支持 small 或 large 道具")
-        self.wait("recovery_dialog")
-        self.tap(461, 104, "道具恢复页")
+        frame = self.wait("recovery_dialog")
+        # 默认已在道具页时不重复切换标签，避免页面刷新吞掉紧接着的加号点击。
+        if self.match(frame, "recovery_item_tab")[0] < self.threshold:
+            self.tap(461, 104, "道具恢复页")
         frame = self.wait("recovery_item_tab")
         row = f"recovery_{mode}_row"
         if self.match(frame, row)[0] < self.threshold:
             self._save_failure(frame, "recovery_item")
             raise RuntimeError("恢复道具页面未确认")
-        small_area = (828, 215, 942, 284)
-        large_area = (828, 350, 942, 424)
-        if (self.match(frame, "recovery_small_zero", small_area)[0] < self.threshold or
-                self.match(frame, "recovery_large_zero", large_area)[0] < self.threshold):
-            self._save_failure(frame, "recovery_initial_count")
-            raise RuntimeError("恢复页初始选择数量不是零，停止以避免消耗多瓶道具")
         plus_y = 247 if mode == "small" else 386
-        self.tap(794, plus_y, "选择一瓶恢复饮料")
-        selected = f"recovery_{mode}_selected"
-        area = small_area if mode == "small" else large_area
-        other = "large" if mode == "small" else "small"
-        other_area = large_area if mode == "small" else small_area
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
+        # 标题和标签可在动画结束前匹配成功，先等待界面稳定。
+        time.sleep(0.5)
+        confirm_location = None
+        for attempt in range(1, 4):
             self._check_stop()
             frame = self.device.screenshot()
-            if self.match(frame, selected, area)[0] >= self.threshold:
-                break
+            if (self.match(frame, "recovery_dialog")[0] < self.threshold or
+                    self.match(frame, "recovery_item_tab")[0] < self.threshold):
+                self._save_failure(frame, "recovery_selection")
+                raise RuntimeError("选择饮料时道具回复页已关闭")
+            # 每次重试均复位两条滑条，避免第一次输入延迟生效后再次加号叠加用药。
+            self.tap(534, 247, "小饮料滑条复位")
+            self.tap(534, 386, "大饮料滑条复位")
             time.sleep(0.3)
+            self.log_message(f"体力回复：选择一瓶饮料，点击加号 {attempt}/3")
+            self.tap(794, plus_y, "选择一瓶恢复饮料")
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                self._check_stop()
+                frame = self.device.screenshot()
+                if self.match(frame, "recovery_dialog")[0] < self.threshold:
+                    self._save_failure(frame, "recovery_selection")
+                    raise RuntimeError("选择饮料时回复页已关闭")
+                # 广告回复入口出现时，决定按钮会右移；使用实际匹配位置，不点广告按钮。
+                score, location = self.match(frame, "recovery_confirm_enabled", (270, 612, 1000, 695))
+                if score >= self.threshold:
+                    confirm_location = location
+                    break
+                time.sleep(0.3)
+            if confirm_location is not None:
+                break
         else:
             self._save_failure(frame, "recovery_selection")
-            raise RuntimeError("未确认已选择一瓶恢复饮料")
-        if self.match(frame, f"recovery_{other}_zero", other_area)[0] < self.threshold:
-            self._save_failure(frame, "recovery_other_count")
-            raise RuntimeError("另一种恢复饮料的选择数量不是零")
-        if self.match(frame, "recovery_confirm_enabled", (625, 612, 890, 694))[0] < self.threshold:
-            raise RuntimeError("恢复确认按钮未启用")
-        self.tap(756, 655, "确认消耗一瓶恢复饮料")
+            raise RuntimeError("选择一瓶饮料后决定按钮未启用")
+        height, width = self.templates["recovery_confirm_enabled"].shape[:2]
+        self.tap(confirm_location[0] + width // 2, confirm_location[1] + height // 2, "提交一瓶恢复饮料选择")
+        self._confirm_bonus_recovery()
+
+    def _confirm_bonus_recovery(self) -> None:
+        # 决定只打开二次确认；必须识别 Live Bonus 提示和 OK，再确认回到准备页。
         deadline = time.monotonic() + 20
+        ok_clicks = 0
+        last_click = float("-inf")
+        time.sleep(0.5)
         while time.monotonic() < deadline:
             self._check_stop()
             frame = self.device.screenshot()
-            if self.match(frame, "recovery_dialog")[0] < self.threshold:
+            prompt = self.match(frame, "recovery_ok_dialog", (300, 270, 965, 385))[0]
+            score, location = self.match(frame, "recovery_ok_button", (640, 389, 882, 460))
+            if prompt >= self.threshold and score >= self.threshold:
+                if ok_clicks < 3 and time.monotonic() - last_click >= 1.0:
+                    height, width = self.templates["recovery_ok_button"].shape[:2]
+                    self.tap(location[0] + width // 2, location[1] + height // 2, "确认体力回复 OK")
+                    ok_clicks += 1
+                    last_click = time.monotonic()
+            elif (ok_clicks and self.match(frame, "prepare")[0] >= self.threshold
+                  and self.match(frame, "recovery_dialog")[0] < self.threshold):
                 return
             time.sleep(0.5)
-        self._save_failure(frame, "recovery_confirmation")
-        raise TimeoutError("确认恢复后窗口仍未关闭")
+        self._save_failure(frame, "recovery_ok")
+        raise TimeoutError("体力回复 OK 确认未完成或未返回准备页")
 
     @staticmethod
     def _verify_bonus_changed(before: np.ndarray, after: np.ndarray) -> None:
@@ -200,22 +262,55 @@ class Navigator:
         if float(np.abs(before_bonus - after_bonus).mean()) < 2.0:
             raise RuntimeError("恢复窗口已关闭，但体力显示没有变化")
 
-    def wait_for_play_or_recovery(self, before: np.ndarray, mode: str, remaining: int) -> int:
+    def _wait_for_bonus_change(self, before: np.ndarray) -> np.ndarray:
+        # OK 弹窗先关闭，服务器回复和顶部体力可能稍后更新；等待结果而不再次用药。
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            self._check_stop()
+            after = self.device.screenshot()
+            if self.match(after, "prepare")[0] >= self.threshold:
+                try:
+                    self._verify_bonus_changed(before, after)
+                except RuntimeError:
+                    pass
+                else:
+                    return after
+            time.sleep(0.3)
+        self._save_failure(after, "recovery_bonus_update")
+        raise RuntimeError("确认 OK 后等待 10 秒，体力显示仍没有变化")
+
+    def _recover_and_verify(self, before: np.ndarray, mode: str, count: int = 1) -> np.ndarray:
+        if mode == "off":
+            raise RuntimeError("游戏请求恢复体力；自动回复体力已关闭")
+        label = "小饮料" if mode == "small" else "大饮料"
+        self.log_message(f"体力回复：本次使用 {count} 瓶{label}")
+        # 每瓶独立执行加号、决定和 OK，再核对体力变化，按设置次数完成本次回复。
+        for index in range(count):
+            self._check_stop()
+            if index:
+                self.tap(1086, 42, "继续打开体力回复")
+            self.recover_bonus_from_dialog(mode)
+            after = self._wait_for_bonus_change(before)
+            after = self._dismiss_bonus_notice("关闭体力回复完成提示")
+            self.log_message(f"体力回复成功：{label} {index + 1}/{count} 瓶")
+            before = after
+        return before
+
+    def wait_for_play_or_recovery(self, before: np.ndarray, mode: str, count: int = 1) -> None:
         deadline = time.monotonic() + 45
+        recovered = False
         while time.monotonic() < deadline:
             self._check_stop()
             frame = self.device.screenshot()
             if self.match(frame, "playing")[0] >= self.threshold:
-                return remaining
+                return
             if self.match(frame, "recovery_dialog")[0] >= self.threshold:
-                if mode == "off" or remaining <= 0:
-                    raise RuntimeError("游戏请求恢复体力；MFA 未获准使用恢复道具或次数已达上限")
-                self.recover_bonus_from_dialog(mode)
-                after = self.wait("prepare", timeout=20)
-                self._verify_bonus_changed(before, after)
+                if recovered:
+                    raise RuntimeError("回复体力后再次出现回复页，停止以免重复消耗")
+                before = self._recover_and_verify(before, mode, count)
+                recovered = True
+                self.ensure_auto(True)
                 self.tap(1010, 558, "恢复体力后重新开始演出")
-                before = self.device.screenshot()
-                remaining -= 1
                 deadline = time.monotonic() + 45
             time.sleep(0.5)
         self._save_failure(frame, "start_or_recovery")
@@ -247,24 +342,25 @@ class Navigator:
         raise TimeoutError(f"结算 {timeout:.0f} 秒后仍未确认主页，BACK 次数={backs}")
 
     def start_and_collect(self, *, max_song_seconds: float = 300,
-                          recovery_mode: str = "off", recovery_remaining: int = 0) -> int:
+                          recovery_mode: str = "off", recovery_count: int = 1) -> None:
         before = self.wait("prepare")
         self.tap(1010, 558, "开始演出")
         if self.dry_run:
-            return recovery_remaining
+            return
         # 开演后必须在短时间内看到演奏场，体力不足或弹窗不会误耗完整曲目超时。
-        recovery_remaining = self.wait_for_play_or_recovery(before, recovery_mode, recovery_remaining)
+        self.wait_for_play_or_recovery(before, recovery_mode, recovery_count)
         self.wait("live_clear", timeout=max_song_seconds)
         self.collect_with_back()
-        return recovery_remaining
 
     def auto_live_loop(self, rounds: int, *, song_mode: str = "current",
-                       recovery_mode: str = "off", recovery_limit: int = 0) -> None:
+                       recovery_mode: str = "off",
+                       recovery_count: int = 1) -> None:
         if rounds < 1:
             raise ValueError("rounds 必须至少为 1")
         if song_mode not in {"current", "random"}:
             raise ValueError("选曲方式无效")
-        if recovery_mode not in {"off", "small", "large"} or not 0 <= recovery_limit <= 99:
+        if (recovery_mode not in {"off", "small", "large"} or
+                isinstance(recovery_count, bool) or not isinstance(recovery_count, int) or not 1 <= recovery_count <= 99):
             raise ValueError("恢复配置无效")
         self.device.preflight()
         self.completed_rounds = 0
@@ -275,10 +371,10 @@ class Navigator:
             self.navigate_to_prepare(song_mode)
             if self.dry_run:
                 return
-            self.ensure_auto(True)
-            recovery_limit = self.start_and_collect(
+            self.prepare_auto(recovery_mode, recovery_count)
+            self.start_and_collect(
                 recovery_mode=recovery_mode,
-                recovery_remaining=recovery_limit,
+                recovery_count=recovery_count,
             )
             self.completed_rounds += 1
             self.log_message(f"自动演出：已完成 {self.completed_rounds} / 总数 {rounds}")

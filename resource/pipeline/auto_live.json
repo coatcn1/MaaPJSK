@@ -9,13 +9,13 @@
     "action": "Custom",
     "custom_action": "ProjectSekaiRecoveryModeConfig",
     "custom_action_param": {"mode": "off"},
-    "next": ["AutoLiveRecoveryLimitConfig"]
+    "next": ["AutoLiveRecoveryCountConfig"]
   },
-  "AutoLiveRecoveryLimitConfig": {
+  "AutoLiveRecoveryCountConfig": {
     "recognition": "DirectHit",
     "action": "Custom",
-    "custom_action": "ProjectSekaiRecoveryLimitConfig",
-    "custom_action_param": {"limit": 1},
+    "custom_action": "ProjectSekaiRecoveryCountConfig",
+    "custom_action_param": {"count": 1},
     "next": ["AutoLiveSongModeConfig"]
   },
   "AutoLiveSongModeConfig": {

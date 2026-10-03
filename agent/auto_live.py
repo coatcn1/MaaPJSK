@@ -64,19 +64,6 @@ class ProjectSekaiRecoveryModeConfig(CustomAction):
             return False
 
 
-@AgentServer.custom_action("ProjectSekaiRecoveryLimitConfig")
-class ProjectSekaiRecoveryLimitConfig(CustomAction):
-    def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
-        try:
-            raw = json.loads(argv.custom_action_param or "{}").get("limit", 1)
-            if isinstance(raw, bool) or not str(raw).isdigit() or not 1 <= int(raw) <= 99:
-                return False
-            _SETTINGS[_task_id(argv)]["limit"] = int(raw)
-            return True
-        except Exception:
-            return False
-
-
 @AgentServer.custom_action("ProjectSekaiSongModeConfig")
 class ProjectSekaiSongModeConfig(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
@@ -90,6 +77,19 @@ class ProjectSekaiSongModeConfig(CustomAction):
             return False
 
 
+@AgentServer.custom_action("ProjectSekaiRecoveryCountConfig")
+class ProjectSekaiRecoveryCountConfig(CustomAction):
+    def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
+        try:
+            raw = json.loads(argv.custom_action_param or "{}").get("count", 1)
+            if isinstance(raw, bool) or not str(raw).isdigit() or not 1 <= int(raw) <= 99:
+                return False
+            _SETTINGS[_task_id(argv)]["count"] = int(raw)
+            return True
+        except Exception:
+            return False
+
+
 @AgentServer.custom_action("ProjectSekaiAutoLive")
 class ProjectSekaiAutoLive(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
@@ -98,10 +98,10 @@ class ProjectSekaiAutoLive(CustomAction):
         try:
             parameters = json.loads(argv.custom_action_param or "{}")
             count = _round_count(parameters.get("count", 1))
-            settings = _SETTINGS.pop(_task_id(argv), {"mode": "off", "limit": 1})
+            settings = _SETTINGS.pop(_task_id(argv), {"mode": "off"})
             mode = str(settings["mode"])
             song_mode = str(settings.get("song_mode", "current"))
-            limit = int(settings.get("limit", 1)) if mode != "off" else 0
+            recovery_count = int(settings.get("count", 1))
             device = MaaDevice(context.tasker.controller)
             navigator = Navigator(
                 device,
@@ -109,7 +109,8 @@ class ProjectSekaiAutoLive(CustomAction):
                 stop_requested=lambda: bool(context.tasker.stopping),
                 log_message=lambda content: _visible_log(context, content),
             )
-            navigator.auto_live_loop(count, song_mode=song_mode, recovery_mode=mode, recovery_limit=limit)
+            navigator.auto_live_loop(count, song_mode=song_mode, recovery_mode=mode,
+                                     recovery_count=recovery_count)
             return True
         except InterruptedError:
             return False

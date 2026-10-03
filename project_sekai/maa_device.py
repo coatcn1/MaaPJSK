@@ -32,7 +32,8 @@ class MaaDevice:
         return frame
 
     def tap(self, x: int, y: int) -> None:
-        self.controller.post_click(x, y).wait()
+        if not self.controller.post_click(x, y).wait().succeeded:
+            raise RuntimeError(f"MFA 控制器点击失败：({x}, {y})")
 
     def back(self) -> None:
         self.controller.post_click_key(4).wait()

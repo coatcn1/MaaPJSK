@@ -29,7 +29,7 @@ class AutoLiveConfigurationTests(unittest.TestCase):
         self.assertEqual([task["name"] for task in interface["task"]], ["AutoLive"])
         self.assertEqual(
             interface["task"][0]["option"],
-            ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryLimit"],
+            ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryCount"],
         )
         self.assertEqual(interface["option"]["AutoLiveSongMode"]["default_case"], "Current")
         self.assertEqual(
@@ -37,24 +37,24 @@ class AutoLiveConfigurationTests(unittest.TestCase):
             ["当前歌曲", "随机选取"],
         )
 
-    def test_mode_limit_and_rounds_reach_navigator(self) -> None:
+    def test_mode_quantity_and_rounds_reach_navigator(self) -> None:
         task_id = 731
         context = SimpleNamespace(tasker=SimpleNamespace(controller=object(), stopping=False))
         self.assertTrue(auto_live.ProjectSekaiRecoveryModeConfig().run(context, argument(task_id, {"mode": "small"})))
-        self.assertTrue(auto_live.ProjectSekaiRecoveryLimitConfig().run(context, argument(task_id, {"limit": 3})))
+        self.assertTrue(auto_live.ProjectSekaiRecoveryCountConfig().run(context, argument(task_id, {"count": 2})))
         self.assertTrue(auto_live.ProjectSekaiSongModeConfig().run(context, argument(task_id, {"mode": "random"})))
         with patch.object(auto_live, "MaaDevice"), patch.object(auto_live, "Navigator") as navigator_type:
             self.assertTrue(auto_live.ProjectSekaiAutoLive().run(context, argument(task_id, {"count": 5})))
             navigator_type.return_value.auto_live_loop.assert_called_once_with(
-                5, song_mode="random", recovery_mode="small", recovery_limit=3
+                5, song_mode="random", recovery_mode="small", recovery_count=2
             )
         self.assertNotIn(task_id, auto_live._SETTINGS)
 
-    def test_invalid_limit_does_not_start_auto_live(self) -> None:
+    def test_invalid_quantity_is_rejected(self) -> None:
         task_id = 732
         context = SimpleNamespace(tasker=SimpleNamespace(controller=object(), stopping=False))
         self.assertTrue(auto_live.ProjectSekaiRecoveryModeConfig().run(context, argument(task_id, {"mode": "large"})))
-        self.assertFalse(auto_live.ProjectSekaiRecoveryLimitConfig().run(context, argument(task_id, {"limit": 0})))
+        self.assertFalse(auto_live.ProjectSekaiRecoveryCountConfig().run(context, argument(task_id, {"count": 0})))
         self.assertEqual(auto_live._SETTINGS[task_id], {"mode": "large"})
 
     def test_invalid_song_mode_is_rejected(self) -> None:
@@ -113,25 +113,180 @@ class RecoveryGuardTests(unittest.TestCase):
         navigator.threshold = 0.83
         navigator.match = lambda _frame, name, _area=None: (1.0 if name == "recovery_dialog" else 0.0, (0, 0))
         navigator.tap = lambda *_args: self.fail("关闭恢复时不应点击道具或确认")
-        for mode, remaining in (("off", 1), ("small", 0)):
-            with self.subTest(mode=mode, remaining=remaining):
-                with self.assertRaisesRegex(RuntimeError, "未获准使用恢复道具或次数已达上限"):
-                    navigator.wait_for_play_or_recovery(frame, mode, remaining)
+        with self.assertRaisesRegex(RuntimeError, "自动回复体力已关闭"):
+            navigator.wait_for_play_or_recovery(frame, "off")
 
-    def test_existing_item_selection_is_rejected_before_click(self) -> None:
+    def test_unrecognized_item_row_is_rejected_before_click(self) -> None:
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         navigator = Navigator.__new__(Navigator)
         navigator.threshold = 0.83
         navigator.wait = lambda _name: frame
         navigator.match = lambda _frame, name, _area=None: (
-            0.0 if name == "recovery_large_zero" else 1.0, (0, 0)
+            0.0 if name == "recovery_small_row" else 1.0, (0, 0)
         )
         navigator._save_failure = lambda *_args: None
         taps: list[tuple[int, int]] = []
         navigator.tap = lambda x, y, _reason: taps.append((x, y))
-        with self.assertRaisesRegex(RuntimeError, "初始选择数量不是零"):
+        with self.assertRaisesRegex(RuntimeError, "恢复道具页面未确认"):
             navigator.recover_bonus_from_dialog("small")
-        self.assertEqual(taps, [(461, 104)])
+        self.assertEqual(taps, [])
+
+
+class ZeroBonusPreparationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.empty = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.filled = self.empty.copy()
+        self.filled[25:60, 1045:1120] = 100
+        self.navigator = Navigator.__new__(Navigator)
+        self.navigator.device = SimpleNamespace(preflight=lambda: None, screenshot=lambda: self.frame)
+        self.navigator.device.back = Mock()
+        self.navigator.threshold = 0.83
+        self.navigator.stop_requested = lambda: False
+        self.navigator.dry_run = False
+        self.frame = self.empty
+        self.auto_on = False
+        self.taps: list[tuple[int, int]] = []
+        self.messages: list[str] = []
+        self.navigator.log_message = self.messages.append
+        self.navigator._save_failure = Mock()
+        self.navigator.navigate_to_prepare = Mock()
+        self.navigator.wait = lambda _name, **_kwargs: self.frame
+        self.navigator.match = self.match
+        self.navigator.tap = self.tap
+        self.navigator.recover_bonus_from_dialog = Mock(side_effect=self.recover)
+        self.navigator.start_and_collect = Mock(side_effect=self.start)
+
+    def match(self, frame: np.ndarray, name: str, _area=None) -> tuple[float, tuple[int, int]]:
+        matches = {"prepare": True, "auto_on": self.auto_on,
+                   "auto_off": not self.auto_on}
+        return (1.0 if matches.get(name, False) else 0.0), (0, 0)
+
+    def tap(self, x: int, y: int, _reason: str) -> None:
+        self.taps.append((x, y))
+        if (x, y) == (565, 669) and self.frame is self.filled:
+            self.auto_on = True
+
+    def recover(self, _mode: str) -> None:
+        self.frame = self.filled
+
+    def start(self, **kwargs) -> None:
+        self.assertTrue(self.auto_on, "补充体力并确认 AUTO 后才能开演")
+
+    def test_zero_bonus_is_recovered_before_auto_and_start(self) -> None:
+        with patch("project_sekai.navigator.time.sleep"):
+            self.navigator.auto_live_loop(1, recovery_mode="large")
+        self.navigator.recover_bonus_from_dialog.assert_called_once_with("large")
+        self.assertEqual(self.taps, [(565, 669), (1086, 42), (565, 669)])
+        self.assertEqual(self.navigator.device.back.call_count, 2)
+        self.navigator.start_and_collect.assert_called_once_with(
+            recovery_mode="large", recovery_count=1)
+        self.assertEqual(self.navigator.completed_rounds, 1)
+
+    def test_disabled_recovery_does_not_open_popup_or_start(self) -> None:
+        with patch("project_sekai.navigator.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "自动回复体力已关闭"):
+                self.navigator.auto_live_loop(1, recovery_mode="off")
+        self.assertNotIn((1086, 42), self.taps)
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+        self.navigator.start_and_collect.assert_not_called()
+
+    def test_nonzero_bonus_does_not_consume_drink(self) -> None:
+        self.frame = self.filled
+        with patch("project_sekai.navigator.time.sleep"):
+            self.navigator.auto_live_loop(1, recovery_mode="large")
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+        self.navigator.start_and_collect.assert_called_once_with(
+            recovery_mode="large", recovery_count=1)
+
+    def test_recovery_without_bonus_change_never_starts(self) -> None:
+        self.navigator.recover_bonus_from_dialog.side_effect = lambda _mode: None
+        with patch("project_sekai.navigator.time.sleep"), patch(
+                "project_sekai.navigator.time.monotonic", side_effect=range(30)):
+            with self.assertRaisesRegex(RuntimeError, "体力显示仍没有变化"):
+                self.navigator.auto_live_loop(1, recovery_mode="large")
+        self.assertEqual(self.taps, [(565, 669), (1086, 42)])
+        self.navigator.device.back.assert_called_once()
+        self.navigator.start_and_collect.assert_not_called()
+
+    def test_bonus_update_can_arrive_after_ok_dialog_closes(self) -> None:
+        readings = iter((self.empty, self.empty, self.filled))
+        self.navigator.device.screenshot = lambda: next(readings)
+        with patch("project_sekai.navigator.time.sleep"):
+            after = self.navigator._wait_for_bonus_change(self.empty)
+        self.assertIs(after, self.filled)
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_recovery_runs_again_when_a_later_round_needs_bonus(self) -> None:
+        def next_round(_mode: str) -> None:
+            self.frame = self.empty
+            self.auto_on = False
+        self.navigator.navigate_to_prepare.side_effect = next_round
+        with patch("project_sekai.navigator.time.sleep"):
+            self.navigator.auto_live_loop(2, recovery_mode="large")
+        self.assertEqual(self.navigator.recover_bonus_from_dialog.call_count, 2)
+        self.assertEqual(self.navigator.start_and_collect.call_count, 2)
+        self.assertEqual(self.navigator.completed_rounds, 2)
+
+    def test_specified_quantity_is_consumed_before_auto_retry(self) -> None:
+        def recover_one(_mode: str) -> None:
+            self.filled = self.frame.copy()
+            self.filled[25:60, 1045:1120] += 60
+            self.frame = self.filled
+        self.navigator.recover_bonus_from_dialog.side_effect = recover_one
+        with patch("project_sekai.navigator.time.sleep"):
+            self.navigator.auto_live_loop(1, recovery_mode="small", recovery_count=3)
+        self.assertEqual(self.navigator.recover_bonus_from_dialog.call_count, 3)
+        self.navigator.start_and_collect.assert_called_once_with(
+            recovery_mode="small", recovery_count=3)
+        self.assertEqual(self.taps.count((1086, 42)), 3)
+        self.assertEqual(self.taps[-1], (565, 669))
+        self.assertEqual(self.navigator.device.back.call_count, 4)
+
+    def test_rejected_again_after_recovery_does_not_consume_more(self) -> None:
+        self.navigator.tap = lambda x, y, _reason: self.taps.append((x, y))
+        with patch("project_sekai.navigator.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "点击 AUTO 后未开启"):
+                self.navigator.auto_live_loop(1, recovery_mode="large")
+        self.navigator.recover_bonus_from_dialog.assert_called_once_with("large")
+        self.navigator.start_and_collect.assert_not_called()
+
+    def test_modal_auto_prompt_is_closed_with_back(self) -> None:
+        modal = [False]
+        def tap(x: int, y: int, reason: str) -> None:
+            self.tap(x, y, reason)
+            if (x, y) == (565, 669) and self.frame is self.empty:
+                modal[0] = True
+        original_match = self.match
+        self.navigator.tap = tap
+        self.navigator.match = lambda frame, name, area=None: (
+            (0.0, (0, 0)) if name == "prepare" and modal[0] else original_match(frame, name, area))
+        self.navigator.device.back = Mock(side_effect=lambda: modal.__setitem__(0, False))
+        with patch("project_sekai.navigator.time.sleep"):
+            self.navigator.auto_live_loop(1, recovery_mode="large")
+        self.assertEqual(self.navigator.device.back.call_count, 2)
+        self.assertNotIn((1279, 719), self.taps)
+
+    def test_stop_before_notice_dismissal_never_sends_back(self) -> None:
+        self.navigator.stop_requested = lambda: True
+        with self.assertRaises(InterruptedError):
+            self.navigator._dismiss_bonus_notice("关闭体力回复完成提示")
+        self.navigator.device.back.assert_not_called()
+
+    def test_recovery_notice_is_dismissed_before_retrying_auto(self) -> None:
+        events = []
+        self.navigator.device.back.side_effect = lambda: events.append("esc")
+        def recover(mode):
+            events.append("recover")
+            self.recover(mode)
+        def tap(x, y, reason):
+            if (x, y) == (565, 669):
+                events.append("auto")
+            self.tap(x, y, reason)
+        self.navigator.recover_bonus_from_dialog.side_effect = recover
+        self.navigator.tap = tap
+        with patch("project_sekai.navigator.time.sleep"):
+            self.navigator.auto_live_loop(1, recovery_mode="large")
+        self.assertEqual(events, ["auto", "esc", "recover", "esc", "auto"])
 
 
 class ProgressTests(unittest.TestCase):
@@ -141,7 +296,7 @@ class ProgressTests(unittest.TestCase):
         navigator.stop_requested = lambda: False
         navigator.dry_run = False
         navigator.navigate_to_prepare = Mock()
-        navigator.ensure_auto = Mock()
+        navigator.prepare_auto = Mock()
         navigator.start_and_collect = Mock(side_effect=[0, RuntimeError("第二局失败")])
         messages: list[str] = []
         navigator.log_message = messages.append

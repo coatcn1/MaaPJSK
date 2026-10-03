@@ -29,9 +29,9 @@
     {
       "name": "AutoLive",
       "label": "🎶 自动演出",
-      "description": "从主页使用选曲页当前歌曲或点击随机选曲，并使用游戏内 AUTO LIVE 按指定次数循环；结算使用 BACK 返回主页。仅在游戏弹出体力回复页时，才按所选策略与瓶数上限使用道具。",
+      "description": "通过游戏内 AUTO LIVE 按指定次数循环。每次 AUTO 开启失败时关闭提示，按指定种类和每次瓶数回复，再返回开启 AUTO。",
       "entry": "AutoLive",
-      "option": ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryLimit"]
+      "option": ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryCount"]
     }
   ],
   "option": {
@@ -103,21 +103,19 @@
         }
       ]
     },
-    "AutoLiveRecoveryLimit": {
+    "AutoLiveRecoveryCount": {
       "type": "input",
-      "label": "单次任务最多使用饮料",
-      "inputs": [
-        {
-          "name": "Limit",
-          "label": "瓶数上限",
-          "default": "1",
-          "pipeline_type": "int",
-          "verify": "^[1-9][0-9]?$",
-          "pattern_msg": "请输入 1 到 99 的整数"
-        }
-      ],
+      "label": "每次回复饮料数量",
+      "inputs": [{
+        "name": "RecoveryCount",
+        "label": "每次瓶数",
+        "default": "1",
+        "pipeline_type": "int",
+        "verify": "^[1-9][0-9]?$",
+        "pattern_msg": "请输入 1 到 99 的整数"
+      }],
       "pipeline_override": {
-        "AutoLiveRecoveryLimitConfig": {"custom_action_param": {"limit": "{Limit}"}}
+        "AutoLiveRecoveryCountConfig": {"custom_action_param": {"count": "{RecoveryCount}"}}
       }
     }
   }

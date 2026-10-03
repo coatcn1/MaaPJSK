@@ -14,10 +14,8 @@
     "recovery_item_tab": {"capture": "recovery_popup_1.png", "box": [360, 87, 560, 121]},
     "recovery_small_row": {"capture": "recovery_popup_1.png", "box": [420, 179, 731, 223]},
     "recovery_large_row": {"capture": "recovery_popup_1.png", "box": [420, 314, 731, 359]},
-    "recovery_small_zero": {"capture": "recovery_popup_1.png", "box": [838, 222, 932, 274]},
-    "recovery_large_zero": {"capture": "recovery_popup_1.png", "box": [838, 359, 932, 414]},
-    "recovery_small_selected": {"capture": "recovery_small_preview.png", "box": [838, 222, 932, 274]},
-    "recovery_large_selected": {"capture": "recovery_large_preview.png", "box": [838, 359, 932, 414]},
-    "recovery_confirm_enabled": {"capture": "recovery_small_preview.png", "box": [658, 634, 862, 679]}
+    "recovery_confirm_enabled": {"capture": "recovery_small_preview.png", "box": [658, 634, 862, 679]},
+    "recovery_ok_dialog": {"capture": "recovery_ok.png", "box": [389, 302, 560, 329]},
+    "recovery_ok_button": {"capture": "recovery_ok.png", "box": [658, 405, 860, 440]}
   }
 }
