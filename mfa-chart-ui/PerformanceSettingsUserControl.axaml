@@ -6,7 +6,7 @@
              x:DataType="settings:PerformanceSettingsUserControlModel">
     <suki:GlassCard Padding="24,18">
         <StackPanel Spacing="14">
-            <TextBlock Text="单人谱面演奏设置" FontSize="18" FontWeight="SemiBold" />
+            <TextBlock Text="谱面演奏设置" FontSize="18" FontWeight="SemiBold" />
             <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto,Auto" RowSpacing="16">
                 <TextBlock Grid.Row="0" Text="演奏引擎" VerticalAlignment="Center" />
                 <ComboBox Grid.Row="0" Grid.Column="1" SelectedIndex="{Binding EngineIndex, Mode=TwoWay}">
@@ -27,9 +27,13 @@
             </Grid>
             <CheckBox Content="自动使用当前设备、难度已通过验证的 Native 校准配置"
                       IsChecked="{Binding UseCalibrationProfile, Mode=TwoWay}" />
+            <CheckBox Content="协力演奏中按 FAST / LATE 微调（试验）"
+                      IsChecked="{Binding CooperativeGameTimingFeedback, Mode=TwoWay}" />
+            <TextBlock Text="仅 Native 协力生效。复用每 2 秒观察，12 秒内 3 次有效同向 GREAT 才微调未来输入，确认 PERFECT 或相反方向后清空；每次 5 ms，至少 6 秒一次，累计限制 ±60 ms；原手动偏移不改。"
+                       TextWrapping="Wrap" />
             <TextBlock Text="实际偏移 = 已验证的校准偏移 + 上方手动偏移。正值延后触控，负值提前触控。每局开演前锁定；每局体力由所选数量决定，不足时按任务中的用药设置处理。"
                        TextWrapping="Wrap" />
-            <TextBlock Text="Native 校准按上方体力数量完成一局排练和一局正式验证，校准期间关闭用药。MASTER 要求 GREAT 不超过 10，通过后保存当前设备和难度的配置。"
+            <TextBlock Text="Native 校准按上方体力数量完成一局排练和一局正式验证，校准期间关闭用药。以实际 FAST 与 LATE（SLOW）接近平衡为目标，不因 MISS 等其他判定单独拒绝；仍要求 LIVE CLEAR、音数匹配、完整输入与释放。通过后保存当前设备和难度的配置。"
                        TextWrapping="Wrap" />
             <TextBlock Text="{Binding CalibrationText}" TextWrapping="Wrap" />
             <WrapPanel>

@@ -11,6 +11,8 @@ from maa.tasker import Tasker
 
 import auto_live  # noqa: F401
 import solo_live  # noqa: F401
+import cooperative_live  # noqa: F401
+import one_shot_live  # noqa: F401
 
 
 def main() -> None:

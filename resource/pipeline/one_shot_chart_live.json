@@ -1,0 +1,39 @@
+{
+  "OneShotChartLive": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "next": ["OneShotChartLiveDifficultyConfig"]
+  },
+  "OneShotChartLiveDifficultyConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiOneShotLiveConfig",
+    "custom_action_param": {"difficulty": "easy"},
+    "next": ["OneShotChartLiveRun"]
+  },
+  "OneShotChartLiveRun": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiOneShotLive",
+    "custom_action_param": {},
+    "focus": {
+      "Node.Action.Starting": {
+        "content": "一键演出开始：最长等待 5 分钟最终歌曲封面",
+        "display": ["log"]
+      },
+      "Node.Action.Succeeded": {
+        "content": "一键演出已完成本曲，任务结束",
+        "display": ["log", "toast"]
+      },
+      "Node.Action.Failed": {
+        "content": "一键演出中止或等待超时，详情见本局报告",
+        "display": ["log", "toast"]
+      }
+    }
+  },
+  "OneShotChartLiveLog": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "post_delay": 0
+  }
+}

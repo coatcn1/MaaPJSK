@@ -15,10 +15,14 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
     [ObservableProperty] private int _touchOffsetMs;
     [ObservableProperty] private int _bonusIndex;
     [ObservableProperty] private bool _useCalibrationProfile = true;
+    [ObservableProperty] private bool _cooperativeGameTimingFeedback;
     [ObservableProperty] private string _statusText = "保存后在下一次启动任务时生效。";
     [ObservableProperty] private string _calibrationText = "尚未生成已通过验证的校准配置。";
 
     private static string ConfigPath => Path.Combine(AppContext.BaseDirectory, "config", "performance-settings.json");
+
+    private static string FeedbackText(JToken? token) => token?.Type == JTokenType.Integer
+        && token.Value<long>() >= 0 ? token.ToString() : "未记录";
 
     [RelayCommand]
     private void Refresh()
@@ -37,6 +41,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 TouchOffsetMs = value.Value<int>("touch_offset_ms");
                 BonusIndex = value.Value<string>("bonus_consumption") == "current" ? 0 : value.Value<int>("bonus_consumption") + 1;
                 UseCalibrationProfile = value.Value<bool>("use_calibration_profile");
+                var feedback = value["cooperative_game_timing_feedback"];
+                if (feedback is not null && feedback.Type != JTokenType.Boolean)
+                    throw new InvalidDataException("协力 FAST / LATE 微调开关必须为布尔值");
+                CooperativeGameTimingFeedback = feedback?.Value<bool>() ?? false;
                 if (TouchOffsetMs is < -300 or > 300 || BonusIndex is < 0 or > 11)
                     throw new InvalidDataException("触控偏移或体力数量越界");
             }
@@ -48,7 +56,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
             CalibrationText = profiles.Length == 0 ? "尚未生成已通过验证的校准配置。"
                 : string.Join(Environment.NewLine, profiles.Select(profile =>
                     $"{profile.Value<string>("difficulty")?.ToUpperInvariant()}：校准偏移 {profile.Value<int>("offset_ms")} ms · "
-                    + $"PERFECT {profile["validation"]?.Value<double>("perfect_rate"):P2}"));
+                    + $"FAST {FeedbackText(profile["validation"]?["fast"])} / LATE {FeedbackText(profile["validation"]?["late"])}"));
             StatusText = "已读取保存的演奏设置。";
         }
         catch (Exception error)
@@ -77,7 +85,8 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 ["schema_version"] = 1, ["engine"] = EngineIndex == 1 ? "native" : "legacy",
                 ["touch_offset_ms"] = TouchOffsetMs,
                 ["bonus_consumption"] = BonusIndex == 0 ? new JValue("current") : new JValue(BonusIndex - 1),
-                ["use_calibration_profile"] = UseCalibrationProfile
+                ["use_calibration_profile"] = UseCalibrationProfile,
+                ["cooperative_game_timing_feedback"] = CooperativeGameTimingFeedback
             };
             Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath)!);
             // 与任务启动读取并行时只会得到完整旧值或完整新值，不暴露写到一半的 JSON。
@@ -91,7 +100,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
             {
                 if (File.Exists(temporary)) File.Delete(temporary);
             }
-            StatusText = "演奏设置已保存，下次启动单人谱面任务生效。";
+            StatusText = "演奏设置已保存，下次启动谱面演奏任务生效。";
         }
         catch (Exception error)
         {
