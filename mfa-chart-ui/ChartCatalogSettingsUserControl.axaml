@@ -9,10 +9,11 @@
             <TextBlock Text="日服谱面管理" FontSize="18" FontWeight="SemiBold" />
             <TextBlock Text="同步已公开歌曲的 SUS 谱面与封面，包含实际存在的 Easy / Normal / Hard / Expert / Master / Append。"
                        TextWrapping="Wrap" />
-            <TextBlock Text="单人谱面演出与 Native 校准任务从本地谱面库读取歌曲、难度及封面。" TextWrapping="Wrap" />
+            <TextBlock Text="默认增量更新，复用本地完整资源。近三个月的资源每七天复查；更早的未变资源不再联网检查，缺失或损坏仍会补齐。" TextWrapping="Wrap" />
             <TextBlock Text="{Binding CatalogText}" TextWrapping="Wrap" />
             <WrapPanel>
-                <Button Content="同步 / 更新全部日服谱面" Command="{Binding SyncCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,12,8" />
+                <Button Content="增量更新谱面" Command="{Binding SyncCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,12,8" />
+                <Button Content="检查近期资源" Command="{Binding CheckRecentCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,12,8" />
                 <Button Content="取消同步" Command="{Binding CancelCommand}" IsEnabled="{Binding IsSyncing}" Margin="0,0,12,8" />
                 <Button Content="刷新本地状态" Command="{Binding RefreshCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,0,8" />
             </WrapPanel>

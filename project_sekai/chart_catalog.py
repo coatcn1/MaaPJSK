@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -28,6 +29,8 @@ GIT_REFS_URL = "https://github.com/Sekai-World/sekai-master-db-diff.git/info/ref
 MASTER_ROOT = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff"
 ASSET_ROOT = "https://storage.sekai.best/sekai-jp-assets"
 SCHEMA_VERSION = 1
+REMOTE_RECHECK_DAYS = 7
+REMOTE_RECHECK_MONTHS = 3
 Progress = Callable[[str], None]
 
 
@@ -201,9 +204,9 @@ def _safe_local_path(root: Path, relative: Any) -> Path:
     return path
 
 
-def _verified_cache(root: Path, receipt: Path, url: str, validate: Callable[[bytes], dict[str, Any]]) -> dict[str, Any] | None:
+def _verified_asset(root: Path, cached: Any, url: str,
+                    validate: Callable[[bytes], dict[str, Any]]) -> dict[str, Any] | None:
     try:
-        cached = _read_json(receipt)
         if not isinstance(cached, dict) or cached.get("source_url") != url:
             return None
         path = _safe_local_path(root, cached["path"])
@@ -218,17 +221,105 @@ def _verified_cache(root: Path, receipt: Path, url: str, validate: Callable[[byt
         return None
 
 
+def _asset_fingerprint(music: dict[str, Any], metadata: dict[str, Any] | None = None) -> str:
+    # 谱面保守比较完整歌曲及难度元数据；封面只受资源名影响。版本前缀便于以后升级比较规则。
+    value = {"music": music, "chart": metadata} if metadata is not None else {"jacket": music.get("assetbundleName")}
+    return "v1:" + _sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _recently_checked(entry: dict[str, Any]) -> bool:
+    try:
+        checked_at = datetime.fromisoformat(entry["checked_at"])
+        if checked_at.utcoffset() is None:
+            return False
+        age = (datetime.now(timezone.utc) - checked_at).total_seconds()
+        return 0 <= age < REMOTE_RECHECK_DAYS * 86400
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
+def _is_archived(music: dict[str, Any], *, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    month_index = now.year * 12 + now.month - 1 - REMOTE_RECHECK_MONTHS
+    year, month = divmod(month_index, 12)
+    month += 1
+    cutoff = now.replace(year=year, month=month, day=min(now.day, calendar.monthrange(year, month)[1]))
+    return music["publishedAt"] <= cutoff.timestamp() * 1000
+
+
+def _previous_catalog(root: Path, asset_root: str) -> tuple[dict[int, dict[str, Any]], dict[tuple[int, str], str]]:
+    try:
+        manifest = _read_json(root / "manifest.json")
+        if (manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("game") != "project-sekai"
+                or manifest.get("server") != "jp" or manifest["source"]["asset_root"] != asset_root):
+            return {}, {}
+        if not isinstance(manifest["songs"], list) or not all(
+                isinstance(song, dict) and isinstance(song.get("id"), int) and isinstance(song.get("charts"), dict)
+                for song in manifest["songs"]):
+            return {}, {}
+        songs = {song["id"]: song for song in manifest["songs"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}, {}
+    fingerprints = {}
+    try:
+        # 旧索引没有指纹时，从已校验的同版 master 快照迁移，避免首次增量更新重新请求全库。
+        indices = []
+        for name in ("musics", "musicDifficulties"):
+            index = manifest["master"][name]
+            expected_url = f"{MASTER_ROOT}/{manifest['source']['revision']}/{name}.json"
+            path = _safe_local_path(root, index["path"])
+            if index["source_url"] != expected_url or path.stat().st_size > 8 * 1024 * 1024:
+                return songs, {}
+            body = path.read_bytes()
+            if _sha256(body) != index["sha256"]:
+                return songs, {}
+            data = json.loads(body.decode("utf-8-sig"))
+            if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+                return songs, {}
+            indices.append(data)
+        entries, _ = _catalog_entries(*indices, int(time.time() * 1000), DIFFICULTIES)
+        for entry in entries:
+            music = entry["music"]
+            for metadata in entry["charts"]:
+                fingerprints[(music["id"], metadata["musicDifficulty"])] = _asset_fingerprint(music, metadata)
+            fingerprints[(music["id"], "jacket")] = _asset_fingerprint(music)
+    except (OSError, ValueError, KeyError, TypeError):
+        return songs, {}
+    return songs, fingerprints
+
+
 def _sync_asset(root: Path, relative_directory: Path, stem: str, extension: str, url: str,
-                client: HttpClient, validate: Callable[[bytes], dict[str, Any]], *, force: bool) -> tuple[dict[str, Any] | None, str | None]:
+                client: HttpClient, validate: Callable[[bytes], dict[str, Any]], *, force: bool,
+                check_recent: bool, archived: bool, fingerprint: str, previous: dict[str, Any] | None,
+                previous_fingerprint: str | None) -> tuple[dict[str, Any] | None, str | None]:
     receipt = root / ".cache" / f"{_sha256(url.encode('utf-8'))}.json"
-    cached = _verified_cache(root, receipt, url, validate)
+    try:
+        cached = _verified_asset(root, _read_json(receipt), url, validate)
+    except (OSError, ValueError):
+        cached = None
+    if cached is None:
+        cached = _verified_asset(root, previous, url, validate)
+    if cached is not None:
+        cached = dict(cached)
+        if (not cached.get("metadata_fingerprint") and previous is not None
+                and cached["sha256"] == previous.get("sha256")):
+            cached["metadata_fingerprint"] = previous.get("metadata_fingerprint") or previous_fingerprint
+            if previous.get("status") == "stale":
+                cached["status"] = "stale"
+        if (not force and cached.get("status") != "stale" and cached.get("metadata_fingerprint") == fingerprint
+                and (archived or (not check_recent and _recently_checked(cached)))):
+            # 三个月以前的未变资源不联网复查；本地复用也不刷新近期资源的远端确认时间。
+            entry = dict(cached, status="reused", downloaded_bytes=0)
+            entry.pop("update_error", None)
+            _write_json(receipt, entry)
+            return entry, None
     try:
         response = client.get(url, etag=cached.get("etag", "") if cached and not force else "",
                               last_modified=cached.get("last_modified", "") if cached and not force else "")
         if response.status == 304:
             if cached is None:
                 raise ValueError("服务器返回未修改，但没有已校验的本地文件")
-            entry = dict(cached, status="unchanged", checked_at=_utc_now())
+            entry = dict(cached, status="unchanged", checked_at=_utc_now(), downloaded_bytes=0)
         elif response.status == 200:
             required_type = "image/png" if extension == "png" else "text/plain"
             if required_type not in response.content_type:
@@ -243,9 +334,12 @@ def _sync_asset(root: Path, relative_directory: Path, stem: str, extension: str,
             entry = {"path": relative.as_posix(), "source_url": url, "sha256": digest,
                      "size": len(response.body), "etag": response.etag, "last_modified": response.last_modified,
                      "downloaded_at": _utc_now(), "checked_at": _utc_now(),
-                     "status": "unchanged" if cached and cached["sha256"] == digest else "updated", **details}
+                     "status": ("unchanged" if cached["sha256"] == digest else "updated") if cached else "added",
+                     "downloaded_bytes": len(response.body), **details}
         else:
             raise ValueError(f"在线资源返回意外状态 {response.status}")
+        entry["metadata_fingerprint"] = fingerprint
+        entry.pop("update_error", None)
         _write_json(receipt, entry)
         return entry, None
     except InterruptedError:
@@ -253,7 +347,10 @@ def _sync_asset(root: Path, relative_directory: Path, stem: str, extension: str,
     except (OSError, ValueError) as error:
         if cached is not None:
             # 失败时保留可用旧版，但明确标记为未确认最新，不能把它算作本次更新成功。
-            return dict(cached, status="stale", update_error=str(error)), str(error)
+            entry = dict(cached, status="stale", update_error=str(error), downloaded_bytes=0)
+            # 将失败状态保存到续传记录；下次增量必须重试，不能把旧成功回执当成本次已确认。
+            _write_json(receipt, entry)
+            return entry, str(error)
         return None, str(error)
 
 
@@ -295,10 +392,12 @@ def _catalog_entries(musics: list[dict[str, Any]], difficulties: list[dict[str, 
 
 
 def _sync_song(root: Path, catalog_entry: dict[str, Any], client: HttpClient, *, force: bool,
+               check_recent: bool, previous: dict[str, Any], previous_fingerprints: dict[tuple[int, str], str],
                asset_root: str, stop_requested: Callable[[], bool]) -> dict[str, Any]:
     _check_stop(stop_requested)
     music = catalog_entry["music"]
     song_id = music["id"]
+    archived = _is_archived(music)
     song = {"id": song_id, "title": music["title"], "metadata": music,
             "charts": {}, "jacket": None, "errors": []}
     directory = Path("sekai-jp") / str(song_id)
@@ -306,7 +405,11 @@ def _sync_song(root: Path, catalog_entry: dict[str, Any], client: HttpClient, *,
         _check_stop(stop_requested)
         difficulty = metadata["musicDifficulty"]
         url = f"{asset_root}/music/music_score/{song_id:04d}_01/{difficulty}.txt"
-        entry, error = _sync_asset(root, directory, difficulty, "sus", url, client, validate_sus, force=force)
+        entry, error = _sync_asset(root, directory, difficulty, "sus", url, client, validate_sus,
+                                  force=force, check_recent=check_recent, archived=archived,
+                                  fingerprint=_asset_fingerprint(music, metadata),
+                                  previous=previous.get("charts", {}).get(difficulty),
+                                  previous_fingerprint=previous_fingerprints.get((song_id, difficulty)))
         if entry is not None:
             song["charts"][difficulty] = {**entry, "music_id": song_id, "difficulty": difficulty,
                                          "play_level": metadata["playLevel"], "total_note_count": metadata["totalNoteCount"]}
@@ -321,7 +424,11 @@ def _sync_song(root: Path, catalog_entry: dict[str, Any], client: HttpClient, *,
     else:
         _check_stop(stop_requested)
         url = f"{asset_root}/music/jacket/{bundle}/{bundle}.png"
-        song["jacket"], error = _sync_asset(root, directory, "jacket", "png", url, client, _validate_jacket, force=force)
+        song["jacket"], error = _sync_asset(root, directory, "jacket", "png", url, client, _validate_jacket,
+                                          force=force, check_recent=check_recent, archived=archived,
+                                          fingerprint=_asset_fingerprint(music),
+                                          previous=previous.get("jacket"),
+                                          previous_fingerprint=previous_fingerprints.get((song_id, "jacket")))
         if error:
             song["errors"].append({"kind": "jacket", "source_url": url, "message": error})
     return song
@@ -334,13 +441,16 @@ def _summarize(songs: list[dict[str, Any]], *, indexed: int, unpublished: int) -
     return {"indexed_songs": indexed, "stored_songs": len(songs),
             "songs_with_charts": sum(bool(song["charts"]) for song in songs),
             "charts": len(assets), "jackets": len(jackets), "skipped_unpublished": unpublished,
-            "updated": statuses.count("updated"), "unchanged": statuses.count("unchanged"),
+            "added": statuses.count("added"), "updated": statuses.count("updated"),
+            "reused": statuses.count("reused"), "unchanged": statuses.count("unchanged"),
+            "downloaded": sum(asset.get("downloaded_bytes", 0) > 0 for asset in [*assets, *jackets]),
+            "downloaded_bytes": sum(asset.get("downloaded_bytes", 0) for asset in [*assets, *jackets]),
             "stale": statuses.count("stale"), "recoverable_errors": sum(len(song["errors"]) for song in songs),
             "fatal_errors": 0}
 
 
 def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers: int = 6,
-                 force: bool = False, difficulties: tuple[str, ...] = DIFFICULTIES,
+                 force: bool = False, check_recent: bool = False, difficulties: tuple[str, ...] = DIFFICULTIES,
                  song_ids: tuple[int, ...] | None = None, progress: Progress | None = None,
                  stop_requested: Callable[[], bool] | None = None,
                  asset_root: str = ASSET_ROOT) -> dict[str, Any]:
@@ -352,6 +462,8 @@ def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers
     root = Path(output_root).resolve()
     with catalog_lock(root):
         _check_stop(stop)
+        previous_songs, previous_fingerprints = _previous_catalog(root, asset_root)
+        mode = "force" if force else "check_recent" if check_recent else "incremental"
         report("读取日服 master 数据最新版本…")
         revision = _latest_revision(client)
         report(f"固定 master 快照 {revision[:12]}，读取歌曲及难度目录…")
@@ -369,20 +481,27 @@ def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers
         for name, body, url in (("musics", music_body, music_url), ("musicDifficulties", difficulty_body, difficulty_url)):
             digest = _sha256(body)
             relative = Path("master") / f"{name}-{digest}.json"
-            _write_atomic(root / relative, body)
+            path = root / relative
+            if not path.exists() or _sha256(path.read_bytes()) != digest:
+                _write_atomic(path, body)
             master[name] = {"path": relative.as_posix(), "sha256": digest, "source_url": url}
-        report(f"开始同步 {len(entries)} 首歌曲，跳过 {unpublished} 首未公开歌曲；难度：{', '.join(difficulties)}")
+        mode_text = {"incremental": "增量更新", "check_recent": "检查近三个月资源", "force": "强制获取全部资源"}[mode]
+        report(f"开始{mode_text} {len(entries)} 首歌曲，跳过 {unpublished} 首未公开歌曲；难度：{', '.join(difficulties)}")
         songs = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_sync_song, root, entry, client, force=force, asset_root=asset_root,
+            futures = [executor.submit(_sync_song, root, entry, client, force=force, check_recent=check_recent,
+                                       previous=previous_songs.get(entry["music"]["id"], {}),
+                                       previous_fingerprints=previous_fingerprints, asset_root=asset_root,
                                        stop_requested=stop) for entry in entries]
             try:
                 for future in as_completed(futures):
                     _check_stop(stop)
                     song = future.result()
                     songs.append(song)
+                    assets = [*song["charts"].values(), *([song["jacket"]] if song["jacket"] else [])]
                     report(f"[{len(songs)}/{len(entries)}] {song['id']} {song['title']} · "
-                           f"谱面 {len(song['charts'])}，封面 {int(song['jacket'] is not None)}，错误 {len(song['errors'])}")
+                           f"谱面 {len(song['charts'])}，封面 {int(song['jacket'] is not None)}，"
+                           f"复用 {sum(asset['status'] == 'reused' for asset in assets)}，错误 {len(song['errors'])}")
                     for error in song["errors"]:
                         report(f"  失败 {song['id']} {error.get('difficulty', error['kind'])}：{error['message']}")
             except BaseException:
@@ -395,6 +514,8 @@ def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers
                     "generated_at": _utc_now(), "source": {"repository": "Sekai-World/sekai-master-db-diff",
                     "revision": revision, "asset_root": asset_root, "runtime_network_access": False},
                     "scope": {"difficulties": list(difficulties), "song_ids": list(song_ids) if song_ids is not None else None},
+                    "sync": {"mode": mode, "remote_recheck_days": REMOTE_RECHECK_DAYS,
+                             "remote_recheck_months": REMOTE_RECHECK_MONTHS},
                     "master": master, "summary": _summarize(songs, indexed=len(musics), unpublished=unpublished),
                     "songs": songs}
         # 指定歌曲的验证快照独立保存，不能把全库 manifest 缩成少数歌曲。
@@ -402,7 +523,9 @@ def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers
         _write_json(destination, manifest)
         summary = manifest["summary"]
         report(f"同步结束：{summary['stored_songs']} 首 / {summary['charts']} 张谱面 / {summary['jackets']} 个封面；"
-               f"更新 {summary['updated']}，未变化 {summary['unchanged']}，旧版 {summary['stale']}，错误 {summary['recoverable_errors']}")
+               f"新增 {summary['added']}，更新 {summary['updated']}，本地复用 {summary['reused']}，"
+               f"联网未变 {summary['unchanged']}，旧版 {summary['stale']}，错误 {summary['recoverable_errors']}；"
+               f"有效下载 {summary['downloaded']} 个 / {summary['downloaded_bytes'] / (1024 * 1024):.2f} MiB")
         if summary["recoverable_errors"]:
             report("未更新成功的资源（完整错误记录见本地 manifest）：")
             for song in songs:

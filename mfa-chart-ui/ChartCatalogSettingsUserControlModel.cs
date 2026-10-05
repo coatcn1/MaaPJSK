@@ -30,7 +30,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
     private bool _cancelRequested;
 
     [ObservableProperty] private string _catalogText = "本地尚未同步日服谱面";
-    [ObservableProperty] private string _statusText = "停止演出任务后，可在这里同步最新资源。";
+    [ObservableProperty] private string _statusText = "停止演出任务后，可在这里增量更新谱面。";
     [ObservableProperty] private string _progressText = string.Empty;
     [ObservableProperty] [NotifyPropertyChangedFor(nameof(NotSyncing))] private bool _isSyncing;
     public bool NotSyncing => !IsSyncing;
@@ -69,6 +69,11 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
             CatalogText = $"{summary.Value<int?>("songs_with_charts") ?? 0} 首 / "
                           + $"{summary.Value<int?>("charts") ?? 0} 张谱面 / {summary.Value<int?>("jackets") ?? 0} 个封面 / "
                           + $"{errors} 个错误 / {summary.Value<int?>("stale") ?? 0} 个资源未确认最新 · 更新于 {generatedAt}";
+            if (summary.ContainsKey("reused"))
+                CatalogText += Environment.NewLine + $"本次：新增 {summary.Value<int?>("added") ?? 0} / "
+                               + $"更新 {summary.Value<int?>("updated") ?? 0} / 本地复用 {summary.Value<int?>("reused") ?? 0} / "
+                               + $"联网未变 {summary.Value<int?>("unchanged") ?? 0} / "
+                               + $"下载 {(summary.Value<long?>("downloaded_bytes") ?? 0) / (1024d * 1024d):F2} MiB";
         }
         catch (Exception error)
         {
@@ -93,7 +98,12 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
     }
 
     [RelayCommand]
-    private async Task SyncAsync()
+    private Task SyncAsync() => RunSyncAsync(checkRecent: false);
+
+    [RelayCommand]
+    private Task CheckRecentAsync() => RunSyncAsync(checkRecent: true);
+
+    private async Task RunSyncAsync(bool checkRecent)
     {
         if (Instances.InstanceTabBarViewModel.Tabs.Any(tab => tab.IsRunning))
         {
@@ -109,7 +119,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
         _cancelRequested = false;
         _progressLines.Clear();
         ProgressText = string.Empty;
-        StatusText = "正在同步日服最新谱面…";
+        StatusText = checkRecent ? "正在联网检查近三个月的资源…" : "正在增量更新日服谱面…";
         try
         {
             var config = await LoadConfigAsync();
@@ -123,6 +133,8 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
             startInfo.ArgumentList.Add(Required(config, "script_path"));
             startInfo.ArgumentList.Add("--output-root");
             startInfo.ArgumentList.Add(Required(config, "output_root"));
+            if (checkRecent)
+                startInfo.ArgumentList.Add("--check-recent");
             startInfo.Environment["PYTHONUTF8"] = "1";
             startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
             _cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(45));
@@ -133,7 +145,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
             await _process.WaitForExitAsync(_cancellation.Token);
             StatusText = _process.ExitCode switch
             {
-                0 => "同步完成。",
+                0 => checkRecent ? "近期资源检查完成。" : "增量更新完成。",
                 2 => "同步已结束；部分资源更新失败，可再次同步重试，错误详情见下方。",
                 _ => $"同步失败（退出码 {_process.ExitCode}），原有谱面库可继续使用；详情见下方。"
             };
