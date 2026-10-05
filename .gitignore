@@ -1,6 +1,7 @@
 __pycache__/
 .pytest_cache/
 .local/
+config/maa_option.json
 *.pyc
 *.log
 *.png

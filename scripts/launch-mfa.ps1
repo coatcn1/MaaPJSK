@@ -34,12 +34,15 @@ if (-not (Test-Path -LiteralPath $agentBinarySource -PathType Container)) {
     }
 }
 
-$otherProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'MaaBanGDream.exe' OR Name = 'MFAAvalonia.exe'" | Where-Object {
-    $_.ExecutablePath -and (Split-Path -Parent $_.ExecutablePath) -ine $targetRoot
-})
-if ($otherProcesses.Count -gt 0) {
-    $details = ($otherProcesses | ForEach-Object { "PID $($_.ProcessId): $($_.ExecutablePath)" }) -join '; '
-    throw "其他 MFA 实例正在运行。请先关闭后再启动 MaaPJSK：$details"
+if (-not $StageOnly) {
+    # 纯部署不启动控制器；其他项目的运行实例不妨碍更新本项目文件。
+    $otherProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'MaaBanGDream.exe' OR Name = 'MFAAvalonia.exe'" | Where-Object {
+        $_.ExecutablePath -and (Split-Path -Parent $_.ExecutablePath) -ine $targetRoot
+    })
+    if ($otherProcesses.Count -gt 0) {
+        $details = ($otherProcesses | ForEach-Object { "PID $($_.ProcessId): $($_.ExecutablePath)" }) -join '; '
+        throw "其他 MFA 实例正在运行。请先关闭后再启动 MaaPJSK：$details"
+    }
 }
 
 $current = @(Get-CimInstance Win32_Process -Filter "Name = 'MaaBanGDream.exe' OR Name = 'MFAAvalonia.exe'" | Where-Object {
@@ -95,6 +98,8 @@ $settings | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $settingsPath -E
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\server.py') -Destination $agentTarget -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\auto_live.py') -Destination $agentTarget -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\solo_live.py') -Destination $agentTarget -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\cooperative_live.py') -Destination $agentTarget -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\one_shot_live.py') -Destination $agentTarget -Force
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'project_sekai') -Filter '*.py' | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $packageTarget -Force
 }
@@ -125,6 +130,22 @@ $templateTarget = Join-Path $targetRoot 'config\templates'
 New-Item -ItemType Directory -Force -Path $templateTarget | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $projectRoot '.local\templates') -Filter '*.png' | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $templateTarget -Force
+}
+$cooperativeConfig = Join-Path $projectRoot '.local\cooperative-templates\config.json'
+if (Test-Path -LiteralPath $cooperativeConfig -PathType Leaf) {
+    # 协力截图不公开；有本机模板时随部署复制，未采样的机器仍可运行原有任务。
+    Copy-Item -LiteralPath $cooperativeConfig -Destination (Join-Path $targetRoot 'config\cooperative-templates.json') -Force
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot '.local\cooperative-templates\templates') -Filter '*.png' | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $templateTarget -Force
+    }
+}
+$gameTimingConfig = Join-Path $projectRoot '.local\game-timing-templates\config.json'
+if (Test-Path -LiteralPath $gameTimingConfig -PathType Leaf) {
+    # 可选反馈只使用本机确认的字形模板；不携带玩家画面或自行采样游戏。
+    Copy-Item -LiteralPath $gameTimingConfig -Destination (Join-Path $targetRoot 'config\game-timing-templates.json') -Force
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot '.local\game-timing-templates\templates') -Filter '*.png' | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $templateTarget -Force
+    }
 }
 $compactLibrary = Join-Path $projectRoot '.local\compact-toasts\SukiUI.dll'
 if (Test-Path -LiteralPath $compactLibrary -PathType Leaf) {

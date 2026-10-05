@@ -26,6 +26,68 @@ foreach ($name in @('ChartCatalogSettingsUserControlModel.cs', 'PerformanceSetti
 foreach ($name in @('ChartCatalogSettingsUserControl.axaml', 'ChartCatalogSettingsUserControl.axaml.cs', 'PerformanceSettingsUserControl.axaml', 'PerformanceSettingsUserControl.axaml.cs')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot "mfa-chart-ui\$name") -Destination $viewTarget -Force
 }
+Copy-Item -LiteralPath (Join-Path $projectRoot 'mfa-chart-ui\MaaPjskTaskStatus.cs') -Destination (Join-Path $sourceRoot 'MFAAvalonia\Extensions\MaaFW') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'mfa-chart-ui\SystemSleepHelper.cs') -Destination (Join-Path $sourceRoot 'MFAAvalonia\Helper') -Force
+
+$processorPath = Join-Path $sourceRoot 'MFAAvalonia\Extensions\MaaFW\MaaProcessor.cs'
+$processor = [IO.File]::ReadAllText($processorPath)
+$statusPattern = 'if \(InstanceConfiguration.GetValue\(ConfigurationKeys.ContinueRunningWhenError, true\)\)\s*job.Wait\(\);\s*else\s*job.Wait\(\).ThrowIfNot\(MaaJobStatus.Succeeded\);'
+if ([regex]::Matches($processor, $statusPattern).Count -ne 1) { throw '上游队列任务状态入口不匹配' }
+$statusCheck = @'
+var jobStatus = job.Wait();
+            token.ThrowIfCancellationRequested();
+            MaaPjskTaskStatus.Check(task, jobStatus,
+                InstanceConfiguration.GetValue(ConfigurationKeys.ContinueRunningWhenError, true));
+'@
+[IO.File]::WriteAllText($processorPath, [regex]::Replace($processor, $statusPattern, $statusCheck), [Text.UTF8Encoding]::new($false))
+
+$processor = [IO.File]::ReadAllText($processorPath)
+$executionPattern = 'async private Task ExecuteTasks\(CancellationToken token\)\s*\{'
+if ([regex]::Matches($processor, $executionPattern).Count -ne 1) { throw '上游实际任务执行入口不匹配' }
+$executionScope = @'
+async private Task ExecuteTasks(CancellationToken token)
+    {
+        // 队列最后一项提前出队时仍在执行；作用域持续到实际任务返回和清理结束。
+        using var sleepScope = TaskQueue.Count > 0 && !token.IsCancellationRequested
+            ? await SystemSleepHelper.BeginTaskExecutionAsync(token) : null;
+'@
+[IO.File]::WriteAllText($processorPath, [regex]::Replace($processor, $executionPattern, $executionScope), [Text.UTF8Encoding]::new($false))
+
+$performanceModelPath = Join-Path $modelTarget 'PerformanceUserControlModel.cs'
+$performanceModel = [IO.File]::ReadAllText($performanceModelPath)
+$preferenceRead = 'ConfigurationManager.Current.GetValue(ConfigurationKeys.PreventSleep, false)'
+$preferenceWritePattern = 'partial void OnPreventSleepChanged\(bool value\) => HandlePropertyChanged\(ConfigurationKeys.PreventSleep, value, \(v\) =>\s*\{\s*SystemSleepHelper.ApplyPreventSleep\(v\);\s*\}\);'
+if ($performanceModel.Split(@($preferenceRead), [StringSplitOptions]::None).Count -ne 2 -or
+    [regex]::Matches($performanceModel, $preferenceWritePattern).Count -ne 1) { throw '上游防息屏开关入口不匹配' }
+$performanceModel = $performanceModel.Replace($preferenceRead, 'SystemSleepHelper.GetPreventSleepSetting()')
+$performanceModel = [regex]::Replace($performanceModel, $preferenceWritePattern, 'partial void OnPreventSleepChanged(bool value) => SystemSleepHelper.SavePreventSleepSetting(value);')
+[IO.File]::WriteAllText($performanceModelPath, $performanceModel, [Text.UTF8Encoding]::new($false))
+
+$appPath = Join-Path $sourceRoot 'MFAAvalonia\App.axaml.cs'
+$appSource = [IO.File]::ReadAllText($appPath)
+$shutdownPattern = 'private void OnShutdownRequested\(object sender, ShutdownRequestedEventArgs e\)\s*\{'
+if ([regex]::Matches($appSource, $shutdownPattern).Count -ne 1) { throw '上游退出清理入口不匹配' }
+$shutdown = @'
+private void OnShutdownRequested(object sender, ShutdownRequestedEventArgs e)
+    {
+        SystemSleepHelper.Shutdown();
+'@
+[IO.File]::WriteAllText($appPath, [regex]::Replace($appSource, $shutdownPattern, $shutdown), [Text.UTF8Encoding]::new($false))
+
+# 只修改当前开关的文本，保持原有配置键与关闭默认值。
+$sleepLabels = @{
+    'Strings.resx' = '任务运行中阻止息屏'
+    'Strings.zh-Hant.resx' = '任務執行中阻止螢幕休眠'
+    'Strings.en-US.resx' = 'Prevent display sleep while tasks run'
+}
+foreach ($file in $sleepLabels.Keys) {
+    $languagePath = Join-Path $sourceRoot "MFAAvalonia\Assets\Localization\$file"
+    $language = [IO.File]::ReadAllText($languagePath)
+    $labelPattern = '(<data name="PreventSleep" xml:space="preserve">\s*<value>)[^<]*(</value>)'
+    if ([regex]::Matches($language, $labelPattern).Count -ne 1) { throw "上游防息屏翻译入口不匹配：$file" }
+    $language = [regex]::Replace($language, $labelPattern, ('${1}' + $sleepLabels[$file] + '${2}'))
+    [IO.File]::WriteAllText($languagePath, $language, [Text.UTF8Encoding]::new($false))
+}
 
 $settingsPath = Join-Path $sourceRoot 'MFAAvalonia\Views\Pages\SettingsView.axaml'
 $settings = [IO.File]::ReadAllText($settingsPath)

@@ -26,7 +26,8 @@ class AutoLiveConfigurationTests(unittest.TestCase):
     def test_recovery_options_are_part_of_auto_live_task(self) -> None:
         interface_path = Path(__file__).resolve().parents[1] / "interface.json"
         interface = json.loads(interface_path.read_text(encoding="utf-8"))
-        self.assertEqual([task["name"] for task in interface["task"]], ["AutoLive", "SoloChartLive", "SoloChartCalibration"])
+        self.assertEqual([task["name"] for task in interface["task"]],
+                         ["AutoLive", "SoloChartLive", "CooperativeChartLive", "OneShotChartLive", "SoloChartCalibration"])
         self.assertEqual(
             interface["task"][0]["option"],
             ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryCount"],
@@ -240,6 +241,86 @@ class ZeroBonusPreparationTests(unittest.TestCase):
             after = self.navigator._wait_for_bonus_change(self.empty)
         self.assertIs(after, self.filled)
         self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_small_bonus_digit_change_is_confirmed_numerically_in_two_frames(self) -> None:
+        before = self.filled
+        after = before.copy()
+        after[35:40, 1070:1075] = 255
+        self.navigator.bonus_reader = lambda frame: (5 if frame is before else 6, None)
+        self.navigator.device.screenshot = Mock(return_value=after)
+        self.assertLess(float(np.abs(before.astype(float) - after).mean()), 2)
+        with patch("project_sekai.navigator.time.sleep"):
+            result = self.navigator._wait_for_bonus_change(before)
+        self.assertIs(result, after)
+        self.assertEqual(self.navigator.device.screenshot.call_count, 2)
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_background_change_without_numeric_increase_cannot_confirm_a_drink(self) -> None:
+        self.navigator.bonus_reader = lambda frame: (5, None)
+        self.navigator.device.screenshot = Mock(return_value=self.filled)
+        with patch("project_sekai.navigator.time.sleep"), \
+                patch("project_sekai.navigator.time.monotonic", side_effect=range(30)):
+            with self.assertRaisesRegex(RuntimeError, "体力显示仍没有变化"):
+                self.navigator._wait_for_bonus_change(self.empty)
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_bonus_update_waits_for_reliable_equal_increased_readings(self) -> None:
+        before = self.filled
+        frames = [before.copy() for _ in range(4)]
+        for frame in frames:
+            frame[35:40, 1070:1075] = 255
+        values = iter((ValueError("读数冲突"), 6, 7, 7))
+        def read(frame):
+            if frame is before:
+                return 5, None
+            value = next(values)
+            if isinstance(value, Exception):
+                raise value
+            return value, None
+        self.navigator.bonus_reader = read
+        self.navigator.device.screenshot = Mock(side_effect=frames)
+        with patch("project_sekai.navigator.time.sleep"):
+            result = self.navigator._wait_for_bonus_change(before)
+        self.assertIs(result, frames[-1])
+        self.assertEqual(self.navigator.device.screenshot.call_count, 4)
+
+    def test_unreadable_before_value_cannot_consume_another_drink(self) -> None:
+        self.navigator.bonus_reader = Mock(side_effect=ValueError("用药前读数冲突"))
+        with self.assertRaisesRegex(RuntimeError, "用药前"):
+            self.navigator._recover_and_verify(self.filled, "small", 5)
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_five_small_drinks_are_confirmed_once_even_when_stamina_becomes_sufficient_early(self) -> None:
+        frames = {value:self.filled.copy() for value in range(2,8)}
+        for value, frame in frames.items():
+            frame[0,0,0] = value
+        state = {'value':2}
+        self.navigator.bonus_reader = lambda frame: (int(frame[0,0,0]),None)
+        self.navigator.device.screenshot = Mock(side_effect=lambda: frames[state['value']])
+        self.navigator.wait = lambda *args,**kwargs: frames[state['value']]
+        def recover(mode):
+            self.assertEqual(mode,'small')
+            state['value'] += 1
+        self.navigator.recover_bonus_from_dialog = Mock(side_effect=recover)
+        progress = []
+        with patch('project_sekai.navigator.time.sleep'):
+            after = self.navigator._recover_and_verify(frames[2],'small',5,
+                on_recovered=lambda count,frame: progress.append((count,int(frame[0,0,0]))))
+        self.assertIs(after,frames[7])
+        self.assertEqual(progress,[(1,3),(2,4),(3,5),(4,6),(5,7)])
+        self.assertEqual(self.navigator.recover_bonus_from_dialog.call_count,5)
+        self.assertEqual(self.navigator.device.back.call_count,5)
+
+    def test_confirmed_bottle_progress_survives_notice_dismissal_failure(self) -> None:
+        before = self.empty
+        self.navigator.bonus_reader = lambda frame: (2 if frame is before else 3,None)
+        self.navigator._dismiss_bonus_notice = Mock(side_effect=RuntimeError('通知未关闭'))
+        progress = []
+        with patch('project_sekai.navigator.time.sleep'), self.assertRaisesRegex(RuntimeError,'通知未关闭'):
+            self.navigator._recover_and_verify(before,'small',5,
+                on_recovered=lambda count,frame: progress.append((count,int(self.navigator.bonus_reader(frame)[0]))))
+        self.assertEqual(progress,[(1,3)])
+        self.navigator.recover_bonus_from_dialog.assert_called_once_with('small')
 
     def test_recovery_runs_again_when_a_later_round_needs_bonus(self) -> None:
         def next_round(_mode: str) -> None:
