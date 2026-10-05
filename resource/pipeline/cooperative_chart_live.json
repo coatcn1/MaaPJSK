@@ -1,0 +1,108 @@
+{
+  "CooperativeChartLive": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "next": [
+      "CooperativeChartLiveRoomConfig"
+    ]
+  },
+  "CooperativeChartLiveRoomConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLiveConfig",
+    "custom_action_param": {
+      "room": "free"
+    },
+    "next": [
+      "CooperativeChartLiveSongConfig"
+    ]
+  },
+  "CooperativeChartLiveSongConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLiveConfig",
+    "custom_action_param": {
+      "song_mode": "current"
+    },
+    "next": [
+      "CooperativeChartLiveDifficultyConfig"
+    ]
+  },
+  "CooperativeChartLiveDifficultyConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLiveConfig",
+    "custom_action_param": {
+      "difficulty": "easy"
+    },
+    "next": [
+      "CooperativeChartLiveCountConfig"
+    ]
+  },
+  "CooperativeChartLiveCountConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLiveConfig",
+    "custom_action_param": {
+      "count": 1
+    },
+    "next": [
+      "CooperativeChartLiveRecoveryModeConfig"
+    ]
+  },
+  "CooperativeChartLiveRecoveryModeConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLiveConfig",
+    "custom_action_param": {
+      "recovery_mode": "off"
+    },
+    "next": [
+      "CooperativeChartLiveRecoveryCountConfig"
+    ]
+  },
+  "CooperativeChartLiveRecoveryCountConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLiveConfig",
+    "custom_action_param": {
+      "recovery_count": 1
+    },
+    "next": [
+      "CooperativeChartLiveRun"
+    ]
+  },
+  "CooperativeChartLiveRun": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiCooperativeLive",
+    "custom_action_param": {},
+    "focus": {
+      "Node.Action.Starting": {
+        "content": "协力谱面演出开始：匹配公房并确认实际抽选歌曲",
+        "display": [
+          "log"
+        ]
+      },
+      "Node.Action.Succeeded": {
+        "content": "协力谱面演出完成，个人判定已保存",
+        "display": [
+          "log",
+          "toast"
+        ]
+      },
+      "Node.Action.Failed": {
+        "content": "协力谱面演出中止，详情见本局报告",
+        "display": [
+          "log",
+          "toast"
+        ]
+      }
+    }
+  },
+  "CooperativeChartLiveLog": {
+    "recognition": "DirectHit",
+    "action": "DoNothing",
+    "post_delay": 0
+  }
+}

@@ -1,3 +1,5 @@
 numpy>=1.26,<3
 opencv-python>=4.8,<5
 maafw==5.10.2
+onnxruntime==1.29.0
+PyYAML==6.0.3

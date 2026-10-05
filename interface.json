@@ -17,24 +17,96 @@
     {
       "name": "Japanese",
       "label": "日服",
-      "path": ["./resource"],
-      "controller": ["Android"]
+      "path": [
+        "./resource"
+      ],
+      "controller": [
+        "Android"
+      ]
     }
   ],
   "agent": {
     "child_exec": "python",
-    "child_args": ["./agent/server.py"]
+    "child_args": [
+      "./agent/server.py"
+    ]
   },
   "task": [
     {
       "name": "AutoLive",
       "label": "🎶 自动演出",
-      "description": "从主页使用选曲页当前歌曲或点击随机选曲，并使用游戏内 AUTO LIVE 按指定次数循环；结算使用 BACK 返回主页。仅在游戏弹出体力回复页时，才按所选策略与瓶数上限使用道具。",
+      "description": "通过游戏内 AUTO LIVE 按指定次数循环。每次 AUTO 开启失败时关闭提示，按指定种类和每次瓶数回复，再返回开启 AUTO。",
       "entry": "AutoLive",
-      "option": ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryLimit"]
+      "option": [
+        "AutoLiveSongMode",
+        "AutoLiveCount",
+        "AutoLiveRecoveryMode",
+        "AutoLiveRecoveryCount"
+      ]
+    },
+    {
+      "name": "SoloChartLive",
+      "label": "🎼 单人谱面演出",
+      "entry": "SoloChartLive",
+      "default_check": false,
+      "description": "匹配准备页与开场封面，按本地 SUS 谱面演奏并记录判定。引擎、谱面触控偏移和每局体力在 MFA 设置 → 演奏设置中保存；不足时按任务指定种类和瓶数自动用药。",
+      "option": [
+        "SoloChartLiveSongMode",
+        "SoloChartLiveDifficulty",
+        "SoloChartLiveCount",
+        "SoloChartLiveRecoveryMode",
+        "SoloChartLiveRecoveryCount"
+      ]
+    },
+    {
+      "name": "CooperativeChartLive",
+      "label": "🤝 协力谱面演出",
+      "entry": "CooperativeChartLive",
+      "default_check": false,
+      "description": "自由或资深公房匹配，按房间抽选后的实际歌曲与难度读取本地 SUS。引擎、手动偏移与每局体力沿用演奏设置；保存个人判定后返回主页。首次使用请先验收，Native 暂不使用单人校准配置。",
+      "option": [
+        "CooperativeChartLiveRoom",
+        "CooperativeChartLiveSongMode",
+        "CooperativeChartLiveDifficulty",
+        "CooperativeChartLiveCount",
+        "CooperativeChartLiveRecoveryMode",
+        "CooperativeChartLiveRecoveryCount"
+      ]
+    },
+    {
+      "name": "OneShotChartLive",
+      "label": "▶️ 一键演出",
+      "entry": "OneShotChartLive",
+      "default_check": false,
+      "description": "手动进入单人或协力演出后，最长等待 5 分钟最终歌曲封面与标题；按所选难度演奏一曲即停止，保留游戏结算页面。任务难度须与手动选择的游戏难度一致。引擎和手动偏移沿用演奏设置。",
+      "option": ["OneShotChartLiveDifficulty"]
+    },
+    {
+      "name": "SoloChartCalibration",
+      "label": "🎯 Native 谱面校准",
+      "entry": "SoloChartCalibration",
+      "default_check": false,
+      "description": "按演奏设置中的体力数量完成一局排练与一局正式验证，校准期间关闭用药。以实际 FAST 与 LATE（SLOW）接近平衡为目标，不因 MISS 等其他判定单独拒绝；仍要求 LIVE CLEAR、音数匹配、完整输入与释放。通过后保存当前设备和难度的配置。",
+      "option": [
+        "SoloChartCalibrationSongMode",
+        "SoloChartCalibrationDifficulty"
+      ]
     }
   ],
   "option": {
+    "OneShotChartLiveDifficulty": {
+      "type": "select",
+      "label": "谱面难度",
+      "default_case": "EASY",
+      "cases": [
+        {"name": "EASY", "label": "EASY", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "easy"}}}},
+        {"name": "NORMAL", "label": "NORMAL", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "normal"}}}},
+        {"name": "HARD", "label": "HARD", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "hard"}}}},
+        {"name": "EXPERT", "label": "EXPERT", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "expert"}}}},
+        {"name": "MASTER", "label": "MASTER", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "master"}}}},
+        {"name": "APPEND", "label": "APPEND", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "append"}}}}
+      ]
+    },
     "AutoLiveSongMode": {
       "type": "select",
       "label": "选曲方式",
@@ -44,14 +116,22 @@
           "name": "Current",
           "label": "当前歌曲",
           "pipeline_override": {
-            "AutoLiveSongModeConfig": {"custom_action_param": {"mode": "current"}}
+            "AutoLiveSongModeConfig": {
+              "custom_action_param": {
+                "mode": "current"
+              }
+            }
           }
         },
         {
           "name": "Random",
           "label": "随机选取",
           "pipeline_override": {
-            "AutoLiveSongModeConfig": {"custom_action_param": {"mode": "random"}}
+            "AutoLiveSongModeConfig": {
+              "custom_action_param": {
+                "mode": "random"
+              }
+            }
           }
         }
       ]
@@ -71,7 +151,9 @@
       ],
       "pipeline_override": {
         "AutoLiveRun": {
-          "custom_action_param": {"count": "{Count}"}
+          "custom_action_param": {
+            "count": "{Count}"
+          }
         }
       }
     },
@@ -84,32 +166,44 @@
           "name": "Off",
           "label": "关闭（默认）",
           "pipeline_override": {
-            "AutoLiveRecoveryModeConfig": {"custom_action_param": {"mode": "off"}}
+            "AutoLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "mode": "off"
+              }
+            }
           }
         },
         {
           "name": "Small",
           "label": "小饮料（每瓶 +1）",
           "pipeline_override": {
-            "AutoLiveRecoveryModeConfig": {"custom_action_param": {"mode": "small"}}
+            "AutoLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "mode": "small"
+              }
+            }
           }
         },
         {
           "name": "Large",
           "label": "大饮料（每瓶 +10）",
           "pipeline_override": {
-            "AutoLiveRecoveryModeConfig": {"custom_action_param": {"mode": "large"}}
+            "AutoLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "mode": "large"
+              }
+            }
           }
         }
       ]
     },
-    "AutoLiveRecoveryLimit": {
+    "AutoLiveRecoveryCount": {
       "type": "input",
-      "label": "单次任务最多使用饮料",
+      "label": "每次回复饮料数量",
       "inputs": [
         {
-          "name": "Limit",
-          "label": "瓶数上限",
+          "name": "RecoveryCount",
+          "label": "每次瓶数",
           "default": "1",
           "pipeline_type": "int",
           "verify": "^[1-9][0-9]?$",
@@ -117,8 +211,500 @@
         }
       ],
       "pipeline_override": {
-        "AutoLiveRecoveryLimitConfig": {"custom_action_param": {"limit": "{Limit}"}}
+        "AutoLiveRecoveryCountConfig": {
+          "custom_action_param": {
+            "count": "{RecoveryCount}"
+          }
+        }
       }
+    },
+    "SoloChartLiveSongMode": {
+      "type": "select",
+      "label": "选曲方式",
+      "default_case": "Current",
+      "cases": [
+        {
+          "name": "Current",
+          "label": "当前歌曲",
+          "pipeline_override": {
+            "SoloChartLiveSongConfig": {
+              "custom_action_param": {
+                "song_mode": "current"
+              }
+            }
+          }
+        },
+        {
+          "name": "Random",
+          "label": "随机选取",
+          "pipeline_override": {
+            "SoloChartLiveSongConfig": {
+              "custom_action_param": {
+                "song_mode": "random"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SoloChartLiveDifficulty": {
+      "type": "select",
+      "label": "谱面难度",
+      "default_case": "EASY",
+      "cases": [
+        {
+          "name": "EASY",
+          "label": "EASY",
+          "pipeline_override": {
+            "SoloChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "easy"
+              }
+            }
+          }
+        },
+        {
+          "name": "NORMAL",
+          "label": "NORMAL",
+          "pipeline_override": {
+            "SoloChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "normal"
+              }
+            }
+          }
+        },
+        {
+          "name": "HARD",
+          "label": "HARD",
+          "pipeline_override": {
+            "SoloChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "hard"
+              }
+            }
+          }
+        },
+        {
+          "name": "EXPERT",
+          "label": "EXPERT",
+          "pipeline_override": {
+            "SoloChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "expert"
+              }
+            }
+          }
+        },
+        {
+          "name": "MASTER",
+          "label": "MASTER",
+          "pipeline_override": {
+            "SoloChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "master"
+              }
+            }
+          }
+        },
+        {
+          "name": "APPEND",
+          "label": "APPEND",
+          "pipeline_override": {
+            "SoloChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "append"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SoloChartLiveCount": {
+      "type": "input",
+      "label": "演出次数",
+      "inputs": [
+        {
+          "name": "Value",
+          "label": "演出次数",
+          "default": "1",
+          "pipeline_type": "int",
+          "verify": "^[1-9][0-9]{0,2}$",
+          "pattern_msg": "请输入 1 到 999 的整数"
+        }
+      ],
+      "pipeline_override": {
+        "SoloChartLiveCountConfig": {
+          "custom_action_param": {
+            "count": "{Value}"
+          }
+        }
+      }
+    },
+    "SoloChartLiveRecoveryMode": {
+      "type": "select",
+      "label": "体力不足时使用道具",
+      "default_case": "Off",
+      "cases": [
+        {
+          "name": "Off",
+          "label": "关闭",
+          "pipeline_override": {
+            "SoloChartLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "recovery_mode": "off"
+              }
+            }
+          }
+        },
+        {
+          "name": "Small",
+          "label": "小饮料（每瓶 +1）",
+          "pipeline_override": {
+            "SoloChartLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "recovery_mode": "small"
+              }
+            }
+          }
+        },
+        {
+          "name": "Large",
+          "label": "大饮料（每瓶 +10）",
+          "pipeline_override": {
+            "SoloChartLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "recovery_mode": "large"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SoloChartLiveRecoveryCount": {
+      "type": "input",
+      "label": "每次回复饮料数量",
+      "inputs": [
+        {
+          "name": "Value",
+          "label": "每次瓶数",
+          "default": "1",
+          "pipeline_type": "int",
+          "verify": "^[1-9][0-9]?$",
+          "pattern_msg": "请输入 1 到 99 的整数"
+        }
+      ],
+      "pipeline_override": {
+        "SoloChartLiveRecoveryCountConfig": {
+          "custom_action_param": {
+            "recovery_count": "{Value}"
+          }
+        }
+      }
+    },
+    "SoloChartCalibrationDifficulty": {
+      "type": "select",
+      "label": "谱面难度",
+      "default_case": "EASY",
+      "cases": [
+        {
+          "name": "EASY",
+          "label": "EASY",
+          "pipeline_override": {
+            "SoloChartCalibrationDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "easy"
+              }
+            }
+          }
+        },
+        {
+          "name": "NORMAL",
+          "label": "NORMAL",
+          "pipeline_override": {
+            "SoloChartCalibrationDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "normal"
+              }
+            }
+          }
+        },
+        {
+          "name": "HARD",
+          "label": "HARD",
+          "pipeline_override": {
+            "SoloChartCalibrationDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "hard"
+              }
+            }
+          }
+        },
+        {
+          "name": "EXPERT",
+          "label": "EXPERT",
+          "pipeline_override": {
+            "SoloChartCalibrationDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "expert"
+              }
+            }
+          }
+        },
+        {
+          "name": "MASTER",
+          "label": "MASTER",
+          "pipeline_override": {
+            "SoloChartCalibrationDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "master"
+              }
+            }
+          }
+        },
+        {
+          "name": "APPEND",
+          "label": "APPEND",
+          "pipeline_override": {
+            "SoloChartCalibrationDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "append"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SoloChartCalibrationSongMode": {
+      "type": "select",
+      "label": "选曲方式",
+      "default_case": "Current",
+      "cases": [
+        {
+          "name": "Current",
+          "label": "当前歌曲",
+          "pipeline_override": {
+            "SoloChartCalibrationSongConfig": {
+              "custom_action_param": {
+                "song_mode": "current"
+              }
+            }
+          }
+        },
+        {
+          "name": "Random",
+          "label": "随机选取",
+          "pipeline_override": {
+            "SoloChartCalibrationSongConfig": {
+              "custom_action_param": {
+                "song_mode": "random"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CooperativeChartLiveSongMode": {
+      "type": "select",
+      "label": "选曲方式",
+      "default_case": "Current",
+      "cases": [
+        {
+          "name": "Current",
+          "label": "提交当前歌曲",
+          "pipeline_override": {
+            "CooperativeChartLiveSongConfig": {
+              "custom_action_param": {
+                "song_mode": "current"
+              }
+            }
+          }
+        },
+        {
+          "name": "Random",
+          "label": "随机（おまかせ）",
+          "pipeline_override": {
+            "CooperativeChartLiveSongConfig": {
+              "custom_action_param": {
+                "song_mode": "random"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CooperativeChartLiveDifficulty": {
+      "type": "select",
+      "label": "谱面难度",
+      "default_case": "EASY",
+      "cases": [
+        {
+          "name": "EASY",
+          "label": "EASY",
+          "pipeline_override": {
+            "CooperativeChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "easy"
+              }
+            }
+          }
+        },
+        {
+          "name": "NORMAL",
+          "label": "NORMAL",
+          "pipeline_override": {
+            "CooperativeChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "normal"
+              }
+            }
+          }
+        },
+        {
+          "name": "HARD",
+          "label": "HARD",
+          "pipeline_override": {
+            "CooperativeChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "hard"
+              }
+            }
+          }
+        },
+        {
+          "name": "EXPERT",
+          "label": "EXPERT",
+          "pipeline_override": {
+            "CooperativeChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "expert"
+              }
+            }
+          }
+        },
+        {
+          "name": "MASTER",
+          "label": "MASTER",
+          "pipeline_override": {
+            "CooperativeChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "master"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CooperativeChartLiveCount": {
+      "type": "input",
+      "label": "演出次数",
+      "inputs": [
+        {
+          "name": "Value",
+          "label": "演出次数",
+          "default": "1",
+          "pipeline_type": "int",
+          "verify": "^[1-9][0-9]{0,2}$",
+          "pattern_msg": "请输入 1 到 999 的整数"
+        }
+      ],
+      "pipeline_override": {
+        "CooperativeChartLiveCountConfig": {
+          "custom_action_param": {
+            "count": "{Value}"
+          }
+        }
+      }
+    },
+    "CooperativeChartLiveRecoveryMode": {
+      "type": "select",
+      "label": "体力不足时使用道具",
+      "default_case": "Off",
+      "cases": [
+        {
+          "name": "Off",
+          "label": "关闭",
+          "pipeline_override": {
+            "CooperativeChartLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "recovery_mode": "off"
+              }
+            }
+          }
+        },
+        {
+          "name": "Small",
+          "label": "小饮料（每瓶 +1）",
+          "pipeline_override": {
+            "CooperativeChartLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "recovery_mode": "small"
+              }
+            }
+          }
+        },
+        {
+          "name": "Large",
+          "label": "大饮料（每瓶 +10）",
+          "pipeline_override": {
+            "CooperativeChartLiveRecoveryModeConfig": {
+              "custom_action_param": {
+                "recovery_mode": "large"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CooperativeChartLiveRecoveryCount": {
+      "type": "input",
+      "label": "每次回复饮料数量",
+      "inputs": [
+        {
+          "name": "Value",
+          "label": "每次瓶数",
+          "default": "1",
+          "pipeline_type": "int",
+          "verify": "^[1-9][0-9]?$",
+          "pattern_msg": "请输入 1 到 99 的整数"
+        }
+      ],
+      "pipeline_override": {
+        "CooperativeChartLiveRecoveryCountConfig": {
+          "custom_action_param": {
+            "recovery_count": "{Value}"
+          }
+        }
+      }
+    },
+    "CooperativeChartLiveRoom": {
+      "type": "select",
+      "label": "公房类型",
+      "default_case": "Free",
+      "cases": [
+        {
+          "name": "Free",
+          "label": "自由房间",
+          "pipeline_override": {
+            "CooperativeChartLiveRoomConfig": {
+              "custom_action_param": {
+                "room": "free"
+              }
+            }
+          }
+        },
+        {
+          "name": "Veteran",
+          "label": "资深房间",
+          "pipeline_override": {
+            "CooperativeChartLiveRoomConfig": {
+              "custom_action_param": {
+                "room": "veteran"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

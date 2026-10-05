@@ -32,10 +32,16 @@ class MaaDevice:
         return frame
 
     def tap(self, x: int, y: int) -> None:
-        self.controller.post_click(x, y).wait()
+        if not self.controller.post_click(x, y).wait().succeeded:
+            raise RuntimeError(f"MFA 控制器点击失败：({x}, {y})")
 
     def back(self) -> None:
         self.controller.post_click_key(4).wait()
+
+    def home(self) -> None:
+        # HOME 将游戏留在后台；回执失败时不能声称已返回模拟器主页。
+        if not self.controller.post_click_key(3).wait().succeeded:
+            raise RuntimeError("MFA 控制器 HOME 输入失败")
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 450) -> None:
         self.controller.post_swipe(x1, y1, x2, y2, duration_ms).wait()

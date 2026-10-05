@@ -1,0 +1,8 @@
+{
+  "regions": {
+    "fast": {"capture": "fast-great.png", "box": [601, 389, 681, 417], "ink": "white"},
+    "late": {"capture": "late-great.png", "box": [601, 389, 681, 417], "ink": "white"},
+    "great": {"capture": "fast-great.png", "box": [567, 425, 713, 467], "ink": "pink"},
+    "perfect": {"capture": "late-perfect.png", "box": [544, 426, 736, 461], "ink": "pastel"}
+  }
+}

@@ -1,6 +1,7 @@
 __pycache__/
 .pytest_cache/
 .local/
+config/maa_option.json
 *.pyc
 *.log
 *.png
@@ -8,3 +9,11 @@ __pycache__/
 *.mp4
 *.sus
 charts/private/
+resource/charts/
+resource/models/song_title_ocr/
+**/bin/
+**/obj/
+*.pyd
+project_sekai/native/*.lib
+project_sekai/native/*.pdb
+native/build/

@@ -95,6 +95,41 @@ class ResultNavigationTests(unittest.TestCase):
         self.assertEqual(device.backs, 0)
         self.assertEqual(device.index, 0)
 
+    def _title_navigator(self, device: FakeDevice) -> Navigator:
+        navigator = Navigator(device, self.config)
+        navigator.templates["title_screen"] = self.unknown[0:20, 0:20]
+        navigator.match = lambda _frame, name, _area=None: (1.0 if name == "title_screen" else 0.0, (0, 0))
+        return navigator
+
+    def test_title_during_settlement_stops_without_back_or_counting(self) -> None:
+        device = FakeDevice([self.unknown])
+        navigator = self._title_navigator(device)
+        with patch("project_sekai.navigator.time.sleep"), patch("project_sekai.navigator.time.monotonic", side_effect=[0, 0, 2]):
+            with self.assertRaisesRegex(RuntimeError, "标题页"):
+                navigator.collect_with_back(timeout=0.05)
+        self.assertEqual(device.backs, 0)
+        self.assertEqual(device.taps, [])
+        self.assertEqual(navigator.completed_rounds, 0)
+
+    def test_title_after_animation_tap_stops_before_back(self) -> None:
+        device = FakeDevice([self.unknown, self.home])
+        navigator = self._title_navigator(device)
+        navigator.match = lambda frame, name, _area=None: (1.0 if name == "title_screen" and frame is self.home else 0.0, (0, 0))
+        with patch("project_sekai.navigator.time.sleep"), patch("project_sekai.navigator.time.monotonic", side_effect=[0, 0, 2]):
+            with self.assertRaisesRegex(RuntimeError, "标题页"):
+                navigator.collect_with_back(timeout=0.05)
+        self.assertEqual(device.backs, 0)
+        self.assertEqual(device.taps, [(1279, 719)])
+
+    def test_title_before_navigation_stops_without_input(self) -> None:
+        device = FakeDevice([self.unknown])
+        navigator = self._title_navigator(device)
+        with patch("project_sekai.navigator.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "标题页"):
+                navigator.return_to_home(max_backs=2)
+        self.assertEqual(device.backs, 0)
+        self.assertEqual(device.taps, [])
+
 
 if __name__ == "__main__":
     unittest.main()
