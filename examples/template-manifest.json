@@ -7,6 +7,8 @@
     "song_select": {"capture": "song_select.png", "box": [934, 560, 1087, 625]},
     "prepare": {"capture": "prepare.png", "box": [45, 135, 300, 172]},
     "playing": {"capture": "playfield.png", "box": [1194, 16, 1252, 73]},
+    "life_hud": {"capture": "playfield.png", "box": [1008, 13, 1061, 34]},
+    "life_zero_value": {"capture": "life_zero.png", "box": [1090, 8, 1187, 37]},
     "live_clear": {"capture": "live_clear.png", "box": [137, 280, 970, 395]},
     "live_failed": {"capture": "solo_live_failed.png", "box": [137, 280, 970, 395]},
     "master_selected": {"capture": "song_select.png", "box": [1138, 538, 1211, 557]},

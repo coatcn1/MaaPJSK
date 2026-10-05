@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'agent'))
 import solo_live as agent
 from project_sekai.ocr import LineOcr, Reading
 from project_sekai.solo_live import LiveResult, SoloLive, numeric, is_light_mode, append_result_index
-from project_sekai.song_identity import SongMatcher, title_score
+from project_sekai.song_identity import SongMatcher, read_image, title_score
 from scripts.test_solo_live import controller_options
 
 
@@ -138,7 +138,7 @@ class SoloTests(unittest.TestCase):
         workflow = SoloLive.__new__(SoloLive)
         workflow.device = Mock()
         workflow.navigator = SimpleNamespace(threshold=.83,templates={'live_failed':None})
-        workflow.navigator.match=lambda frame,name: (1.0 if (name=='home' and frame is sequence[-1]) or
+        workflow.navigator.match=lambda frame,name,*args: (1.0 if (name=='home' and frame is sequence[-1]) or
             (name=='live_clear' and frame is clear) or (name=='live_failed' and frame is failed) else 0.0,(0,0))
         workflow.navigator._check_stop=lambda:None
         workflow.screenshot=Mock(side_effect=sequence)
@@ -156,6 +156,42 @@ class SoloTests(unittest.TestCase):
         self.assertEqual(report['judgements']['perfect'],250)
         self.assertEqual(report['live_status'],'failed')
         self.assertFalse(report.get('completed',False))
+
+    def test_black_transition_and_missing_clear_use_life_hud_end_confirmation(self):
+        black = np.zeros((720, 1280, 3), np.uint8)
+        other, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
+        workflow = self._collection([black, other, judge, judge, home, home], None, None, judge)
+        workflow.life_guard = SimpleNamespace(hud_seen=True)
+        workflow.navigator.templates['life_hud'] = None
+        report = {'engine': 'legacy', 'chart': {'total_note_count': 259}, 'playback': {
+            'planned_actions': 4, 'sent_actions': 4, 'release_confirmed': True}}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['completed'])
+        self.assertEqual(report['live_status'], 'ended')
+        self.assertEqual(report['end_detection']['method'], 'life_hud_disappeared')
+
+    def test_unreadable_result_at_home_is_recorded_as_warning(self):
+        clear, other, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
+        workflow = self._collection([clear, other, home, home], clear, None, None)
+        report = {'chart': {'total_note_count': 259}}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.collect(report, Path(directory))
+        self.assertFalse(report['completed'])
+        self.assertTrue(report['returned_home'])
+        self.assertEqual(report['result_status'], 'unreadable')
+        self.assertIn('继续下一曲', report['settlement_warning'])
+
+    def test_result_note_mismatch_preserves_numbers_without_stopping(self):
+        clear, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
+        workflow = self._collection([clear, judge, judge, home, home], clear, None, judge)
+        report = {'chart': {'total_note_count': 260}}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.collect(report, Path(directory))
+        self.assertFalse(report['completed'])
+        self.assertEqual(report['judgements']['total'], 259)
+        self.assertEqual(report['result_status'], 'note_count_mismatch')
+        self.assertTrue(report['returned_home'])
 
     def test_home_after_animation_tap_prevents_another_back(self):
         clear,judge,other,home=[np.full((720,1280,3),value,np.uint8) for value in [180,190,200,210]]
@@ -370,6 +406,25 @@ class SoloTests(unittest.TestCase):
                 workflow.ensure_bonus_available('large',1,report,Path(directory))
         self.assertEqual(workflow.navigator._recover_and_verify.call_count,2)
 
+    def test_confirmed_drink_progress_is_persisted_before_a_later_bottle_fails(self):
+        workflow, report = self._availability_workflow([2])
+        frame = np.zeros((720,1280,3),np.uint8)
+        workflow.read_available_bonus = Mock(side_effect=[(3,Reading('3/50',.99)),(4,Reading('4/50',.99))])
+        def partial(before, mode, count, *, on_recovered):
+            on_recovered(1,frame)
+            on_recovered(2,frame)
+            raise RuntimeError('后续饮料等待失败')
+        workflow.navigator._recover_and_verify.side_effect = partial
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError,'后续饮料'):
+                workflow.ensure_bonus_available('small',5,report,Path(directory))
+            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['recovery']['completed_bottles'],2)
+        self.assertEqual(saved['recovery']['available_after'],4)
+        self.assertEqual(saved['recovery']['requested_bottles'],5)
+        workflow.navigator._recover_and_verify.assert_called_once()
+        workflow.navigator.ensure_auto.assert_not_called()
+
     def test_recovery_still_insufficient_stops_without_extra_drinks_or_lowering_consumption(self):
         workflow,report = self._availability_workflow([0,1])
         with tempfile.TemporaryDirectory() as directory:
@@ -458,6 +513,46 @@ class SoloTests(unittest.TestCase):
         self.assertTrue(all(call.args[:2]==('small',3) for call in workflow.ensure_bonus_available.call_args_list))
         workflow.restore_bonus.assert_not_called()
 
+    def test_partial_solo_result_continues_and_persists_before_progress(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device = Mock()
+        workflow.stop_requested = lambda: False
+        workflow.completed_rounds = 0
+        workflow.repository = Mock()
+        workflow.repository.songs = {730: {'charts': {'easy': {
+            'music_id': 730, 'difficulty': 'easy', 'sha256': 'hash', 'path': 'chart.sus', 'total_note_count': 259}}}}
+        selected = SimpleNamespace(song_id=730, to_dict=lambda: {'song_id': 730})
+        workflow.select = Mock(return_value=(selected, np.zeros((1, 1, 3), np.uint8)))
+        workflow.prepare_bonus = Mock()
+        workflow.ensure_bonus_available = Mock()
+        workflow.start = Mock(return_value=0)
+        workflow.play = Mock()
+
+        def collect(report, _):
+            report.update(returned_home=True, live_status='cleared', completed=report['round'] != 1)
+            if report['round'] == 1:
+                report.update(result_status='unreadable', settlement_warning='数字未完整读取，继续下一曲')
+            else:
+                report.update(result_status='recorded', judgements=LiveResult(250, 5, 2, 1, 1).to_dict())
+
+        workflow.collect = Mock(side_effect=collect)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('project_sekai.solo_live.parse_sus', return_value=SimpleNamespace(duration=1)), \
+                patch('project_sekai.solo_live.compile_touches', return_value=[]):
+            workflow.report_root = Path(directory)
+
+            def log(message):
+                if '已完成 1' in message:
+                    self.assertTrue(Path(workflow.last_report['report_path']).is_file())
+                    self.assertTrue((workflow.report_root / 'results.csv').is_file())
+
+            workflow.log = Mock(side_effect=log)
+            reports = workflow.run(2, 'easy', 'current')
+        self.assertEqual(workflow.play.call_count, 2)
+        self.assertEqual(workflow.completed_rounds, 1)
+        self.assertFalse(reports[0]['completed'])
+        self.assertTrue(reports[1]['completed'])
+
     def _opening_workflow(self, sequence, identities):
         workflow = SoloLive.__new__(SoloLive)
         workflow.device = Mock()
@@ -499,3 +594,69 @@ class SoloTests(unittest.TestCase):
         self.assertEqual(workflow.matcher.match.call_count,8)
         self.assertEqual(len(report['final_identity_attempts']),7)
         self.assertIsNotNone(workflow.loading_frame)
+
+    def test_long_intro_failure_keeps_baseline_and_recent_anchor_evidence(self):
+        final = np.full((80,160,3),10,np.uint8)
+        frames = [np.full((80,160,3),value,np.uint8) for value in range(20,60)]
+        identity = SimpleNamespace(song_id=730,difficulty='normal',title='エメラルド',to_dict=lambda:{'song_id':730})
+        workflow = self._opening_workflow([final]+frames,[identity])
+        workflow.navigator.match.side_effect = lambda frame,name,*args:(float(name=='playing' and frame is not final),(0,0))
+        chart = SimpleNamespace(first=SimpleNamespace(start=4.0),gestures=[])
+        report = {}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.StartAnchor') as anchor:
+            anchor.return_value.observe.side_effect = [None]*39+[RuntimeError('首音失败')]
+            anchor.return_value.samples = []
+            with self.assertRaisesRegex(RuntimeError,'首音失败'):
+                workflow.start(chart,identity,report,Path(directory))
+            saved = report['anchor_frames']
+            self.assertEqual(len(saved),32)
+            self.assertTrue(np.array_equal(read_image(Path(directory)/saved[0]['path']),frames[0]))
+            self.assertTrue(np.array_equal(read_image(Path(directory)/saved[-1]['path']),frames[-1]))
+
+    def test_replaced_single_candidate_report_and_pinned_frame_follow_actual_state(self):
+        final=np.full((80,160,3),10,np.uint8)
+        frames=[np.full((80,160,3),value,np.uint8) for value in range(20,60)]
+        identity=SimpleNamespace(song_id=730,difficulty='normal',title='song',to_dict=lambda:{'song_id':730})
+        workflow=self._opening_workflow([final]+frames,[identity])
+        workflow.navigator.match.side_effect=lambda frame,name,*args:(float(name=='playing' and frame is not final),(0,0))
+        chart=SimpleNamespace(first=SimpleNamespace(start=4.),gestures=[]);report={}
+        with tempfile.TemporaryDirectory() as directory,patch('project_sekai.solo_live.StartAnchor') as factory:
+            anchor=factory.return_value;anchor.samples=[];anchor.failure_reason=None
+            def observe(frame,when,**kwargs):
+                if frame is frames[1]:anchor.samples=[(when,220.)]
+                if frame is frames[3]:anchor.samples=[(when,221.)]
+                if frame is frames[-1]:raise RuntimeError('候选未确认运动')
+                return None
+            anchor.observe.side_effect=observe
+            with self.assertRaisesRegex(RuntimeError,'候选未确认运动'):
+                workflow.start(chart,identity,report,Path(directory))
+            self.assertEqual(report['anchor_attempt']['samples'],anchor.samples)
+            self.assertEqual(report['anchor_attempt']['sample_count'],1)
+            self.assertEqual(report['anchor_attempt']['sample_state'],'candidate_unconfirmed')
+            saved=report['anchor_frames'];self.assertEqual(len(saved),33)
+            pixels=[read_image(Path(directory)/item['path']) for item in saved]
+            self.assertTrue(any(np.array_equal(image,frames[3]) for image in pixels))
+            self.assertFalse(any(np.array_equal(image,frames[1]) for image in pixels))
+            self.assertEqual([item['captured_at'] for item in saved],sorted(item['captured_at'] for item in saved))
+
+    def test_success_defers_encoding_and_retains_early_candidate_frame(self):
+        final=np.full((80,160,3),10,np.uint8)
+        frames=[np.full((80,160,3),value,np.uint8) for value in range(20,60)]
+        identity=SimpleNamespace(song_id=730,difficulty='normal',title='song',to_dict=lambda:{'song_id':730})
+        workflow=self._opening_workflow([final]+frames,[identity])
+        workflow.navigator.match.side_effect=lambda frame,name,*args:(float(name=='playing' and frame is not final),(0,0))
+        chart=SimpleNamespace(first=SimpleNamespace(start=4.),gestures=[]);report={}
+        with tempfile.TemporaryDirectory() as directory,patch('project_sekai.solo_live.StartAnchor') as factory,patch('project_sekai.solo_live.write_image') as write:
+            anchor=factory.return_value;anchor.samples=[];anchor.fit={}
+            def observe(frame,when,**kwargs):
+                if frame is frames[1]:anchor.samples=[(when,220.)]
+                if frame is frames[-1]:
+                    anchor.samples.append((when,300.))
+                    return 123.
+                return None
+            anchor.observe.side_effect=observe
+            self.assertEqual(workflow.start(chart,identity,report,Path(directory)),123.)
+            write.assert_not_called()
+            self.assertEqual(report['anchor_attempt']['sample_state'],'accepted')
+            self.assertEqual(len(workflow.anchor_frames),33)
+            self.assertTrue(any(np.array_equal(image,frames[1]) for _,image in workflow.anchor_frames))

@@ -134,6 +134,39 @@ class NativeTests(unittest.TestCase):
         self.assertIn('d 0 149 640 50',script['lines'])
         self.assertIn('m 0 205 670 50',script['lines'])
 
+    def test_cooperative_observer_rate_and_queue_margin_cover_a_continuous_hold(self):
+        clock=Clock();device=ScriptDevice(clock);samples=[]
+        events=(Touch(.1,2,0,'down',500),Touch(8,0,0,'up'))
+        def sample():
+            samples.append(clock())
+            clock.sleep(.20)
+        player=NativePlayer(None,events,Path('.'),lambda:False,device=device,clock=clock,sleeper=clock.sleep,
+                            idle_observer=sample,observation_interval=2.0,observation_budget=.30)
+        player.prepare()
+        player.play(1000,0)
+        player.close()
+        self.assertGreaterEqual(len(samples),3)
+        self.assertTrue(all(second-first>=2 for first,second in zip(samples,samples[1:])))
+        self.assertEqual(player.report['queue_underflows'],0)
+        self.assertEqual(player.report['executed_actions'],2)
+        self.assertEqual(player.report['observation']['samples'],len(samples))
+
+    def test_observed_cost_increases_the_required_queue_margin_without_burst_sampling(self):
+        clock=Clock();device=ScriptDevice(clock);samples=[]
+        events=(Touch(.1,2,0,'down',500),Touch(10,0,0,'up'))
+        def sample():
+            samples.append(clock())
+            clock.sleep(.45)
+        player=NativePlayer(None,events,Path('.'),lambda:False,device=device,clock=clock,sleeper=clock.sleep,
+                            idle_observer=sample,observation_interval=2.0,observation_budget=.30)
+        player.prepare()
+        player.play(1000,0)
+        player.close()
+        self.assertGreaterEqual(len(samples),3)
+        self.assertEqual(player.report['queue_underflows'],0)
+        self.assertAlmostEqual(player.report['observation']['max_cost_ms'],450)
+        self.assertGreaterEqual(player.report['observation']['minimum_headroom_ms'],600)
+
     def test_late_start_and_invalid_touch_plan_are_rejected_before_publication(self):
         module=native_engine.module()
         with self.assertRaises(ValueError): module.Timeline([asdict(Touch(.1,1,0,'move',600))])
@@ -151,6 +184,97 @@ def good_report(perfect=100, fast=0, late=0):
 
 
 class SettingsCalibrationTests(unittest.TestCase):
+    def write_warm_fixture(self, root, name, offset, *, fast=0, late=17, **metadata):
+        runs=root/'solo-chart-runs';runs.mkdir(exist_ok=True)
+        report=good_report(fast=fast,late=late);report['timing_offset_ms']=offset
+        report_path=runs/f'{name}.json';report_path.write_text(json.dumps(report))
+        directory=root/'calibration-runs'/name;directory.mkdir(parents=True)
+        (directory/'session.json').write_text(json.dumps({'environment':{},'difficulty':'normal',
+            'rounds':[{'stage':'formal-validation','report':str(report_path)}],**metadata}))
+        return report_path
+
+    def test_unknown_failed_warm_does_not_override_manual_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            self.write_warm_fixture(root,'old',-24)
+            self.write_warm_fixture(root,'new',-27,late=4,initial_offset_source='warm',initial_offset_ms=-24)
+            calls=[]
+            workflow=SimpleNamespace(log=lambda _:None,stop_requested=lambda:False,
+                run=lambda *args,**kwargs:calls.append(args[3]) or [good_report()])
+            session=CalibrationRunner(workflow,CalibrationProfiles(root/'profiles'),{},
+                PerformanceSettings(touch_offset_ms=-51),root/'calibration-runs').run('normal','current')
+            self.assertEqual(calls,[-51,-51])
+            self.assertEqual(session['initial_offset_source'],'manual')
+            self.assertEqual(session['warm_seed_offset_ms'],-51)
+
+    def test_same_manual_seed_continues_unbalanced_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            report_path=self.write_warm_fixture(root,'old',7,warm_seed_offset_ms=10)
+            calls=[]
+            workflow=SimpleNamespace(log=lambda _:None,stop_requested=lambda:False,
+                run=lambda *args,**kwargs:calls.append(args[3]) or [good_report()])
+            session=CalibrationRunner(workflow,CalibrationProfiles(root/'profiles'),{},
+                PerformanceSettings(touch_offset_ms=10),root/'calibration-runs').run('normal','current')
+            self.assertEqual(calls,[7,7])
+            self.assertEqual(session['warm_seed_offset_ms'],10)
+            self.assertEqual(session['warm_start_report'],str(report_path.resolve()))
+
+    def test_failed_warm_seed_requires_exact_manual_and_known_integer_lineage(self):
+        for metadata,expected in [
+                ({'warm_seed_offset_ms':20},False),({'warm_seed_offset_ms':True},False),
+                ({'warm_seed_offset_ms':None,'initial_offset_source':'manual','initial_offset_ms':10},False),
+                ({'initial_offset_source':'manual','initial_offset_ms':10},True),
+                ({'initial_offset_source':'explicit','initial_offset_ms':10},True),
+                ({'initial_offset_source':'explicit','initial_offset_ms':-23},False),
+                ({'initial_offset_source':'manual','initial_offset_ms':True},False),
+                ({'initial_offset_source':'warm','initial_offset_ms':10},False)]:
+            with self.subTest(metadata=metadata),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);self.write_warm_fixture(root,'old',7,**metadata)
+                runner=CalibrationRunner(SimpleNamespace(),CalibrationProfiles(root/'profiles'),{},
+                    PerformanceSettings(touch_offset_ms=10),root/'calibration-runs')
+                self.assertEqual(runner.warm_candidate('normal') is not None,expected)
+
+    def test_unknown_better_rank_does_not_hide_eligible_failed_warm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            self.write_warm_fixture(root,'new',-27,fast=4,late=7)
+            self.write_warm_fixture(root,'old',7,warm_seed_offset_ms=10)
+            runner=CalibrationRunner(SimpleNamespace(),CalibrationProfiles(root/'profiles'),{},
+                PerformanceSettings(touch_offset_ms=10),root/'calibration-runs')
+            self.assertEqual(runner.warm_candidate('normal')['offset'],7)
+
+    def test_balanced_legacy_warm_keeps_unknown_seed_and_explicit_resets_it(self):
+        for explicit,seed,source in [(None,None,'warm'),(-23,-23,'explicit')]:
+            with self.subTest(explicit=explicit),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);self.write_warm_fixture(root,'old',7,late=1)
+                workflow=SimpleNamespace(log=lambda _:None,stop_requested=lambda:False,
+                    run=lambda *args,**kwargs:[good_report()])
+                session=CalibrationRunner(workflow,CalibrationProfiles(root/'profiles'),{},
+                    PerformanceSettings(touch_offset_ms=10),root/'calibration-runs',initial_offset_ms=explicit).run('normal','current')
+                self.assertEqual(session['warm_seed_offset_ms'],seed)
+                self.assertEqual(session['initial_offset_source'],source)
+
+    def test_invalid_latest_round_does_not_hide_valid_older_round_in_same_session(self):
+        for invalid in ['feedback','missing','json']:
+            with self.subTest(invalid=invalid),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                old=self.write_warm_fixture(root,'old',-30,fast=10,late=10,warm_seed_offset_ms=0)
+                newer=old.parent/'newer.json'
+                if invalid=='feedback':
+                    report=good_report(fast=None,late=None);report['timing_offset_ms']=-24
+                    newer.write_text(json.dumps(report))
+                elif invalid=='json':newer.write_text('{invalid')
+                session_path=root/'calibration-runs'/'old'/'session.json'
+                session=json.loads(session_path.read_text())
+                session['rounds'].append({'report':str(newer)})
+                session_path.write_text(json.dumps(session))
+                runner=CalibrationRunner(SimpleNamespace(),CalibrationProfiles(root/'profiles'),{},
+                    PerformanceSettings(),root/'calibration-runs')
+                candidate=runner.warm_candidate('normal')
+                self.assertIsNotNone(candidate)
+                self.assertEqual(candidate['offset'],-30)
+
     def test_trace_before_same_lane_tap_reuses_held_contact_instead_of_early_down(self):
         chart=Chart((Gesture((Point(1,4,3,5),),'trace'),Gesture((Point(1.1,6,3,5),),'trace'),
                      Gesture((Point(1.2,6,3,1),),'tap')),480,((0,120),))
@@ -189,7 +313,7 @@ class SettingsCalibrationTests(unittest.TestCase):
         self.assertEqual(adjusted_offset(5,good_report()['judgements']),5)
         with self.assertRaises(ValueError): adjusted_offset(0,{'fast':None,'late':0,'total':100})
         bad=good_report(99,fast=1)['judgements'];bad['bad']=1
-        self.assertEqual(adjusted_offset(-24,bad),-21)
+        self.assertEqual(adjusted_offset(-24,bad),-24)
 
     def test_authorized_five_stamina_calibration_keeps_requested_quantity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -206,24 +330,60 @@ class SettingsCalibrationTests(unittest.TestCase):
             self.assertEqual(restored,[5])
             self.assertTrue(all(kwargs['bonus_consumption']==5 and kwargs['recovery_mode']=='off' for _,kwargs in calls))
             self.assertEqual(calls[0][0][3],-23)
+            self.assertEqual(session['initial_offset_source'],'explicit')
+            self.assertEqual(session['initial_offset_ms'],-23)
 
     def test_formal_validation_requires_real_full_execution_and_correct_chart_total(self):
         self.assertTrue(validation_passed(good_report(95)))
-        for key,value in [('perfect_rate',.94),('miss',1),('bad',1),('total_matches_chart',False)]:
+        for key,value in [('total_matches_chart',False)]:
             report=good_report();report['judgements'][key]=value
             self.assertFalse(validation_passed(report))
         for key,value in [('executed_actions',199),('release_confirmed',False)]:
             report=good_report();report['playback'][key]=value
             self.assertFalse(validation_passed(report))
 
-    def test_master_cannot_pass_percentage_gate_with_more_than_ten_great(self):
+    def test_balanced_feedback_accepts_complex_chart_without_precision_gate(self):
         report=good_report();report['requested_difficulty']='master'
-        report['judgements'].update(perfect=989,great=11,total=1000,perfect_rate=.989)
-        self.assertFalse(validation_passed(report))
-        report['judgements'].update(perfect=990,great=10,perfect_rate=.99)
+        report['judgements'].update(perfect=20,great=20,good=10,bad=10,miss=40,perfect_rate=.2,fast=20,late=21)
         self.assertTrue(validation_passed(report))
-        report['judgements']['good']=1
+
+    def test_unbalanced_or_incomplete_feedback_rejects_even_perfect_chart(self):
+        for fast,late in [(0,17),(None,0),(-1,0),(True,0),(0,False),(0,None)]:
+            with self.subTest(fast=fast,late=late):
+                report=good_report(fast=fast,late=late)
+                self.assertFalse(validation_passed(report))
+        self.assertTrue(validation_passed(good_report(fast=0,late=0)))
+        report=good_report();report['judgements'].pop('fast')
         self.assertFalse(validation_passed(report))
+        for key,value in [('completed',False),('live_status','failed')]:
+            report=good_report();report[key]=value
+            self.assertFalse(validation_passed(report))
+
+    def test_balanced_low_perfect_profile_save_and_load_use_same_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report=good_report(20,fast=10,late=11)
+            report['judgements'].update(great=20,good=10,bad=10,miss=40)
+            profile={'schema_version':1,'accepted':True,'environment':{},'difficulty':'master',
+                     'offset_ms':0,'validation_report':report,'latency_offsets':{}}
+            profiles=CalibrationProfiles(Path(directory))
+            profiles.save(profile)
+            self.assertEqual(profiles.load({},'master'),profile)
+            report['judgements'].update(fast=0,late=17)
+            with self.assertRaises(ValueError):profiles.save(profile)
+
+    def test_warm_candidate_ranks_feedback_balance_before_perfect_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);runs=root/'solo-chart-runs';runs.mkdir()
+            for name,report,offset in [('20261005-new',good_report(100,late=17),-24),
+                                       ('20261005-old',good_report(20,fast=10,late=10),-51)]:
+                report['timing_offset_ms']=offset;report_path=runs/f'{name}.json'
+                report_path.write_text(json.dumps(report))
+                session=root/'calibration-runs'/name;session.mkdir(parents=True)
+                (session/'session.json').write_text(json.dumps({'environment':{},'difficulty':'normal',
+                    'rounds':[{'report':str(report_path)}]}))
+            runner=CalibrationRunner(SimpleNamespace(),CalibrationProfiles(root/'profiles'),{},
+                PerformanceSettings(),root/'calibration-runs')
+            self.assertEqual(runner.warm_candidate('normal')['offset'],-51)
 
     def test_calibration_is_two_zero_stamina_rounds_then_activates_only_after_validation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -238,9 +398,25 @@ class SettingsCalibrationTests(unittest.TestCase):
             self.assertEqual(session['status'],'accepted')
             self.assertEqual([args[2] for args,_ in calls],['random','current'])
             self.assertTrue(all(kwargs['bonus_consumption']==0 and kwargs['recovery_mode']=='off' for _,kwargs in calls))
-            self.assertEqual(calls[1][0][3],-12)
-            self.assertEqual(profiles.load({'engine':'native'},'normal')['offset_ms'],-92)
+            self.assertEqual(calls[0][0][3],80)
+            self.assertEqual(calls[1][0][3],68)
+            self.assertEqual(profiles.load({'engine':'native'},'normal')['offset_ms'],-12)
             self.assertIsNone(profiles.load({'engine':'another-device'},'normal'))
+
+    def test_new_environment_calibration_keeps_negative_manual_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); calls=[]
+            settings=PerformanceSettings(touch_offset_ms=-51,use_calibration_profile=False)
+            snapshot=asdict(settings)
+            workflow=SimpleNamespace(log=lambda _:None,stop_requested=lambda:False,
+                run=lambda *args,**kwargs:calls.append(args[3]) or [good_report()])
+            profiles=CalibrationProfiles(root/'profiles')
+            session=CalibrationRunner(workflow,profiles,{'version':'new'},settings,root/'sessions').run('normal','current')
+            self.assertEqual(calls,[-51,-51])
+            self.assertEqual(session['initial_offset_ms'],-51)
+            self.assertEqual(session['initial_offset_source'],'manual')
+            self.assertEqual(profiles.load({'version':'new'},'normal')['offset_ms'],0)
+            self.assertEqual(asdict(settings),snapshot)
 
     def test_failed_validation_preserves_existing_accepted_profile(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -248,10 +424,52 @@ class SettingsCalibrationTests(unittest.TestCase):
             initial={'schema_version':1,'accepted':True,'environment':{},'difficulty':'easy','offset_ms':15,
                      'validation_report':good_report(),'latency_offsets':{}}
             path=profiles.save(initial); before=path.read_bytes()
-            workflow=SimpleNamespace(log=lambda _:None,run=lambda *args,**kwargs:[good_report(80)],stop_requested=lambda:False)
-            runner=CalibrationRunner(workflow,profiles,{},PerformanceSettings(),root/'sessions')
+            calls=[];settings=PerformanceSettings(touch_offset_ms=-51)
+            snapshot=asdict(settings)
+            workflow=SimpleNamespace(log=lambda _:None,run=lambda *args,**kwargs:calls.append(args[3]) or [good_report(80,late=1) if len(calls)==1 else good_report(100,late=17)],stop_requested=lambda:False)
+            runner=CalibrationRunner(workflow,profiles,{},settings,root/'sessions')
             with self.assertRaisesRegex(RuntimeError,'未通过'):runner.run('easy','current')
             self.assertEqual(path.read_bytes(),before)
+            self.assertEqual(calls,[-36,-36])
+            self.assertEqual(asdict(settings),snapshot)
+            session=json.loads(next((root/'sessions').glob('*/session.json')).read_text())
+            self.assertEqual(session['initial_offset_source'],'profile')
+            self.assertEqual(session['initial_offset_ms'],-36)
+
+    def test_calibration_offset_priority_and_old_environment_isolation(self):
+        for environment, explicit, expected, source in [
+                ({'version':'old'},None,-12,'warm'),
+                ({'version':'new'},None,-51,'manual'),
+                ({'version':'old'},-23,-23,'explicit')]:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);session_dir=root/'calibration-runs'/'old';session_dir.mkdir(parents=True)
+                runs=root/'solo-chart-runs';runs.mkdir()
+                report=good_report();report['timing_offset_ms']=-12
+                report_path=runs/'report.json';report_path.write_text(json.dumps(report))
+                (session_dir/'session.json').write_text(json.dumps({'environment':{'version':'old'},
+                    'difficulty':'normal','rounds':[{'report':str(report_path)}]}))
+                calls=[];settings=PerformanceSettings(touch_offset_ms=-51)
+                workflow=SimpleNamespace(log=lambda _:None,stop_requested=lambda:False,
+                    run=lambda *args,**kwargs:calls.append(args[3]) or [good_report()])
+                session=CalibrationRunner(workflow,CalibrationProfiles(root/'profiles'),environment,settings,
+                    root/'calibration-runs',initial_offset_ms=explicit).run('normal','current')
+                self.assertEqual(calls,[expected,expected])
+                self.assertEqual(session['initial_offset_source'],source)
+                self.assertEqual(session['initial_offset_ms'],expected)
+
+    def test_explicit_candidate_overrides_profile_without_changing_manual_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);profiles=CalibrationProfiles(root/'profiles')
+            profiles.save({'schema_version':1,'accepted':True,'environment':{},'difficulty':'normal',
+                'offset_ms':15,'validation_report':good_report(),'latency_offsets':{}})
+            calls=[];settings=PerformanceSettings(touch_offset_ms=-51)
+            workflow=SimpleNamespace(log=lambda _:None,stop_requested=lambda:False,
+                run=lambda *args,**kwargs:calls.append(args[3]) or [good_report()])
+            session=CalibrationRunner(workflow,profiles,{},settings,root/'sessions',initial_offset_ms=-23).run('normal','current')
+            self.assertEqual(calls,[-23,-23])
+            self.assertEqual(session['initial_offset_source'],'explicit')
+            self.assertEqual(profiles.load({},'normal')['offset_ms'],28)
+            self.assertEqual(settings.touch_offset_ms,-51)
 
     def test_speed_mismatch_prevents_using_profile_before_native_start(self):
         verify_profile_anchor({'anchor_rate':3},good_report())

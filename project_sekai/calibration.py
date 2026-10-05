@@ -61,12 +61,20 @@ class CalibrationProfiles:
         return path
 
 
-def adjusted_offset(current: int, result: dict) -> int:
+def timing_feedback(result: dict) -> dict:
     fast, late = result.get("fast"), result.get("late")
     if type(fast) is not int or type(late) is not int or min(fast, late) < 0:
         raise ValueError("排练结算 FAST/LATE 未完整读取，不能推算偏移")
     feedback, error = fast + late, late - fast
-    if feedback == 0 or (abs(error) <= max(2, round(feedback * .10)) and result.get("bad", 0) == 0):
+    tolerance = max(2, round(feedback * .10))
+    return {"fast": fast, "late": late, "count": feedback, "error": error,
+            "tolerance": tolerance, "balanced": abs(error) <= tolerance}
+
+
+def adjusted_offset(current: int, result: dict) -> int:
+    values = timing_feedback(result)
+    feedback, error = values["count"], values["error"]
+    if values["balanced"]:
         return current
     ratio = feedback / max(1, result["total"])
     step = 48 if ratio >= .6 else 24 if ratio >= .35 else 12 if ratio >= .02 else 3
@@ -75,17 +83,21 @@ def adjusted_offset(current: int, result: dict) -> int:
     return max(-250, min(250, current - delta))
 
 
-def validation_passed(report: dict) -> bool:
+def valid_calibration_evidence(report: dict) -> bool:
     result = report.get("judgements", {})
     playback = report.get("playback", {})
     return bool(report.get("completed") is True and report.get("live_status") == "cleared"
-                and result.get("total_matches_chart") is True and result.get("perfect_rate", 0) >= .95
-                and result.get("bad") == 0 and result.get("miss") == 0
-                and (report.get("requested_difficulty") != "master"
-                     or (type(result.get("great")) is int and result["great"] <= 10 and result.get("good") == 0))
+                and result.get("total_matches_chart") is True
                 and playback.get("release_confirmed") is True
                 and playback.get("planned_actions", 0) > 0
                 and playback.get("planned_actions") == playback.get("sent_actions") == playback.get("executed_actions"))
+
+
+def validation_passed(report: dict) -> bool:
+    try:
+        return valid_calibration_evidence(report) and timing_feedback(report.get("judgements", {}))["balanced"]
+    except ValueError:
+        return False
 
 
 def verify_profile_anchor(profile: dict, report: dict):
@@ -114,7 +126,7 @@ class CalibrationRunner:
         self.test_recovery_mode, self.test_recovery_count = test_recovery_mode, test_recovery_count
 
     def warm_candidate(self, difficulty: str):
-        # 未通过精度门槛的候选只能用于下一次排练，不能作为正常演奏配置启用。
+        # 未通过平衡门槛的候选只能用于下一次排练，不能作为正常演奏配置启用。
         best = None
         allowed_root = (self.session_root.parent / "solo-chart-runs").resolve()
         for path in sorted(self.session_root.glob("*/session.json"), reverse=True)[:12]:
@@ -122,24 +134,35 @@ class CalibrationRunner:
                 session = json.loads(path.read_text(encoding="utf-8-sig"))
                 if session.get("environment") != self.environment or session.get("difficulty") != difficulty:
                     continue
-                for item in session.get("rounds", []):
-                    report_path = Path(item["report"]).resolve()
-                    if not report_path.is_relative_to(allowed_root):
+                seed = session.get("warm_seed_offset_ms")
+                if "warm_seed_offset_ms" not in session and session.get("initial_offset_source") in {"manual", "explicit"}:
+                    seed = session.get("initial_offset_ms")
+                if type(seed) is not int:
+                    seed = None
+                for item in reversed(session.get("rounds", [])):
+                    try:
+                        report_path = Path(item["report"]).resolve()
+                        if not report_path.is_relative_to(allowed_root):
+                            continue
+                        report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+                        playback = report.get("playback", {})
+                        values = report.get("judgements", {})
+                        if not valid_calibration_evidence(report):
+                            continue
+                        feedback = timing_feedback(values)
+                        # 失败候选仅延续同一明确起点，不能用未知沿袭覆盖用户当前手动值。
+                        if not feedback["balanced"] and seed != self.settings.touch_offset_ms:
+                            continue
+                        # 先选已平衡候选，再比较偏斜比例和绝对差；相同证据保留较新会话。
+                        rank = (not feedback["balanced"], abs(feedback["error"]) / max(1, feedback["count"]),
+                                abs(feedback["error"]))
+                        offset = report.get("timing_offset_ms")
+                        if type(offset) is int and -250 <= offset <= 250 and (best is None or rank < best["rank"]):
+                            best = {"rank": rank, "feedback": feedback, "offset": offset, "latency": playback.get("latency_offsets", {}),
+                                    "session": path.parent.name, "seed_offset_ms": seed, "report": str(report_path)}
+                    except (OSError, ValueError, KeyError, TypeError):
+                        # 单轮缺失或损坏不应掩盖同一会话内其他完整证据。
                         continue
-                    report = json.loads(report_path.read_text(encoding="utf-8-sig"))
-                    playback = report.get("playback", {})
-                    values = report.get("judgements", {})
-                    if (report.get("completed") is not True or values.get("total_matches_chart") is not True
-                            or playback.get("release_confirmed") is not True
-                            or playback.get("planned_actions", 0) <= 0
-                            or playback.get("planned_actions") != playback.get("sent_actions")
-                            or playback.get("planned_actions") != playback.get("executed_actions")):
-                        continue
-                    score = values.get("perfect_rate", 0)
-                    offset = report.get("timing_offset_ms")
-                    if type(offset) is int and -250 <= offset <= 250 and (best is None or score > best["score"]):
-                        best = {"score": score, "offset": offset, "latency": playback.get("latency_offsets", {}),
-                                "session": path.parent.name}
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         return best
@@ -152,16 +175,27 @@ class CalibrationRunner:
                    "settings_snapshot": asdict(self.settings), "bonus_consumption": self.test_bonus_consumption}
         session["recovery_settings"] = {"mode": self.test_recovery_mode, "count": self.test_recovery_count}
         previous = self.profiles.load(self.environment, difficulty)
-        offset = previous["offset_ms"] + self.settings.touch_offset_ms if previous else 0
+        # 配置保存的是相对手动值的残差；新环境也必须沿用用户的实际手动起点。
+        offset = self.settings.touch_offset_ms + (previous["offset_ms"] if previous else 0)
+        source = "profile" if previous else "manual"
+        seed = None if previous else self.settings.touch_offset_ms
         latency = previous.get("latency_offsets", {}) if previous else {}
         if previous is None:
             warm = self.warm_candidate(difficulty)
             if warm is not None:
                 offset, latency = warm["offset"], warm["latency"]
+                source = "warm"
+                seed = warm["seed_offset_ms"]
                 session["warm_start"] = warm["session"]
+                session["warm_start_report"] = warm["report"]
         if self.initial_offset_ms is not None:
             offset = self.initial_offset_ms
             session["test_initial_offset_ms"] = offset
+            source = "explicit"
+            seed = offset
+        session["initial_offset_ms"] = offset
+        session["initial_offset_source"] = source
+        session["warm_seed_offset_ms"] = seed
         pending_profile = None
         try:
             _write_json(directory / "session.json", session)
@@ -183,16 +217,18 @@ class CalibrationRunner:
                 if index == 1:
                     offset = adjusted_offset(offset, report["judgements"])
                     session["suggested_offset_ms"] = offset
+                    session["rehearsal_feedback"] = timing_feedback(report["judgements"])
                     _write_json(directory / "session.json", session)
                 else:
                     if not validation_passed(report):
                         session["status"] = "rejected"
-                        raise RuntimeError("Native 正式验证未通过：要求完整执行、零 BAD/MISS、PERFECT 至少 95%；MASTER 另要求 GREAT 不超过 10、GOOD 为零；本次候选未启用")
+                        raise RuntimeError("Native 正式验证未通过：要求 LIVE CLEAR、音数匹配、完整执行和释放及完整 FAST/LATE 平衡；本次候选未启用")
                     profile = {"schema_version": 1, "accepted": True, "environment": self.environment,
                                "difficulty": difficulty, "created_at": datetime.now().astimezone().isoformat(),
                                "offset_ms": offset - self.settings.touch_offset_ms, "latency_offsets": latency,
                                "anchor_rate": report["start_anchor"]["trajectory_rate"],
                                "validation": report["judgements"], "validation_report": report,
+                               "validation_feedback": timing_feedback(report["judgements"]),
                                "calibration_session": directory.name}
                     pending_profile = profile
                     session["status"] = "validated"
@@ -228,7 +264,8 @@ class CalibrationRunner:
                 else:
                     session["profile"] = self.profiles.save(pending_profile).name
                     session["status"] = "accepted"
-                    self.workflow.log(f"Native 校准已通过并保存：实际偏移 {offset} ms；PERFECT {pending_profile['validation']['perfect_rate']:.2%}")
+                    feedback = pending_profile["validation_feedback"]
+                    self.workflow.log(f"Native 校准已通过并保存：实际偏移 {offset} ms；FAST {feedback['fast']} / LATE {feedback['late']}，允许差值 {feedback['tolerance']}")
             session["finished_at"] = datetime.now().astimezone().isoformat()
             _write_json(directory / "session.json", session)
             if restoration_error is not None and not self.workflow.stop_requested():

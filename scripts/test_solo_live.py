@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--mfa-root", type=Path, default=ROOT / ".local/mfa-generic")
     parser.add_argument("--difficulty", choices=["easy", "normal", "hard", "expert", "master", "append"], default="easy")
     parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--song-mode", choices=["current", "random"], default="current")
     parser.add_argument("--offset-ms", type=int, help="手动实际偏移；校准时作为本次排练的起始候选")
     parser.add_argument("--engine", choices=["legacy", "native"], default="legacy")
     parser.add_argument("--calibrate", action="store_true")
@@ -92,7 +93,10 @@ def main():
     os.environ["MAAPJSK_TEMPLATE_CONFIG"] = str(runtime / "config/maapjsk-templates.json")
     import subprocess
     client = AgentClient()
-    client.set_timeout(1800000 if arguments.calibrate else 900000)
+    # 连续多曲位于同一次 Agent 调用中；固定十五分钟会截断尚未完成的长批次。
+    timeout_ms = 1800000 if arguments.calibrate else max(900000, arguments.count * 600000)
+    if not client.set_timeout(timeout_ms):
+        raise RuntimeError("无法设置单人验收 Agent 超时，尚未开始演出")
     if not client.bind(resource):
         raise RuntimeError("Agent 资源绑定失败")
     from dataclasses import asdict
@@ -118,6 +122,7 @@ def main():
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     overrides = {
         "SoloChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": arguments.difficulty}},
+        "SoloChartLiveSongConfig": {"custom_action_param": {"song_mode": arguments.song_mode}},
         "SoloChartLiveCountConfig": {"custom_action_param": {"count": arguments.count}},
         "SoloChartLiveRecoveryModeConfig": {"custom_action_param": {"recovery_mode": arguments.recovery_mode}},
         "SoloChartLiveRecoveryCountConfig": {"custom_action_param": {"recovery_count": arguments.recovery_count}},
@@ -130,7 +135,8 @@ def main():
         result = tasker.post_task("SoloChartCalibration" if arguments.calibrate else "SoloChartLive", overrides).wait()
         if not result.succeeded:
             raise RuntimeError("单人谱面验收任务未完成，查看 debug/solo-chart-runs 本局报告")
-    except KeyboardInterrupt:
+    except BaseException:
+        # 超时、连接异常和用户停止都先通知任务清理触点，再断开 Agent。
         tasker.post_stop().wait()
         raise
     finally:

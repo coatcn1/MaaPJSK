@@ -61,18 +61,34 @@ public:
         started_ = true;
     }
 
+    void set_future_phase_correction(double value_ms) {
+        if (!started_ || !std::isfinite(value_ms) || std::abs(value_ms) > 60.0
+            || std::abs(value_ms - phase_ms_) > 5.0 + 1e-9)
+            throw std::invalid_argument("游戏相位反馈无效或超过单步限幅");
+        // 不改冻结起点、游标和已发布队列；游戏反馈仅影响下一窗口的目标时刻。
+        phase_ms_ = value_ms;
+        phase_activated_ = phase_activated_ || value_ms != 0.0;
+    }
+
     py::object next(double now) {
         if (!started_ || !std::isfinite(now)) throw std::runtime_error("Native 尚未锁定开场");
         if (position_ == events_.size() || tail_ - now > .200) return py::none();
         if (chunks_ && now - tail_ > .180) throw std::runtime_error("Native 队列断粮超过 180 ms");
         if (chunks_ && now > tail_ + .030) ++underflows_;
         const double start = tail_;
-        const double end = std::min(std::max(start, now) + .500, epoch_ + events_.back().time);
+        const double end = std::min(std::max(start, now) + .500,
+            std::max(start, epoch_ + events_.back().time + phase_ms_ / 1000.0));
         py::list actions;
-        while (position_ < events_.size() && epoch_ + events_[position_].time <= end + 1e-9) {
+        while (position_ < events_.size()
+            && std::max(start, epoch_ + events_[position_].time + phase_ms_ / 1000.0) <= end + 1e-9) {
             const auto& event = events_[position_++];
             py::dict row;
-            row["time"] = epoch_ + event.time; row["kind"] = event.kind;
+            const double planned = epoch_ + event.time;
+            // 负修正不能穿过已发布窗口尾部；同时间和弦仍保持同一目标和原顺序。
+            row["time"] = !phase_activated_ ? planned : std::max(start, planned + phase_ms_ / 1000.0);
+            row["planned_time"] = planned;
+            row["game_phase_correction_ms"] = (row["time"].cast<double>() - planned) * 1000.0;
+            row["kind"] = event.kind;
             row["contact"] = event.contact; row["x"] = event.x; row["y"] = event.y;
             row["index"] = event.index;
             actions.append(row);
@@ -82,6 +98,7 @@ public:
         py::dict result;
         result["sequence"] = chunks_; result["start"] = start; result["end"] = end;
         result["events"] = actions; result["final"] = position_ == events_.size();
+        result["game_phase_correction_ms"] = phase_ms_;
         return result;
     }
 
@@ -91,8 +108,8 @@ public:
 private:
     std::vector<Event> events_;
     std::size_t position_ = 0;
-    double epoch_ = 0, tail_ = 0;
-    bool started_ = false;
+    double epoch_ = 0, tail_ = 0, phase_ms_ = 0;
+    bool started_ = false, phase_activated_ = false;
     int chunks_ = 0, underflows_ = 0;
 };
 
@@ -168,6 +185,8 @@ public:
             } else throw std::invalid_argument("窗口触点生命周期无效");
             py::dict receipt;
             receipt["line"] = lines.size(); receipt["time"] = when; receipt["index"] = event["index"];
+            receipt["planned_time"] = event.contains("planned_time") ? event["planned_time"] : event["time"];
+            receipt["game_phase_correction_ms"] = (when - receipt["planned_time"].cast<double>()) * 1000.0;
             receipts.append(receipt);
             command += " " + std::to_string(contact);
             if (kind != "up") command += " " + std::to_string(mapped_x) + " " + std::to_string(mapped_y) + " 50";
@@ -189,9 +208,10 @@ private:
 }
 
 PYBIND11_MODULE(maapjsk_native, module) {
-    module.def("version", []() { return "1.1.0"; });
+    module.def("version", []() { return "1.2.0"; });
     py::class_<Timeline>(module, "Timeline").def(py::init<py::list>())
         .def("start", &Timeline::start).def("next", &Timeline::next)
+        .def("set_future_phase_correction", &Timeline::set_future_phase_correction)
         .def_property_readonly("sent", &Timeline::sent).def_property_readonly("underflows", &Timeline::underflows);
     py::class_<TouchLatencyOffsets>(module, "TouchLatencyOffsets")
         .def(py::init<>()).def_readwrite("down_ms", &TouchLatencyOffsets::down_ms)

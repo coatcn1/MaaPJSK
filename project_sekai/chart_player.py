@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from bisect import bisect_left
 import math
 import time
 from typing import Callable
@@ -10,8 +11,9 @@ import numpy as np
 
 from .sus_chart import Chart, Gesture, slide_x
 
-TOUCH_PLAN_VERSION = 3
-START_ANCHOR_VERSION = 3
+TOUCH_PLAN_VERSION = 4
+SLIDE_NODE_TOUCH_PLAN_VERSION = 5
+START_ANCHOR_VERSION = 7
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -54,7 +56,7 @@ class Touch:
     y: int = 570
 
 
-def compile_touches(chart: Chart) -> tuple[Touch, ...]:
+def compile_touches(chart: Chart, *, sample_slide_nodes: bool = False) -> tuple[Touch, ...]:
     events: list[Touch] = []
     free_after = [-math.inf] * 10
     for chain in sorted(touch_chains(chart), key=lambda values: (values[0].start - (.018 if values[0].flick and values[0].kind != "slide" else 0))):
@@ -72,9 +74,22 @@ def compile_touches(chart: Chart) -> tuple[Touch, ...]:
         events.append(Touch(start, 2, contact, "down", round(gesture.points[0].x)))
         if gesture.kind == "slide":
             count = max(1, math.ceil((gesture.end - gesture.start) / .020))
+            sampled_times = []
             for index in range(1, count + 1):
                 when = gesture.start + (gesture.end - gesture.start) * index / count
+                sampled_times.append(when)
                 events.append(Touch(when, 1, contact, "move", round(slide_x(gesture.points, when))))
+            if sample_slide_nodes:
+                # 离线候选只补真实内部路径节点；保留原网格和边界、控制点及 flick 语义。
+                for point in gesture.points:
+                    if not (gesture.start < point.time < gesture.end and point.path_node and point.kind != 4):
+                        continue
+                    position = bisect_left(sampled_times, point.time)
+                    neighbors = sampled_times[max(0, position - 1):position + 1]
+                    if any(abs(when - point.time) <= 1e-9 for when in neighbors):
+                        continue
+                    sampled_times.insert(position, point.time)
+                    events.append(Touch(point.time, 1, contact, "move", round(slide_x(gesture.points, point.time))))
         for trace in chain[1:]:
             events.append(Touch(trace.start - .020, 1, contact, "move", round(trace.points[0].x)))
         if last.flick:
@@ -116,11 +131,11 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     if gesture.critical or gesture.points[0].kind in {2, 6}:
         mask = cv2.inRange(hsv, (15, 55, 135), (45, 255, 255))
+    elif gesture.kind in {"trace", "slide"}:
+        # 长条尾部的 flick 不改变绿色起点；只用亮色横条，避免与较暗的底带连通。
+        mask = cv2.inRange(hsv, (50, 55, 205), (95, 255, 255))
     elif gesture.flick:
         mask = cv2.inRange(hsv, (140, 65, 135), (179, 255, 255))
-    elif gesture.kind in {"trace", "slide"}:
-        # 轨迹底带较暗；只用亮色横条，避免与底带连通而丢失首音。
-        mask = cv2.inRange(hsv, (50, 55, 205), (95, 255, 255))
     else:
         mask = cv2.inRange(hsv, (95, 55, 135), (135, 255, 255))
     if baseline is not None:
@@ -135,6 +150,10 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
     mask[:40] = 0
     mask[540:] = 0
     point = gesture.points[0]
+    # 金色首音的外框比普通音符更厚；按颜色保留透视高度，避免误取后方同色音符。
+    height_ratio = .16 if gesture.critical or point.kind in {2, 6} else .12
+    # Trace 的三角箭头外框比普通横条更高，低流速小音符尤其明显；保留已有位置与宽度门槛。
+    aspect_ratio = 1.4 if gesture.kind == "trace" else 2.0
     candidates = []
     for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
         x, y, width, height = cv2.boundingRect(contour)
@@ -142,7 +161,7 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         projected_x = 640 + (point.x - 640) * center_y / 570
         expected_width = point.width * (1000 / 12) * center_y / 570
         # 音符随透视靠近判定线会变厚；固定高度上限会过滤首音并误取后面的音符。
-        if (width > 14 and 2 <= height <= max(36, center_y * .12) and width > height * 2
+        if (width > 14 and 2 <= height <= max(36, center_y * height_ratio) and width > height * aspect_ratio
                 and abs(x + width / 2 - projected_x) < max(25, expected_width * .35)
                 and expected_width * .5 < width < expected_width * 1.5 + 12):
             candidates.append(center_y)
@@ -156,13 +175,18 @@ class StartAnchor:
         self.samples: list[tuple[float, float]] = []
         self.baseline: np.ndarray | None = None
         self.fit: dict | None = None
+        self.failure_reason: str | None = None
 
     def observe(self, frame: np.ndarray, captured_at: float, *, capture_seconds: float = 0.0) -> float | None:
         if self.baseline is None:
             self.baseline = frame.copy()
             return None
         if self.samples and captured_at - self.samples[0][0] > 2:
-            raise RuntimeError("第一音通过后仍未建立锚点，拒绝从歌曲中途开始")
+            if len(self.samples) == 1:
+                self.failure_reason = "candidate_motion_unconfirmed"
+                raise RuntimeError("首音候选未确认运动且等待超时，拒绝从歌曲中途开始")
+            self.failure_reason = "trajectory_gate_timeout"
+            raise RuntimeError("首音轨迹未通过同步门槛且等待超时，拒绝从歌曲中途开始")
         y = first_note_y(frame, self.gesture, self.baseline)
         if y is None:
             return None
@@ -182,6 +206,15 @@ class StartAnchor:
                 return None
         self.samples.append((captured_at, y))
         recent = self.samples[-5:]
+        fit_window = "recent"
+        # 快截图的五帧可能仅覆盖约 125 ms，局部斜率噪声会放大成整曲相位误差。
+        # 已有足够轨迹时直接利用最近 1.25 秒、最多 32 点；不为凑宽窗口等待新帧。
+        # 慢链路仍沿用原五帧与低样本门禁，宽窗口不合格时也不能退回噪声短窗口。
+        if len(self.samples) >= 8 and recent[-1][0] - recent[0][0] < .250:
+            wider = [sample for sample in self.samples[-32:] if captured_at - sample[0] <= 1.25]
+            if len(wider) >= 8 and wider[-1][0] - wider[0][0] >= .250:
+                recent = wider
+                fit_window = "wide_trajectory"
         if len(recent) < 2 or recent[-1][1] - recent[0][1] < 25:
             return None
         short_window = len(recent) < self.minimum_samples
@@ -225,6 +258,14 @@ class StartAnchor:
         if not candidates:
             return None
         residual, name, first_hit = min(candidates)
+        selection = "minimum_residual"
+        perspective = next((candidate for candidate in candidates if candidate[1] == "perspective"), None)
+        # 顶端短轨迹中不足一像素的残差差异无法区分模型；优先保留实机验证的透视几何，
+        # 避免指数模型因微小观测噪声外推出提前几十毫秒的起点。质量与启动余量门槛保持不变。
+        if perspective is not None and perspective[0] <= residual + 1.0:
+            if name != "perspective":
+                selection = "perspective_pixel_tie"
+            residual, name, first_hit = perspective
         if short_window:
             cadence = float(np.median(np.diff([when for when, _ in recent])))
             remaining = first_hit - captured_at
@@ -233,7 +274,10 @@ class StartAnchor:
                     or remaining > capture_seconds + cadence + .080):
                 return None
         self.fit = {"model": name, "residual_pixels": residual, "first_hit": first_hit,
-                    "sample_count": len(recent), "short_window": short_window}
+                    "sample_count": len(recent), "short_window": short_window, "selection": selection,
+                    "fit_window": fit_window, "window_seconds": recent[-1][0] - recent[0][0],
+                    "candidates": [{"model": model, "residual_pixels": error, "first_hit": hit}
+                                   for error, model, hit in candidates]}
         return first_hit - self.gesture.start
 
 

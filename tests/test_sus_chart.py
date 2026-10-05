@@ -48,6 +48,31 @@ class SusTests(unittest.TestCase):
         self.assertEqual(slide_x(points, 1), points[-1].x)
         self.assertGreater(slide_x(points, .4), points[0].x + 200)
 
+    def test_visible_slide_checkpoint_uses_path_instead_of_placeholder_lane(self):
+        points = (Point(0, 2, 3), Point(.5, 2, 3, 3, path_node=False), Point(1, 11, 3, 2))
+        self.assertAlmostEqual(slide_x(points, .5), 640, places=3)
+        self.assertAlmostEqual(slide_x(points, .25), 452.5, places=3)
+
+    def test_visible_slide_checkpoint_does_not_split_hidden_node_easing(self):
+        points = (Point(0, 5, 3, 1, 5), Point(.336, 5, 3, 3, path_node=False),
+                  Point(.420, 2, 3, 5, 2), Point(.504, 5, 3, 3, path_node=False), Point(1.345, 5, 3, 2))
+        self.assertAlmostEqual(slide_x(points, .336), 275, places=3)
+        self.assertAlmostEqual(slide_x(points, .504), 267.0616, places=3)
+
+    def test_sus_visible_relay_requires_attachment_to_be_judgement_only(self):
+        rows = '#000320:13003300\n#0013b0:23'
+        path_relay = parse_sus(HEADER + rows).first
+        self.assertTrue(path_relay.points[1].path_node)
+        attached = parse_sus(HEADER + rows + '\n#00012:00001300').first
+        self.assertFalse(attached.points[1].path_node)
+        self.assertAlmostEqual(slide_x(attached.points, 1), 640, places=3)
+
+    def test_sus_directed_relay_remains_path_node_even_with_short_note(self):
+        rows = '#000320:13003300\n#0013b0:23\n#00012:00001300\n#00052:00005300'
+        directed = parse_sus(HEADER + rows).first
+        self.assertTrue(directed.points[1].path_node)
+        self.assertAlmostEqual(slide_x(directed.points, 1), directed.points[1].x, places=3)
+
     def test_twelve_lane_geometry_and_note_width(self):
         self.assertAlmostEqual(Point(0, 2, 1).x, 181.6666667)
         self.assertAlmostEqual(Point(0, 13, 1).x, 1098.3333333)
@@ -66,6 +91,47 @@ class SusTests(unittest.TestCase):
         chart = Chart(tuple(Gesture((Point(0, 2, 1),), 'tap') for _ in range(11)), 480, ((0, 120),))
         with self.assertRaises(ValueError):
             compile_touches(chart)
+
+    def test_slide_node_candidate_preserves_baseline_and_samples_fast_changes(self):
+        def chain(high,low):
+            return Gesture(tuple(Point(t,l,3,k,d) for t,l,k,d in [
+                (101.2,high,1,0),(101.4,high,3,0),(101.4+1/1200,low,5,0),
+                (101.6,low,3,0),(101.6+1/1200,high,5,0),(101.8,high,3,0),
+                (101.8+1/1200,low,5,0),(102.,low,2,4)]),'slide',4)
+        chart=Chart((chain(11,8),chain(5,2)),480,((0.,150.),))
+        baseline=compile_touches(chart)
+        self.assertEqual(baseline,compile_touches(chart,sample_slide_nodes=False))
+        candidate=compile_touches(chart,sample_slide_nodes=True)
+        extra=[event for event in candidate if event not in baseline]
+        self.assertEqual(len(extra),6)
+        self.assertTrue(all(event in candidate for event in baseline))
+        self.assertEqual([event for event in baseline if event.kind!='move' or event.y!=570],
+                         [event for event in candidate if event.kind!='move' or event.y!=570])
+        validate_touches(candidate)
+        self.assertEqual(len({event.contact for event in candidate if event.kind=='down'}),2)
+        for gesture in chart.gestures:
+            contact=next(event.contact for event in candidate if event.kind=='down' and event.x==round(gesture.points[0].x))
+            for point in gesture.points[1:-1]:
+                self.assertTrue(any(event.contact==contact and abs(event.time-point.time)<=1e-9
+                    and event.x==round(slide_x(gesture.points,point.time)) for event in candidate))
+
+    def test_slide_node_candidate_excludes_control_and_placeholder_and_deduplicates_grid(self):
+        fixtures=[
+            (Point(0,2,2),Point(.203,12,4,4),Point(1,2,3,2)),
+            (Point(0,5,3,1,5),Point(.336,5,3,3,path_node=False),Point(.420,2,2,5,2),
+             Point(.504,5,3,3,path_node=False),Point(1.345,5,3,2)),
+            (Point(0,2,3),Point(.4+5e-10,5,3,5),Point(1,8,3,2))]
+        for points in fixtures:
+            with self.subTest(points=points):
+                chart=Chart((Gesture(points,'slide'),),480,((0.,150.),))
+                baseline=compile_touches(chart);candidate=compile_touches(chart,sample_slide_nodes=True)
+                self.assertTrue(all(event in candidate for event in baseline))
+                extra=[event for event in candidate if event not in baseline]
+                self.assertFalse(any(event.time==point.time for event in extra for point in points
+                    if not point.path_node or point.kind==4))
+                self.assertTrue(all(event.x==round(slide_x(points,event.time)) for event in candidate if event.kind=='move'))
+                if points is fixtures[-1]:self.assertEqual(extra,[])
+                validate_touches(candidate)
 
 
 class Clock:
@@ -116,6 +182,19 @@ class PlayerTests(unittest.TestCase):
             self.assertIsNone(anchor.observe(frame,when))
         self.assertEqual(anchor.samples,[])
 
+    def test_first_trace_arrow_keeps_taller_outline_at_low_scroll_speed(self):
+        gesture = Gesture((Point(0,7,1,5),),'trace')
+        baseline = np.zeros((720,1280,3),np.uint8)
+        frame = baseline.copy()
+        center = round(640+(gesture.points[0].x-640)*196/570)
+        # 低流速下先出现较小的完整箭头；外框包含三角顶，不能套用普通横条的长宽比。
+        points = np.array([(center-14,196),(center-14,204),(center+14,204),(center+14,196),
+                           (center+5,196),(center,186),(center-5,196)],np.int32)
+        cv2.fillPoly(frame,[points],(0,255,0))
+        next_center = round(640+(gesture.points[0].x-640)*110/570)
+        cv2.rectangle(frame,(next_center-8,107),(next_center+8,113),(0,255,0),-1)
+        self.assertGreater(first_note_y(frame,gesture,baseline),190)
+
     def test_start_anchor_uses_perspective_motion_before_judgement(self):
         gesture = Gesture((Point(0,9,4,5),),'trace')
         anchor = StartAnchor(gesture)
@@ -156,6 +235,33 @@ class PlayerTests(unittest.TestCase):
         self.assertNotEqual(anchor.fit['model'],'calibrated_perspective')
         self.assertLess(anchor.fit['residual_pixels'],4)
 
+    def test_native_anchor_keeps_perspective_when_early_models_differ_below_one_pixel(self):
+        anchor = StartAnchor(Gesture((Point(0,10,4),),'tap'), minimum_samples=4)
+        frame = np.zeros((720,1280,3),np.uint8)
+        # 实际失败局在顶端五帧中两模型只差 0.29 像素，指数外推却早了约 47 毫秒。
+        times = [10,10.0951079,10.1868247,10.2983601,10.3898068]
+        with patch('project_sekai.chart_player.first_note_y',side_effect=[87.5,114,140.5,185,233.5]):
+            anchor.observe(frame,9)
+            for when in times[:-1]:
+                self.assertIsNone(anchor.observe(frame,when,capture_seconds=.085))
+            epoch = anchor.observe(frame,times[-1],capture_seconds=.085)
+        self.assertIsNotNone(epoch)
+        self.assertEqual(anchor.fit['model'],'perspective')
+        self.assertLess(anchor.fit['residual_pixels'],4)
+        self.assertAlmostEqual(epoch,10.795068,places=5)
+        self.assertEqual(anchor.fit['selection'],'perspective_pixel_tie')
+
+    def test_anchor_does_not_prefer_perspective_when_its_fit_is_distinctly_worse(self):
+        anchor = StartAnchor(Gesture((Point(0,10,4),),'tap'), minimum_samples=4)
+        frame = np.zeros((720,1280,3),np.uint8)
+        with patch('project_sekai.chart_player.first_note_y',side_effect=[80,120,180,270]):
+            anchor.observe(frame,9)
+            for when in [10,10.2,10.4]:
+                self.assertIsNone(anchor.observe(frame,when,capture_seconds=.05))
+            self.assertIsNotNone(anchor.observe(frame,10.6,capture_seconds=.05))
+        self.assertEqual(anchor.fit['model'],'exponential')
+        self.assertEqual(anchor.fit['selection'],'minimum_residual')
+
     def test_large_first_note_near_judgement_is_not_replaced_by_its_successor(self):
         gesture = Gesture((Point(0,8,3),),'tap')
         baseline = np.zeros((720,1280,3),np.uint8)
@@ -163,6 +269,22 @@ class PlayerTests(unittest.TestCase):
         cv2.rectangle(frame,(641,438),(840,485),(255,130,65),-1)
         cv2.rectangle(frame,(641,253),(754,272),(255,130,65),-1)
         self.assertAlmostEqual(first_note_y(frame,gesture,baseline),462,delta=1)
+
+    def test_critical_first_note_keeps_its_taller_gold_rim_before_the_successor(self):
+        gesture = Gesture((Point(1,11,3,2),),'tap',critical=True)
+        baseline = np.zeros((720,1280,3),np.uint8)
+        frame = baseline.copy()
+        cv2.rectangle(frame,(776,281),(928,320),(30,210,255),-1)
+        cv2.rectangle(frame,(692,83),(745,98),(30,210,255),-1)
+        self.assertAlmostEqual(first_note_y(frame,gesture,baseline),301,delta=1)
+
+    def test_slide_ending_in_flick_still_anchors_on_its_green_head(self):
+        gesture = Gesture((Point(2.5,2,6,1), Point(3.5,2,3,2)), 'slide', flick=1)
+        baseline = np.zeros((720,1280,3),np.uint8)
+        frame = baseline.copy()
+        cv2.rectangle(frame,(476,192),(613,211),(80,255,30),-1)
+        cv2.rectangle(frame,(579,70),(637,81),(130,45,255),-1)
+        self.assertAlmostEqual(first_note_y(frame,gesture,baseline),202,delta=1)
 
     def test_native_short_window_accepts_three_consistent_samples_before_first_note(self):
         anchor = StartAnchor(Gesture((Point(0,8,3),),'tap'),minimum_samples=4)

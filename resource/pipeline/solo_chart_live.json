@@ -130,7 +130,7 @@
     "custom_action_param": {},
     "focus": {
       "Node.Action.Starting": {
-        "content": "Native 校准开始：0 体力，排练 + 正式验证",
+        "content": "Native 校准开始：按演奏设置的体力数量，排练 + 正式验证",
         "display": [
           "log"
         ]

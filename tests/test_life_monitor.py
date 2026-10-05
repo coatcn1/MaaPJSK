@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 
-from project_sekai.life_monitor import LifeDepleted, LifeGuard
+from project_sekai.life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from project_sekai.solo_live import SoloLive
 
 
@@ -32,6 +32,26 @@ class LifeTests(unittest.TestCase):
         self.assertFalse(guard.observe(frame, lambda _: False))
         self.assertFalse(guard.observe(frame, lambda _: True))
         self.assertTrue(guard.observe(frame, lambda _: True))
+
+    def test_cooperative_bar_fill_uses_the_lower_strip_and_avoids_numeric_ocr(self):
+        frame = np.zeros((720,1280,3),np.uint8)
+        frame[48:56,1008:1177] = (125,255,120)
+        guard = LifeGuard(bar_area=(1008,48,1177,56))
+        reader = Mock(return_value=True)
+        for _ in range(2):
+            self.assertFalse(guard.observe(frame,reader))
+        reader.assert_not_called()
+
+    def test_zero_template_rejects_nonzero_values_with_a_trailing_zero(self):
+        def value_image(text):
+            image = np.zeros((29,97,3),np.uint8)
+            (width,_),_ = cv2.getTextSize(text,cv2.FONT_HERSHEY_SIMPLEX,.7,2)
+            cv2.putText(image,text,(95-width,23),cv2.FONT_HERSHEY_SIMPLEX,.7,(255,255,255),2)
+            return image
+        template = ZeroLifeTemplate(value_image('0'))
+        for text in ('10','100','1000',''):
+            self.assertLess(template.score(value_image(text),(0,0,97,29)),.90,text)
+        self.assertGreater(template.score(value_image('0'),(0,0,97,29)),.99)
 
     def test_pause_quit_confirmation_and_home_are_ordered(self):
         frames = [np.full((720,1280,3), value, dtype=np.uint8) for value in range(4)]

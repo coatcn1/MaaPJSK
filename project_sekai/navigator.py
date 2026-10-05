@@ -18,13 +18,15 @@ class AutoEnableRejected(RuntimeError):
 class Navigator:
     def __init__(self, device: AdbDevice, config_path: str | Path, *, dry_run: bool = False,
                  stop_requested: Callable[[], bool] | None = None,
-                 log_message: Callable[[str], None] | None = None) -> None:
+                 log_message: Callable[[str], None] | None = None,
+                 bonus_reader: Callable[[np.ndarray], tuple[int, object]] | None = None) -> None:
         self.device = device
         self.config_path = Path(config_path).resolve()
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.dry_run = dry_run
         self.stop_requested = stop_requested or (lambda: False)
         self.log_message = log_message or (lambda message: print(message, flush=True))
+        self.bonus_reader = bonus_reader
         self.completed_rounds = 0
         self.templates: dict[str, np.ndarray] = {}
         for name, relative_path in self.config["templates"].items():
@@ -279,22 +281,39 @@ class Navigator:
 
     def _wait_for_bonus_change(self, before: np.ndarray) -> np.ndarray:
         # OK 弹窗先关闭，服务器回复和顶部体力可能稍后更新；等待结果而不再次用药。
+        reader = getattr(self, "bonus_reader", None)
+        before_value = reader(before)[0] if reader is not None else None
+        previous_value = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             self._check_stop()
             after = self.device.screenshot()
             if self.match(after, "prepare")[0] >= self.threshold:
-                try:
-                    self._verify_bonus_changed(before, after)
-                except RuntimeError:
-                    pass
+                if reader is not None:
+                    # 小药只增加一格，数字笔画的变化可能低于整块像素均值；背景变化也不代表到账。
+                    try:
+                        value = reader(after)[0]
+                    except ValueError:
+                        previous_value = None
+                    else:
+                        if value > before_value and value == previous_value:
+                            return after
+                        previous_value = value if value > before_value else None
                 else:
-                    return after
+                    try:
+                        self._verify_bonus_changed(before, after)
+                    except RuntimeError:
+                        pass
+                    else:
+                        return after
+            else:
+                previous_value = None
             time.sleep(0.3)
         self._save_failure(after, "recovery_bonus_update")
         raise RuntimeError("确认 OK 后等待 10 秒，体力显示仍没有变化")
 
-    def _recover_and_verify(self, before: np.ndarray, mode: str, count: int = 1) -> np.ndarray:
+    def _recover_and_verify(self, before: np.ndarray, mode: str, count: int = 1, *,
+                            on_recovered: Callable[[int, np.ndarray], None] | None = None) -> np.ndarray:
         if mode == "off":
             raise RuntimeError("游戏请求恢复体力；自动回复体力已关闭")
         label = "小饮料" if mode == "small" else "大饮料"
@@ -302,10 +321,19 @@ class Navigator:
         # 每瓶独立执行加号、决定和 OK，再核对体力变化，按设置次数完成本次回复。
         for index in range(count):
             self._check_stop()
+            reader = getattr(self, "bonus_reader", None)
+            if reader is not None:
+                try:
+                    reader(before)
+                except ValueError as error:
+                    raise RuntimeError("用药前实际体力未确认，停止追加饮料") from error
             if index:
                 self.tap(1086, 42, "继续打开体力回复")
             self.recover_bonus_from_dialog(mode)
             after = self._wait_for_bonus_change(before)
+            # 到账进度先保存，关闭完成提示失败时也不能遗失已用瓶数或重做本批。
+            if on_recovered is not None:
+                on_recovered(index + 1, after)
             after = self._dismiss_bonus_notice("关闭体力回复完成提示")
             self.log_message(f"体力回复成功：{label} {index + 1}/{count} 瓶")
             before = after

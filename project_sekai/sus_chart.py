@@ -14,6 +14,7 @@ class Point:
     width: int
     kind: int = 1
     direction: int = 0
+    path_node: bool = True
 
     @property
     def x(self) -> float:
@@ -159,7 +160,10 @@ def parse_sus(text: str) -> Chart:
         active: list[Point] = []
         active_critical = False
         for position, lane, width, kind in sorted(nodes, key=lambda item: (item[0], 0 if item[3] == 2 else 1)):
-            point = Point(seconds(position), lane, width, kind, directions.get((position, lane), 0))
+            direction = directions.get((position, lane), 0)
+            # 有短音符但没有方向的可见点只作判定；带缓动方向或没有短音符的点仍定义路径。
+            path_node = kind != 3 or bool(direction) or (position, lane) not in shorts
+            point = Point(seconds(position), lane, width, kind, direction, path_node)
             consumed.add((position, lane))
             if kind == 1:
                 if active:
@@ -192,6 +196,8 @@ def parse_sus(text: str) -> Chart:
 
 def slide_x(points: tuple[Point, ...], when: float) -> float:
     """使用节点的时间坐标反解 Bézier 参数，避免把控制点当作直线节点。"""
+    # 判定点的坐标是占位值；保留实际路径节点及其缓动，不用判定点切断曲线。
+    points = tuple(point for point in points if point.path_node)
     if when <= points[0].time:
         return points[0].x
     if when >= points[-1].time:

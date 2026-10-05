@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import csv
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -16,8 +17,10 @@ from .chart_catalog import ChartRepository, _write_json
 from .chart_player import ChartPlayer, StartAnchor, compile_touches
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard
+from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition
 from .navigator import Navigator
 from .ocr import LineOcr, Reading
+from .performance_trace import PerformanceTrace
 from .song_identity import SongMatcher, normalize_title, write_image
 from .sus_chart import parse_sus
 
@@ -83,7 +86,8 @@ class SoloLive:
     def __init__(self, device, template_config: Path, chart_root: Path, model_root: Path, report_root: Path,
                  *, stop_requested=lambda: False, log_message=print) -> None:
         self.device, self.stop_requested, self.log = device, stop_requested, log_message
-        self.navigator = Navigator(device, template_config, stop_requested=stop_requested, log_message=log_message)
+        self.navigator = Navigator(device, template_config, stop_requested=stop_requested, log_message=log_message,
+                                   bonus_reader=self.read_available_bonus)
         self.repository = ChartRepository(chart_root)
         self.ocr = LineOcr(model_root)
         self.matcher = SongMatcher(self.repository, self.ocr)
@@ -297,12 +301,19 @@ class SoloLive:
         report["bonus"]["availability"] = "insufficient"
         if mode == "off":
             raise RuntimeError(f"当前体力 {available}，每局需要 {consumption}；自动用药已关闭，请补充体力或修改任务设置")
-        report["recovery"] = {"mode": mode, "requested_bottles": count, "available_before": available,
+        report["recovery"] = {"mode": mode, "requested_bottles": count, "completed_bottles": 0, "available_before": available,
                               "status": "started"}
         _write_json(directory / "report.json", report)
         self.log(f"体力不足：当前 {available} / 每局需要 {consumption}，按用户设置自动回复")
         self.navigator.tap(1086, 42, "打开体力回复")
-        self.navigator._recover_and_verify(before, mode, count)
+        def record_bottle(completed, frame):
+            value, reading = self.read_available_bonus(frame)
+            # 每瓶实际到账后落盘，后续确认失败也保留已用数量，不能把一批重新执行。
+            report["recovery"].update(completed_bottles=completed, available_after=value,
+                                      last_bottle_reading=asdict(reading))
+            _write_json(directory / "report.json", report)
+
+        self.navigator._recover_and_verify(before, mode, count, on_recovered=record_bottle)
         frame, after, readings = self.wait_available_bonus()
         write_image(directory / "recovery-after.png", frame)
         report["recovery"].update(available_after=after, completed_bottles=count, readings=readings, status="confirmed")
@@ -314,23 +325,67 @@ class SoloLive:
         self.navigator.ensure_auto(False)
         self.log(f"体力回复已确认：当前 {after}，继续按每局 {consumption} 体力开演")
 
-    def start(self, chart, identity, report: dict, directory: Path) -> float:
+    def record_identity_check(self, report, stage, *, captured_at=None, error=None):
+        evidence = getattr(getattr(self, "matcher", None), "last_evidence", None)
+        if not isinstance(evidence, dict):
+            return
+        check = dict(evidence, captured_at=captured_at, error=error)
+        checks = report.setdefault("identity_checks", {}).setdefault(stage, [])
+        checks.append(check)
+        if len(checks) > 24:
+            del checks[0]
+
+    def start(self, chart, identity, report: dict, directory: Path, *, ready_action=None, frame_guard=None,
+              identity_phase="final", on_final_identity=None, opening_timeout=120, wait_for_opening=False) -> float:
         self.device.preflight()
-        self.navigator.tap(1013, 563, "开始单人谱面演出")
+        if ready_action is None:
+            self.navigator.tap(1013, 563, "开始单人谱面演出")
+        else:
+            # 准备页不足以确认时仍保留开场机会；确认之前只能操作准备按钮，不能派发谱面触控。
+            ready_identity = ready_action()
+            if identity is None and ready_identity is not None:
+                identity = ready_identity
         clicked_at = time.perf_counter()
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + opening_timeout
         final = None
         # 优先使用四帧；慢截图来不及取得第四帧时，只允许三帧低残差拟合且留足启动余量。
-        anchor = StartAnchor(chart.first, minimum_samples=4 if report.get("engine") == "native" else 2)
+        minimum_samples = 4 if report.get("engine") == "native" else 2
+        anchor = StartAnchor(chart.first, minimum_samples=minimum_samples) if chart is not None else None
         loading_saved = False
         last_error = ""
         problem_priority = (-1, -1.0)
         samples = []
         captured_frames = []
+        pinned_frame = None
+
+        def retained_anchor_frames():
+            retained = {when: screenshot for when, screenshot in captured_frames}
+            if pinned_frame is not None:
+                retained[pinned_frame[0]] = pinned_frame[1]
+            return sorted(retained.items())
+
+        def update_anchor_attempt(*, failed=False, accepted=False):
+            nonlocal samples, pinned_frame
+            current = list(anchor.samples)
+            if current and (not samples or current[0] != samples[0]):
+                # 引用已缓存的图像，首个候选被替换时同步更新；最多多保留一张原始帧。
+                pinned_frame = next((item for item in captured_frames if item[0] == current[0][0]), None)
+            if not current:
+                pinned_frame = None
+            samples = current
+            state = ("accepted" if accepted else "no_candidate" if not samples
+                     else "candidate_unconfirmed" if len(samples) == 1 else "trajectory_pending")
+            attempt = {"samples": samples, "sample_count": len(samples), "sample_state": state}
+            if failed:
+                reason = getattr(anchor, "failure_reason", None)
+                attempt["failure_class"] = (reason if isinstance(reason, str)
+                                            else "candidate_motion_unconfirmed" if len(samples) == 1
+                                            else "trajectory_unaccepted" if samples else "no_candidate")
+            report["anchor_attempt"] = attempt
 
         def save_anchor_frames():
             report["anchor_frames"] = []
-            for index, (when, screenshot) in enumerate(captured_frames):
+            for index, (when, screenshot) in enumerate(retained_anchor_frames()):
                 name = f"anchor-frame-{index:02d}.png"
                 write_image(directory / name, screenshot)
                 report["anchor_frames"].append({"captured_at": when, "path": name})
@@ -338,6 +393,8 @@ class SoloLive:
         while time.monotonic() < deadline:
             before = time.perf_counter()
             frame = self.screenshot()
+            if frame_guard is not None:
+                frame_guard(frame)
             # 帧在设备开始 screencap 时生成，gzip 传输及 Agent 图像解码不是拍摄时间。
             captured_at = before
             if not loading_saved and np.mean(frame[:560].min(axis=2) > 230) > .94:
@@ -345,24 +402,16 @@ class SoloLive:
                 loading_saved = True
             if final is None:
                 try:
-                    candidate = self.matcher.match(frame, identity.difficulty, "final")
-                    if candidate.song_id != identity.song_id:
-                        raise RuntimeError("准备页与最终封面的歌曲不同，拒绝触控")
-                    # 准备页与开场页已提供两次独立确认；开场窗口短，不额外要求连拍两帧。
-                    final = candidate
-                    report["final_identity"] = candidate.to_dict()
-                    report["opening_detection"] = {"seconds_after_start": captured_at - clicked_at,
-                                                   "captured_at": captured_at}
-                    self.final_frame = frame.copy()
-                    # 点开始后持续取帧，加载时间不决定就绪；开场临界区不执行嵌套日志或编码图片。
-                    print(f"开场身份已确认：{candidate.song_id} {candidate.title} {candidate.difficulty.upper()}", flush=True)
+                    difficulty = identity.difficulty if identity is not None else report["requested_difficulty"]
+                    candidate = self.matcher.match(frame, difficulty, identity_phase)
                 except ValueError as error:
                     last_error = str(error)
+                    self.record_identity_check(report, "opening", captured_at=captured_at, error=last_error)
                     attempts = report.setdefault("final_identity_attempts", [])
                     if len(attempts) < 24:
                         attempts.append({"captured_at": captured_at, "error": last_error})
                     # 保留最接近封面的失败帧，避免只保存超时后的暂停页而丢失实际开场证据。
-                    score = re.search(r"最佳=([\d.]+)", last_error)
+                    score = re.search(r"(?:最佳|封面)=([\d.]+)", last_error)
                     candidate_score = float(score[1]) if score else None
                     priority = (0, candidate_score) if score else (1, 0.0)
                     if priority > problem_priority:
@@ -370,21 +419,45 @@ class SoloLive:
                         report["unconfirmed_identity"] = {"captured_at": captured_at, "error": last_error,
                                                           "cover_score": candidate_score}
                         self.identity_problem_frame = frame.copy()
+                else:
+                    self.record_identity_check(report, "opening", captured_at=captured_at)
+                    if identity is not None and candidate.song_id != identity.song_id:
+                        raise RuntimeError("准备页与最终封面的歌曲不同，拒绝触控")
+                    report["final_identity"] = candidate.to_dict()
+                    self.final_frame = frame.copy()
+                    # 资源及 Native 初始化异常必须向外传播，不能作为动画中的 OCR 失败重试。
+                    if on_final_identity is not None:
+                        chart = on_final_identity(candidate)
+                        if anchor is None:
+                            anchor = StartAnchor(chart.first, minimum_samples=minimum_samples)
+                    final = candidate
+                    if wait_for_opening:
+                        # 一键任务的五分钟只限制身份等待；确认后仍须取得完整首音轨迹，不能抢在中途启动。
+                        deadline = time.monotonic() + 120
+                    report["opening_detection"] = {"seconds_after_start": captured_at - clicked_at,
+                                                   "captured_at": captured_at}
+                    # 开场窗口短，只要求一次明确身份；关键时段不执行嵌套日志或编码图片。
+                    print(f"开场身份已确认：{candidate.song_id} {candidate.title} {candidate.difficulty.upper()}", flush=True)
                 if final is None:
+                    if not wait_for_opening and self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
+                        raise RuntimeError(f"两个识别阶段均未确认歌曲，未派发谱面输入：{last_error}")
                     self.pause(.02)
                     continue
             if self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
-                if len(captured_frames) < 32:
-                    captured_frames.append((captured_at, frame.copy()))
+                captured_frames.append((captured_at, frame.copy()))
+                if len(captured_frames) > 32:
+                    # 长前奏会占满最初的空帧；保留原始基线和最近轨迹，确保失败后仍能回放首音。
+                    del captured_frames[1]
                 try:
                     epoch = anchor.observe(frame, captured_at, capture_seconds=time.perf_counter() - before)
                 except Exception:
+                    update_anchor_attempt(failed=True)
                     save_anchor_frames()
                     raise
-                if len(anchor.samples) > len(samples):
-                    samples = list(anchor.samples)
-                    report["anchor_attempt"] = {"samples": samples}
+                if list(anchor.samples) != samples:
+                    update_anchor_attempt()
                 if epoch is not None:
+                    update_anchor_attempt(accepted=True)
                     report["start_anchor"] = {"epoch": epoch, "first_note_time": chart.first.start,
                                               "samples": samples, "capture_seconds": time.perf_counter() - before,
                                               "capture_clock": "request_start", "fit": anchor.fit}
@@ -396,11 +469,15 @@ class SoloLive:
                     # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
                     print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
                     # 锚点建立后不在触控前编码截图，避免错过第一音；结算时再保存证据。
-                    self.anchor_frames = captured_frames
+                    self.anchor_frames = retained_anchor_frames()
                     return epoch
             self.pause(.002)
         write_image(directory / "start-failure.png", frame)
+        if anchor is not None:
+            update_anchor_attempt(failed=True)
         save_anchor_frames()
+        if wait_for_opening and final is None:
+            raise TimeoutError(f"等待最终歌曲封面超过 {opening_timeout} 秒，未派发谱面输入：{last_error}")
         raise RuntimeError(f"开场封面或第一音锚点未确认，未派发谱面输入：{last_error}")
 
     def read_result(self, frame: np.ndarray) -> LiveResult | None:
@@ -462,25 +539,99 @@ class SoloLive:
                                        cv2.BORDER_CONSTANT, value=(255, 255, 255))
             return numeric(self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0])))
 
+    def observe_playfield(self, frame: np.ndarray, directory: Path, interrupted_message: str) -> bool:
+        guard = self.life_guard
+        if blank_transition(frame):
+            guard.playfield_missing_frames = guard.zero_streak = 0
+            return False
+        pause_score = self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0]
+        life_score = (self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0]
+                      if "life_hud" in self.navigator.templates else None)
+        life_visible = life_score is not None and life_score >= self.navigator.threshold
+        visible = pause_score >= self.navigator.threshold or life_visible
+        if visible:
+            guard.playfield_missing_frames = 0
+            guard.hud_seen |= life_visible or life_score is None
+            if pause_score < self.navigator.threshold:
+                guard.pause_fallback_frames += 1
+        else:
+            guard.playfield_missing_frames += 1
+            guard.zero_streak = 0
+        report = getattr(self, "last_report", None)
+        if isinstance(report, dict):
+            report["playfield_monitor"] = {"pause_score": pause_score, "life_hud_score": life_score,
+                                           "consecutive_missing": guard.playfield_missing_frames,
+                                           "pause_fallback_frames": guard.pause_fallback_frames}
+        # 暂停按钮会被特效干扰；生命标签仍在就继续，一张缺失帧不能中断已确认歌曲的输入。
+        if guard.playfield_missing_frames >= 2:
+            write_image(directory / "playback-interrupted.png", frame)
+            raise RuntimeError(interrupted_message)
+        return visible
+
+    def begin_performance_trace(self):
+        self.performance_trace = PerformanceTrace()
+        self.performance_trace_error = None
+
+    def set_performance_trace_plan(self, events):
+        trace = getattr(self, "performance_trace", None)
+        if trace is not None:
+            trace.set_plan(events)
+
+    def record_performance_trace(self, elapsed, previous_samples, *, zero_template_score=None):
+        trace = getattr(self, "performance_trace", None)
+        if trace is None or getattr(self, "performance_trace_error", None):
+            return
+        try:
+            playback = None
+            player = getattr(self, "active_chart_player", None)
+            if player is not None:
+                playback = {"sent_actions": player.sent_actions, "active_contacts": sorted(player.active)}
+            trace.observe(elapsed, self.last_report, self.life_guard,
+                          life_sampled=self.life_guard.samples > previous_samples,
+                          zero_template_score=zero_template_score, playback=playback)
+        except Exception as error:
+            # 诊断不能反压派发或中断演出；失败信息等输入清理后再写入正式报告。
+            self.performance_trace_error = f"{type(error).__name__}: {error}"
+
+    def finish_performance_trace(self, report, directory):
+        trace = getattr(self, "performance_trace", None)
+        if trace is None:
+            return
+        self.performance_trace = None
+        try:
+            if getattr(self, "performance_trace_error", None):
+                raise RuntimeError(self.performance_trace_error)
+            summary = trace.save(directory, report)
+        except Exception as error:
+            summary = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+        report["performance_trace"] = summary
+        report.setdefault("performance_traces", []).append(summary)
+
     def observe_play_state(self, directory: Path):
         requested_at = time.perf_counter()
         frame = self.screenshot()
-        if requested_at - self.life_epoch < 8:
+        # 诊断仅保留已有采样，不增加截图或改变输入；整局保存也限定在 180 秒内。
+        capture_limit = 180 if os.environ.get("MAAPJSK_DIAGNOSTIC_FULL_LIFE_FRAMES") == "1" else 8
+        if requested_at - self.life_epoch < capture_limit:
             self.life_frames.append((requested_at - self.life_epoch, frame))
-        if self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] < self.navigator.threshold:
-            write_image(directory / "playback-interrupted.png", frame)
-            if self.navigator.match(frame, "live_failed")[0] >= self.navigator.threshold:
-                self.life_guard.zero_confirmed = True
-                raise LifeDepleted("游戏已确认 LIVE FAILED，停止输入并退出演出")
-            raise RuntimeError("演奏场提前消失，停止谱面输入")
-        def read_zero(image):
-            try:
-                return self.read_optional_number(image, (1090, 8, 1187, 37)) == 0
-            except ValueError:
-                return False
-        if self.life_guard.observe(frame, read_zero):
-            write_image(directory / "life-zero.png", frame)
-            raise LifeDepleted("连续两帧确认生命归零，停止输入并退出演出")
+        previous_samples = self.life_guard.samples
+        try:
+            if not self.observe_playfield(frame, directory, "演奏场提前消失，停止谱面输入"):
+                if self.navigator.match(frame, "live_failed")[0] >= self.navigator.threshold:
+                    write_image(directory / "playback-interrupted.png", frame)
+                    self.life_guard.zero_confirmed = True
+                    raise LifeDepleted("游戏已确认 LIVE FAILED，停止输入并退出演出")
+                return
+            def read_zero(image):
+                try:
+                    return self.read_optional_number(image, (1090, 8, 1187, 37)) == 0
+                except ValueError:
+                    return False
+            if self.life_guard.observe(frame, read_zero):
+                write_image(directory / "life-zero.png", frame)
+                raise LifeDepleted("连续两帧确认生命归零，停止输入并退出演出")
+        finally:
+            self.record_performance_trace(requested_at - self.life_epoch, previous_samples)
 
     def dialog_action(self, frame, labels):
         # 只在已经暂停或退出确认的场景定位白色按钮，避免把游戏场景文字当成操作入口。
@@ -536,9 +687,14 @@ class SoloLive:
             self.observe_play_state(directory)
 
         player = ChartPlayer(self.device.controller, self.stop_requested, idle_observer=observe_state)
+        self.active_chart_player = player
+        trace = getattr(self, "performance_trace", None)
+        if trace is not None:
+            trace.set_legacy_feedback(player.lateness)
         try:
             report["playback"] = player.play(events, epoch, offset_ms)
         finally:
+            self.active_chart_player = None
             if "playback" not in report:
                 report["playback"] = {"release_confirmed": not player.active,
                                       "active_contacts": sorted(player.active), "sent_actions": player.sent_actions,
@@ -553,9 +709,11 @@ class SoloLive:
         last_candidate = None
         stable = 0
         settlement_index = 0
+        end_guard = LiveEndGuard(self.navigator, report, life_seen=getattr(getattr(self, "life_guard", None), "hud_seen", False))
 
         def inspect_settlement(frame):
             nonlocal stable, last_candidate, result, completed, failed
+            end_guard.observe(frame)
             clear_score = self.navigator.match(frame, "live_clear")[0]
             failed_score = self.navigator.match(frame, "live_failed")[0] if "live_failed" in self.navigator.templates else 0
             if clear_score >= self.navigator.threshold and clear_score > failed_score + .04:
@@ -581,26 +739,36 @@ class SoloLive:
 
         while time.monotonic() < deadline:
             frame = self.screenshot()
+            if blank_transition(frame):
+                end_guard.observe(frame)
+                self.pause(.3)
+                continue
             candidate = inspect_settlement(frame)
             if self.navigator.match(frame, "home")[0] >= self.navigator.threshold:
                 if failed:
                     report["result_status"] = "recorded" if result else "unreadable"
                     raise RuntimeError("游戏判定演出失败，本局未计入完成次数")
-                if not completed:
-                    raise RuntimeError("未确认演出完成，已返回主页")
+                if not (completed or end_guard.ended):
+                    self.pause(.2)
+                    continue
+                report["returned_home"] = True
+                report["performance_completed"] = True
+                report["completed"] = result is not None and result.get("total_matches_chart") is True
                 if result is None:
                     report["result_status"] = "unreadable"
-                    raise RuntimeError("已确认 LIVE CLEAR，但判定数字未完整读取；保留截图并停止后续局")
-                if result.get("total_matches_chart") is False:
+                    report["settlement_warning"] = "判定数字未完整读取，保留证据并继续下一曲"
+                elif result.get("total_matches_chart") is False:
                     report["result_status"] = "note_count_mismatch"
-                    raise RuntimeError("结算音符总数与本地谱面元数据不同；保留实际数字并停止后续局")
-                report["completed"] = True
-                report["live_status"] = "cleared"
-                report["result_status"] = "recorded" if result else "unreadable"
+                    report["settlement_warning"] = "结算音数未匹配本地谱面，保留实际数字并继续下一曲"
+                else:
+                    report["result_status"] = "recorded"
                 return
             write_image(directory / "settlement-last.png", frame)
             if self.navigator.match(frame, "playing")[0] >= self.navigator.threshold and not completed:
                 self.pause(.4)
+                continue
+            if not (completed or failed or end_guard.ended):
+                self.pause(.2)
                 continue
             if settlement_index < 40:
                 settlement_index += 1
@@ -613,6 +781,10 @@ class SoloLive:
             # 奖励退出动画会先显示模糊主页；留出切换时间后再读，避免旧帧诱发多余 BACK。
             self.pause(1.2)
             confirmation = self.screenshot()
+            if blank_transition(confirmation):
+                end_guard.observe(confirmation)
+                self.pause(.3)
+                continue
             # 判定页也可能在这张复查帧才出现，先取得两帧数字再返回。
             confirmation_candidate = inspect_settlement(confirmation)
             if confirmation_candidate is not None and stable < 2:
@@ -620,6 +792,8 @@ class SoloLive:
                 continue
             # 动画加速点击可能已切换到主页；必须重新检查后才能发送 BACK。
             if self.navigator.match(confirmation, "home")[0] >= self.navigator.threshold:
+                continue
+            if self.navigator.match(confirmation, "playing")[0] >= self.navigator.threshold:
                 continue
             if np.mean(confirmation.max(axis=2) < 15) > .95:
                 self.pause(.6)
@@ -660,15 +834,18 @@ class SoloLive:
                       "recovery_settings": {"mode": recovery_mode, "count": recovery_count}}
             report["engine"] = engine
             self.last_report = report
+            self.begin_performance_trace()
             report["report_path"] = str(directory / "report.json")
             try:
                 identity, frame = self.select(difficulty, song_mode)
                 report["preparation_identity"] = identity.to_dict()
+                self.record_identity_check(report, "preparation")
                 write_image(directory / "prepare.png", frame)
                 entry = self.repository.songs[identity.song_id]["charts"][difficulty]
                 report["chart"] = {key: entry[key] for key in ("music_id", "difficulty", "sha256", "path", "total_note_count")}
                 chart = parse_sus(self.repository.load_chart(identity.song_id, difficulty))
                 events = compile_touches(chart)
+                self.set_performance_trace_plan(events)
                 report["chart"]["duration"] = chart.duration
                 report["chart"]["planned_actions"] = len(events)
                 self.prepare_bonus(bonus_consumption, report, directory)
@@ -715,12 +892,8 @@ class SoloLive:
                 if playback_error is not None:
                     report["completed"] = False
                     raise playback_error
-                self.completed_rounds += 1
-                self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")
-                if report.get("judgements"):
-                    values = report["judgements"]
-                    self.log(f"PERFECT {values['perfect']}，GREAT {values['great']}，GOOD {values['good']}，BAD {values['bad']}，MISS {values['miss']}；PERFECT 占比 {values['perfect_rate']:.2%}")
             except Exception as error:
+                report["completed"] = False
                 report["error"] = f"{type(error).__name__}: {error}"
                 report["cancelled"] = self.stop_requested()
                 if not self.stop_requested():
@@ -735,9 +908,12 @@ class SoloLive:
                     try:
                         native_player.close()
                     except Exception as release_error:
+                        report["completed"] = False
                         report["release_error"] = f"{type(release_error).__name__}: {release_error}"
+                        self.finish_performance_trace(report, directory)
                         _write_json(directory / "report.json", report)
                         raise
+                self.finish_performance_trace(report, directory)
                 for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
                                         ("identity_problem_frame", "identity-unconfirmed.png")):
                     frame = getattr(self, attribute, None)
@@ -755,7 +931,21 @@ class SoloLive:
                     report.setdefault("life_frames", []).append({"elapsed_s": when, "path": name})
                 self.life_frames = []
                 report["finished_at"] = datetime.now().astimezone().isoformat()
-                _write_json(directory / "report.json", report)
-                append_result_index(self.report_root, directory, report)
+                try:
+                    _write_json(directory / "report.json", report)
+                    append_result_index(self.report_root, directory, report)
+                except Exception as error:
+                    report["completed"] = False
+                    report["persistence_error"] = f"{type(error).__name__}: {error}"
+                    _write_json(directory / "report.json", report)
+                    raise
+            if report.get("completed"):
+                self.completed_rounds += 1
+            self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")
+            if report.get("settlement_warning"):
+                self.log(f"{report['settlement_warning']}；已演出 {round_index}/{count}，完整记录 {self.completed_rounds}")
+            if report.get("judgements"):
+                values = report["judgements"]
+                self.log(f"PERFECT {values['perfect']}，GREAT {values['great']}，GOOD {values['good']}，BAD {values['bad']}，MISS {values['miss']}；PERFECT 占比 {values['perfect_rate']:.2%}")
             reports.append(report)
         return reports
