@@ -536,22 +536,29 @@ class SoloLive:
 
     def ensure_bonus_available(self, mode: str, count: int, report: dict, directory: Path):
         consumption = report["bonus"]["consumption"]
+        previous = getattr(self.navigator, "recovery_evidence", None)
+        pending_batch = (isinstance(previous, dict) and previous.get("ok_requested")
+                         and previous.get("status") == "started")
+        if pending_batch:
+            # 当前体力足够开演也不能证明原批次已足额到账，跨报告继续保留未确认请求。
+            report["recovery"] = dict(previous, inherited_pending_batch=True)
+            _write_json(directory / "report.json", report)
         if consumption == 0:
             report["bonus"]["availability"] = "not_required"
             return
         before, available, readings = self.wait_available_bonus()
         report["bonus"].update(available_before=available, availability_readings=readings)
+        if pending_batch:
+            report["recovery"]["current_available"] = available
         if available >= consumption:
             report["bonus"]["availability"] = "sufficient"
+            if pending_batch:
+                _write_json(directory / "report.json", report)
             return
         report["bonus"]["availability"] = "insufficient"
         if mode == "off":
             raise RuntimeError(f"当前体力 {available}，每局需要 {consumption}；自动用药已关闭，请补充体力或修改任务设置")
-        previous = getattr(self.navigator, "recovery_evidence", None)
-        if (isinstance(previous, dict) and previous.get("ok_requested")
-                and previous.get("status") == "started"):
-            report["recovery"] = dict(previous, inherited_pending_batch=True,
-                                      current_available=available)
+        if pending_batch:
             _write_json(directory / "report.json", report)
             raise RuntimeError("本任务先前已请求批量用药但到账未确认，请用户处理；不追加或重复整批")
         report["recovery"] = {"mode": mode, "requested_bottles": count, "completed_bottles": 0, "available_before": available,

@@ -882,6 +882,21 @@ class SoloTests(unittest.TestCase):
         workflow.navigator.tap.assert_not_called()
         workflow.navigator._recover_and_verify.assert_not_called()
 
+    def test_sufficient_bonus_still_preserves_pending_partial_batch(self):
+        workflow, report = self._availability_workflow([5])
+        workflow.navigator.recovery_evidence = {'status': 'started', 'ok_requested': True,
+            'requested_bottles': 5, 'completed_bottles': 0, 'expected_increase': 5,
+            'available_before': 2, 'available_after': 5}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.ensure_bonus_available('small', 5, report, Path(directory))
+            saved = json.loads((Path(directory) / 'report.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['bonus']['availability'], 'sufficient')
+        self.assertEqual(saved['recovery']['status'], 'started')
+        self.assertEqual(saved['recovery']['completed_bottles'], 0)
+        self.assertEqual(saved['recovery']['current_available'], 5)
+        self.assertTrue(saved['recovery']['inherited_pending_batch'])
+        workflow.navigator.tap.assert_not_called()
+        workflow.navigator._recover_and_verify.assert_not_called()
 
     def test_recovery_still_insufficient_stops_without_extra_drinks_or_lowering_consumption(self):
         workflow,report = self._availability_workflow([0,1])
