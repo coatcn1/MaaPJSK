@@ -35,7 +35,8 @@ def main():
     parser.add_argument("--mfa-root", type=Path, default=ROOT / ".local/mfa-generic")
     parser.add_argument("--difficulty", choices=["easy", "normal", "hard", "expert", "master", "append"], default="easy")
     parser.add_argument("--count", type=int, default=1)
-    parser.add_argument("--song-mode", choices=["current", "random"], default="current")
+    parser.add_argument("--song-mode", choices=["current", "random", "specified"], default="current")
+    parser.add_argument("--song-name", help="指定搜索时的本地完整曲名")
     parser.add_argument("--offset-ms", type=int, help="手动实际偏移；校准时作为本次排练的起始候选")
     parser.add_argument("--engine", choices=["legacy", "native"], default="legacy")
     parser.add_argument("--calibrate", action="store_true")
@@ -48,6 +49,8 @@ def main():
     parser.add_argument("--recovery-count", type=int, default=1)
     parser.add_argument("--inspect-only", action="store_true")
     arguments = parser.parse_args()
+    if arguments.song_mode == "specified" and (not arguments.song_name or not arguments.song_name.strip() or arguments.calibrate):
+        parser.error("指定搜索须提供 --song-name，校准入口仍仅支持当前／随机")
     if (not 1 <= arguments.count <= 999 or (arguments.offset_ms is not None and not -250 <= arguments.offset_ms <= 250)
             or not 1 <= arguments.recovery_count <= 99):
         parser.error("次数、偏移量或每次回复瓶数越界")
@@ -127,6 +130,10 @@ def main():
         "SoloChartLiveRecoveryModeConfig": {"custom_action_param": {"recovery_mode": arguments.recovery_mode}},
         "SoloChartLiveRecoveryCountConfig": {"custom_action_param": {"recovery_count": arguments.recovery_count}},
     }
+    if arguments.song_mode == "specified":
+        # 旧模式不增加节点或字段，保持独立验收脚本与已部署旧 Agent 的兼容性。
+        overrides["SoloChartLiveSongConfig"]["next"] = ["SoloChartLiveSongNameConfig"]
+        overrides["SoloChartLiveSongNameConfig"] = {"custom_action_param": {"song_name": arguments.song_name.strip()}}
     try:
         if not client.connect():
             raise RuntimeError("部署版 Agent 连接失败")

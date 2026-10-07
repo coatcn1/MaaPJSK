@@ -12,12 +12,336 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'agent'))
 import solo_live as agent
 from project_sekai.ocr import LineOcr, Reading
+from project_sekai.life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from project_sekai.solo_live import LiveResult, SoloLive, numeric, is_light_mode, append_result_index
 from project_sekai.song_identity import SongMatcher, read_image, title_score
+from project_sekai.sus_chart import Chart, Gesture, Point
 from scripts.test_solo_live import controller_options
 
 
 class SoloTests(unittest.TestCase):
+    def test_date_update_notice_requires_modal_two_exact_lines_and_no_hud(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.navigator = SimpleNamespace(templates={'life_hud': None}, threshold=.83,
+                                            match=Mock(return_value=(0., (0, 0))))
+        workflow.ocr = Mock()
+        workflow.ocr.read.side_effect = [Reading('日付が更新されました。', .99), Reading('タイトルに戻ります。', .99)]
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        cv2.rectangle(frame, (251, 248), (1028, 471), (235, 235, 240), -1)
+        self.assertIsNotNone(workflow.date_update_notice(frame))
+        workflow.ocr.read.reset_mock()
+        self.assertIsNone(workflow.date_update_notice(np.zeros_like(frame)))
+        workflow.ocr.read.assert_not_called()
+        workflow.ocr.read.side_effect = [Reading('プロジェクトセカイを終了しますか？', .99), Reading('タイトルに戻ります。', .99)]
+        self.assertIsNone(workflow.date_update_notice(frame))
+        workflow.ocr.read.reset_mock()
+        workflow.navigator.match.return_value = (1., (0, 0))
+        self.assertIsNone(workflow.date_update_notice(frame))
+        workflow.ocr.read.assert_not_called()
+
+    def install_search_ocr(self, workflow, readings):
+        values = iter(readings)
+        last_query = [Reading('', 0.)]
+        def read(frame, box):
+            if box in ((151, 20, 580, 65), (151, 27, 580, 57), (12, 642, 460, 696)):
+                return last_query[0]
+            value = next(values)
+            if box == (151, 24, 580, 62):
+                last_query[0] = value
+            return value
+        workflow.ocr.read.side_effect = read
+
+    def test_specified_song_name_requires_unique_complete_local_title(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.repository = SimpleNamespace(songs={54: {'title': 'Ready Steady', 'charts': {'expert': {}}},
+                                                    55: {'title': 'Ready', 'charts': {'expert': {}}}}, load_chart=Mock())
+        self.assertEqual(workflow.resolve_specified_song('Ready Steady', 'expert'), 54)
+        self.assertEqual(workflow.resolve_specified_song(' ready steady ', 'expert'), 54)
+        for name in ('', 'Ready Ste', 'unknown'):
+            with self.assertRaises(ValueError):
+                workflow.resolve_specified_song(name, 'expert')
+        workflow.repository.songs[56] = {'title': 'ReadySteady', 'charts': {'expert': {}}}
+        with self.assertRaises(ValueError):
+            workflow.resolve_specified_song('Ready Steady', 'expert')
+
+    def test_specified_invalid_local_chart_prevents_all_navigation(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device, workflow.navigator = Mock(), Mock()
+        workflow.repository = SimpleNamespace(songs={54: {'title': 'Ready Steady', 'charts': {'expert': {}}}},
+                                              load_chart=Mock(side_effect=ValueError('本地谱面 SHA256 校验失败')))
+        with self.assertRaisesRegex(ValueError, 'SHA256'):
+            workflow.select('expert', 'specified', song_name='Ready Steady')
+        workflow.device.assert_not_called()
+        workflow.navigator.return_to_home.assert_not_called()
+        workflow.navigator.tap.assert_not_called()
+
+    def test_specified_configuration_adds_name_node_only_to_new_mode(self):
+        root = Path(__file__).resolve().parents[1]
+        interface = json.loads((root / 'interface.json').read_text(encoding='utf8'))
+        pipeline = json.loads((root / 'resource/pipeline/solo_chart_live.json').read_text(encoding='utf8'))
+        cases = {case['name']: case for case in interface['option']['SoloChartLiveSongMode']['cases']}
+        self.assertEqual(pipeline['SoloChartLiveSongConfig']['next'], ['SoloChartLiveCountConfig'])
+        for mode in ('Current', 'Random'):
+            self.assertNotIn('next', cases[mode]['pipeline_override']['SoloChartLiveSongConfig'])
+        self.assertEqual(cases['Specified']['pipeline_override']['SoloChartLiveSongConfig']['next'], ['SoloChartLiveSongNameConfig'])
+        self.assertEqual(agent.validate_option('song_mode', 'specified'), 'specified')
+        self.assertEqual(agent.validate_option('song_name', ' Ready Steady '), 'Ready Steady')
+        for name in ('', '  ', None, 54):
+            with self.assertRaises(ValueError):
+                agent.validate_option('song_name', name)
+
+    def test_specified_search_uses_native_confirm_without_clearing_submitted_query(self):
+        workflow = SoloLive.__new__(SoloLive)
+        frame = np.full((720, 1280, 3), 100, np.uint8)
+        workflow.device, workflow.navigator, workflow.ocr = Mock(), Mock(), Mock()
+        workflow.search_clear_visible = Mock(return_value=False)
+        workflow.checked_search_page = Mock(return_value=frame)
+        workflow.screenshot = Mock(return_value=frame)
+        workflow.native_search_text_present = Mock(side_effect=[False, True, True])
+        workflow.last_report = {'requested_song_name': 'Ready Steady', 'expected_song_id': 54}
+        workflow.pause = lambda _: None
+        self.install_search_ocr(workflow, [Reading('确定', .99),
+                                       Reading('Ready Steady', .99), Reading('确定', .99),
+                                       Reading('Ready Steady', .99), Reading('确定', .99)])
+        workflow.device.controller.post_input_text.return_value.wait.return_value.succeeded = True
+        workflow.submit_song_search('Ready Steady')
+        workflow.device.controller.post_input_text.assert_called_once_with('ReadySteady')
+        self.assertEqual(workflow.last_report['search_query'], 'ReadySteady')
+        self.assertEqual(workflow.last_report['requested_song_name'], 'Ready Steady')
+        self.assertEqual([(call.args[0], call.args[1]) for call in workflow.navigator.tap.call_args_list],
+                         [(350, 42), (1215, 667)])
+
+    def test_specified_search_stop_or_empty_text_cannot_submit(self):
+        for stop in (True, False):
+            workflow = SoloLive.__new__(SoloLive)
+            workflow.device, workflow.navigator, workflow.ocr = Mock(), Mock(), Mock()
+            workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+            workflow.screenshot = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+            clock = SimpleNamespace(now=0.)
+            workflow.native_search_text_present = Mock(return_value=False)
+            workflow.search_clear_visible = Mock(return_value=False)
+            workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+            query_reads = []
+            def read(frame, box):
+                if box[0] == 151:
+                    query_reads.append(None)
+                    return Reading('曲名・クリエイター名から探す' if len(query_reads) == 1 else 'wrong', .99)
+                return Reading('确定', .99)
+            workflow.ocr.read.side_effect = read
+            if stop:
+                workflow.navigator._check_stop.side_effect = InterruptedError('stop')
+            with patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(InterruptedError if stop else RuntimeError):
+                workflow.submit_song_search('Ready Steady')
+            self.assertNotIn((1215, 667), [(call.args[0], call.args[1]) for call in workflow.navigator.tap.call_args_list])
+
+    def test_specified_all_category_scroll_is_bounded_and_requires_text(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device, workflow.navigator, workflow.ocr = Mock(), Mock(), Mock()
+        workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+        workflow.pause = lambda _: None
+        workflow.ocr.read.return_value = Reading('その他', .99)
+        with self.assertRaises(RuntimeError):
+            workflow.select_all_search_category()
+        self.assertEqual(workflow.device.swipe.call_count, 3)
+        workflow.navigator.tap.assert_not_called()
+        workflow.device.swipe.assert_called_with(70, 180, 70, 550)
+
+    def test_specified_search_old_query_clears_only_before_new_input(self):
+        workflow = SoloLive.__new__(SoloLive)
+        frame = np.full((720, 1280, 3), 100, np.uint8)
+        workflow.device, workflow.navigator, workflow.ocr = Mock(), Mock(), Mock()
+        workflow.checked_search_page = Mock(return_value=frame)
+        workflow.screenshot = Mock(return_value=frame)
+        workflow.search_clear_visible = Mock(side_effect=[True, False])
+        workflow.native_search_text_present = Mock(side_effect=[False, True, True])
+        workflow.pause = lambda _: None
+        self.install_search_ocr(workflow, [Reading('确定', .99), Reading('Ready Steady', .99), Reading('确定', .99),
+                                       Reading('Ready Steady', .99), Reading('确定', .99)])
+        workflow.submit_song_search('Ready Steady')
+        self.assertEqual([(call.args[0], call.args[1]) for call in workflow.navigator.tap.call_args_list],
+                         [(610, 42), (350, 42), (1215, 667)])
+
+    def test_specified_search_result_must_really_select_expected_id(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.repository = SimpleNamespace(songs={548: {'title': 'ぼくのかみさま'}})
+        workflow.select_all_search_category, workflow.submit_song_search = Mock(), Mock()
+        workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+        workflow.ocr, workflow.matcher = Mock(), Mock()
+        workflow.ocr.read.return_value = Reading('ぼくのかみさま', .99)
+        workflow.matcher.match.return_value = SimpleNamespace(song_id=54)
+        workflow.search_clear_visible = Mock(return_value=True)
+        workflow.pause = lambda _: None
+        with self.assertRaisesRegex(RuntimeError, '未选中指定歌曲'):
+            workflow.search_specified_song(548, 'expert')
+        workflow.matcher.match.return_value = SimpleNamespace(song_id=548)
+        self.assertEqual(workflow.search_specified_song(548, 'expert').song_id, 548)
+
+    def test_specified_search_clear_x_does_not_confuse_magnifier(self):
+        frame = np.full((720, 1280, 3), 255, np.uint8)
+        cv2.line(frame, (600, 32), (620, 52), (60, 60, 60), 4)
+        cv2.line(frame, (600, 52), (620, 32), (60, 60, 60), 4)
+        self.assertTrue(SoloLive.search_clear_visible(frame))
+        frame[:] = 255
+        cv2.circle(frame, (607, 39), 8, (60, 60, 60), 2)
+        cv2.line(frame, (613, 45), (620, 52), (60, 60, 60), 3)
+        self.assertFalse(SoloLive.search_clear_visible(frame))
+
+    def test_specified_nonempty_native_input_rejects_repeated_paste(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device, workflow.navigator, workflow.ocr = Mock(), Mock(), Mock()
+        workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+        workflow.search_clear_visible = Mock(return_value=False)
+        workflow.native_search_text_present = Mock(return_value=True)
+        workflow.pause = lambda _: None
+        workflow.ocr.read.return_value = Reading('确定', .99)
+        with self.assertRaisesRegex(RuntimeError, '拒绝重复输入'):
+            workflow.submit_song_search('Ready Steady')
+        workflow.device.controller.post_input_text.assert_not_called()
+        self.assertNotIn((1215, 667), [call.args[:2] for call in workflow.navigator.tap.call_args_list])
+
+    def test_native_editor_shape_distinguishes_blank_cursor_from_text(self):
+        frame = np.full((720, 1280, 3), 255, np.uint8)
+        cv2.line(frame, (16, 650), (16, 685), (0, 0, 0), 1)
+        self.assertFalse(SoloLive.native_search_text_present(frame))
+        cv2.putText(frame, 'QUERY', (16, 681), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 0, 0), 2)
+        self.assertTrue(SoloLive.native_search_text_present(frame))
+        frame[:] = 255
+        cv2.rectangle(frame, (450, 645), (480, 690), (0, 0, 0), -1)
+        self.assertFalse(SoloLive.native_search_text_present(frame))
+
+    def test_search_submission_waits_only_for_fresh_confirmation(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.search_clear_visible = Mock(return_value=False)
+        workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+        workflow.device, workflow.ocr = Mock(), Mock()
+        workflow.last_report = {}
+        clock = SimpleNamespace(now=0.)
+        workflow.native_search_text_present = Mock(side_effect=[False, True, True])
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        self.install_search_ocr(workflow, [Reading('old', .99), Reading('确定', .99),
+                                       Reading('デーモンロード', .88), Reading('确定', .99),
+                                       Reading('デーモンロード', .88), Reading('确定', .99)])
+        with patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.wait_search_submission('デーモンロード')
+        self.assertEqual(workflow.checked_search_page.call_count, 3)
+        self.assertLessEqual(clock.now, 2.)
+        self.assertEqual(workflow.last_report['search_submission_readings']['typed']['text'], 'デーモンロード')
+        workflow.device.controller.post_input_text.assert_not_called()
+
+    def test_search_submission_timeout_records_reads_and_stop_interrupts_wait(self):
+        for stop in (False, True):
+            workflow = SoloLive.__new__(SoloLive)
+            workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+            workflow.ocr, workflow.device = Mock(), Mock()
+            workflow.last_report = {}
+            clock = SimpleNamespace(now=0.)
+            def pause(seconds):
+                if stop:
+                    raise InterruptedError('stop')
+                clock.now += seconds
+            workflow.native_search_text_present = Mock(return_value=False)
+            workflow.search_clear_visible = Mock(return_value=False)
+            workflow.pause = pause
+            workflow.ocr.read.side_effect = lambda frame, box: Reading('wrong' if box[0] == 151 else '确定', .99)
+            with patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(InterruptedError if stop else RuntimeError):
+                workflow.wait_search_submission('デーモンロード')
+            self.assertLessEqual(clock.now, 2.)
+            self.assertEqual(workflow.last_report['search_submission_readings']['typed']['text'], 'wrong')
+            workflow.device.controller.post_input_text.assert_not_called()
+
+    def test_search_native_exact_channel_does_not_correct_wrong_diacritic(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.search_clear_visible = Mock(return_value=False)
+        workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+        workflow.ocr, workflow.device = Mock(), Mock()
+        workflow.last_report = {}
+        clock = SimpleNamespace(now=0.)
+        workflow.native_search_text_present = Mock(side_effect=[True, True])
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        def read(frame, box):
+            if box == (1180, 644, 1254, 693):
+                return Reading('确定', .99)
+            return Reading('デーモンロード' if box == (12, 642, 460, 696) else 'テーモンロード', .99)
+        workflow.ocr.read.side_effect = read
+        with patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.wait_search_submission('デーモンロード')
+        evidence = workflow.last_report['search_submission_readings']
+        self.assertEqual(evidence['typed']['text'], 'テーモンロード')
+        self.assertEqual(len(evidence['query_readings']), 4)
+        self.assertEqual(evidence['query_readings'][0]['text'], 'テーモンロード')
+        workflow.device.controller.post_input_text.assert_not_called()
+
+    def test_search_committed_state_still_requires_current_proof_and_real_target(self):
+        workflow = SoloLive.__new__(SoloLive)
+        title = 'デーモンロード'
+        workflow.repository = SimpleNamespace(songs={767: {'title': title}})
+        workflow.select_all_search_category, workflow.submit_song_search = Mock(), Mock()
+        workflow.checked_search_page = Mock(return_value=np.full((720, 1280, 3), 100, np.uint8))
+        workflow.ocr, workflow.matcher = Mock(), Mock()
+        workflow.ocr.read.side_effect = lambda frame, box: Reading('' if box[0] == 1180 else 'テーモンロード', .99)
+        workflow.search_clear_visible = Mock(return_value=True)
+        workflow._verified_search_title = title
+        workflow.matcher.match.return_value = SimpleNamespace(song_id=767)
+        workflow.pause = lambda _: None
+        self.assertEqual(workflow.search_specified_song(767, 'expert').song_id, 767)
+        self.assertEqual(workflow.matcher.match.call_count, 2)
+        workflow.search_clear_visible.return_value = False
+        with self.assertRaisesRegex(RuntimeError, '提交状态未确认'):
+            workflow.search_specified_song(767, 'expert')
+        workflow.search_clear_visible.return_value = True
+        workflow.matcher.match.return_value = SimpleNamespace(song_id=54)
+        with self.assertRaisesRegex(RuntimeError, '未选中指定歌曲'):
+            workflow.search_specified_song(767, 'expert')
+
+    def test_specified_locked_state_requires_both_lock_and_disabled_decide(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.ocr = Mock()
+        workflow.ocr.read.return_value = Reading('决定', .9)
+        workflow.selected_card_padlock = Mock(return_value=True)
+        frame = np.full((720, 1280, 3), 84, np.uint8)
+        self.assertEqual(workflow.specified_decide_state(frame), 'locked')
+        workflow.selected_card_padlock.return_value = False
+        self.assertEqual(workflow.specified_decide_state(frame), 'unknown')
+        frame[:] = 134
+        self.assertEqual(workflow.specified_decide_state(frame), 'ready')
+        workflow.selected_card_padlock.return_value = True
+        self.assertEqual(workflow.specified_decide_state(frame), 'unknown')
+        workflow.ocr.read.return_value = Reading('unknown', .99)
+        frame[:] = 84
+        self.assertEqual(workflow.specified_decide_state(frame), 'unknown')
+
+    def test_selected_card_lock_needs_border_shackle_and_keyhole(self):
+        frame = np.full((720, 1280, 3), 60, np.uint8)
+        cv2.rectangle(frame, (178, 187), (352, 361), (255, 255, 255), 4)
+        cv2.ellipse(frame, (265, 266), (13, 12), 0, 0, 360, (255, 255, 255), 5)
+        cv2.rectangle(frame, (247, 269), (283, 294), (255, 255, 255), -1)
+        cv2.circle(frame, (265, 279), 4, (60, 60, 60), -1)
+        cv2.rectangle(frame, (263, 279), (267, 286), (60, 60, 60), -1)
+        self.assertTrue(SoloLive.selected_card_padlock(frame))
+        cv2.rectangle(frame, (260, 274), (271, 289), (255, 255, 255), -1)
+        self.assertFalse(SoloLive.selected_card_padlock(frame))
+
+    def test_specified_locked_target_never_clicks_disabled_decide(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.resolve_specified_song = Mock(return_value=767)
+        workflow.navigator, workflow.matcher, workflow.ocr = Mock(), Mock(), Mock()
+        frame = np.full((720, 1280, 3), 100, np.uint8)
+        identity = SimpleNamespace(song_id=767)
+        workflow.navigator.wait.return_value = frame
+        workflow.ocr.read.return_value = Reading('HARD', .99)
+        workflow.search_specified_song = Mock(return_value=identity)
+        workflow.checked_search_page = Mock(return_value=frame)
+        workflow.matcher.match.return_value = identity
+        workflow.specified_decide_state = Mock(return_value='locked')
+        workflow.pause = lambda _: None
+        with self.assertRaisesRegex(RuntimeError, '指定歌曲尚未解锁'):
+            workflow.select('expert', 'specified', song_name='デーモンロード')
+        self.assertNotIn((1007, 590), [call.args[:2] for call in workflow.navigator.tap.call_args_list])
+        workflow.navigator.tap.reset_mock()
+        workflow.specified_decide_state.side_effect = AssertionError('old mode must not inspect locks')
+        workflow.select('expert', 'current')
+        self.assertIn((1007, 590), [call.args[:2] for call in workflow.navigator.tap.call_args_list])
+
     def test_acceptance_controller_reuses_mfa_screenshot_extras_and_input_configuration(self):
         config = {'extras':{'type':'MuMu','index':0}}
         with tempfile.TemporaryDirectory() as directory:
@@ -146,10 +470,87 @@ class SoloTests(unittest.TestCase):
         workflow.read_result=lambda frame: LiveResult(250,5,2,1,1) if frame is judge else None
         return workflow
 
+    def test_date_update_collect_stops_before_inputs_and_preserves_results(self):
+        frames = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 150)]
+        workflow = self._collection(frames, None, None, None)
+        workflow.date_update_notice = Mock(return_value={'updated': {'text': '日付が更新されました。'},
+                                                        'return_to_title': {'text': 'タイトルに戻ります。'}})
+        judgements = {'perfect': 1147, 'great': 1, 'total': 1148, 'total_matches_chart': True}
+        report = {'engine': 'native', 'completed': False, 'live_status': 'cleared', 'judgements': dict(judgements),
+                  'playback': {'release_confirmed': True, 'sent_actions': 5889,
+                               'release': {'reset_executed': True, 'release_proof': 'current-reset-jlog-and-cleanup'}}}
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, '需要重新登录'):
+            workflow.collect(report, Path(directory))
+        workflow.device.tap.assert_not_called()
+        workflow.device.back.assert_not_called()
+        self.assertTrue(report['requires_relogin'])
+        self.assertEqual(report['date_update_notice']['confirmation_frames'], 2)
+        self.assertEqual(report['judgements'], judgements)
+        self.assertEqual(report['live_status'], 'cleared')
+        self.assertFalse(report['completed'])
+        self.assertFalse(report.get('returned_home', False))
+        self.assertFalse(report.get('performance_completed', False))
+
+    def test_date_update_collect_without_current_release_cannot_claim_relogin(self):
+        frame = np.full((720, 1280, 3), 140, np.uint8)
+        workflow = self._collection([frame, InterruptedError('stop')], None, None, None)
+        workflow.date_update_notice = Mock(return_value={'date': True})
+        report = {'engine': 'native', 'playback': {'release_confirmed': True, 'sent_actions': 1, 'release': {}}}
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(InterruptedError):
+            workflow.collect(report, Path(directory))
+        workflow.date_update_notice.assert_not_called()
+        workflow.device.tap.assert_not_called()
+        workflow.device.back.assert_not_called()
+        self.assertFalse(report.get('requires_relogin', False))
+
+    def test_date_update_on_post_animation_confirmation_never_sends_back(self):
+        clear, first, second = [np.full((720, 1280, 3), value, np.uint8) for value in (130, 140, 150)]
+        workflow = self._collection([clear, first, second], clear, None, None)
+        workflow.date_update_notice = Mock(side_effect=[None, {'date': True}, {'date': True}])
+        report = {'playback': {'release_confirmed': True}}
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, '需要重新登录'):
+            workflow.collect(report, Path(directory))
+        workflow.device.tap.assert_called_once_with(1279, 719)
+        workflow.device.back.assert_not_called()
+        self.assertTrue(report['requires_relogin'])
+
+    def test_collect_clear_or_home_never_bypasses_missing_current_release(self):
+        for destination in ('clear', 'home'):
+            for release in ({}, {'reset_executed': False, 'release_proof': 'current-reset-jlog-and-cleanup'},
+                            {'reset_executed': True, 'release_proof': 'reset-jlog-without-cleanup'}):
+                clear, home = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 160)]
+                workflow = self._collection([clear, home] if destination == 'clear' else [home], clear, None, None)
+                report = {'engine': 'native', 'completed': False, 'playback_error': 'RuntimeError: original ACK failure',
+                          'playback': {'release_confirmed': bool(release), 'sent_actions': 1, 'release': release}}
+                with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, '严格触点释放'):
+                    workflow.collect(report, Path(directory))
+                workflow.device.tap.assert_not_called()
+                workflow.device.back.assert_not_called()
+                self.assertFalse(report['completed'])
+                self.assertFalse(report.get('returned_home', False))
+                self.assertEqual(report['playback_error'], 'RuntimeError: original ACK failure')
+
+    def test_collect_rechecks_release_before_back_after_safe_animation_tap(self):
+        clear, other, home = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 150, 160)]
+        workflow = self._collection([clear, other, home], clear, None, None)
+        report = {'engine': 'native', 'playback': {'release_confirmed': True, 'sent_actions': 1,
+                  'release': {'reset_executed': True, 'release_proof': 'current-reset-jlog-and-cleanup'}}}
+        frames = iter((clear, other))
+        def screenshot():
+            frame = next(frames)
+            if frame is other:
+                report['playback']['release']['reset_executed'] = False
+            return frame
+        workflow.screenshot.side_effect = screenshot
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, '严格触点释放'):
+            workflow.collect(report, Path(directory))
+        workflow.device.tap.assert_called_once_with(1279, 719)
+        workflow.device.back.assert_not_called()
+
     def test_failed_banner_keeps_round_failed_after_reading_judgements(self):
         failed,judge,other,home=[np.full((720,1280,3),value,np.uint8) for value in [180,190,200,210]]
         workflow=self._collection([failed,other,judge,judge,other,home],None,failed,judge)
-        report={'chart':{'total_note_count':259}}
+        report={'engine':'legacy','playback':{'release_confirmed':True},'chart':{'total_note_count':259}}
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError,'演出失败'):
                 workflow.collect(report,Path(directory))
@@ -174,7 +575,7 @@ class SoloTests(unittest.TestCase):
     def test_unreadable_result_at_home_is_recorded_as_warning(self):
         clear, other, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
         workflow = self._collection([clear, other, home, home], clear, None, None)
-        report = {'chart': {'total_note_count': 259}}
+        report = {'engine':'legacy','playback':{'release_confirmed':True},'chart': {'total_note_count': 259}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report, Path(directory))
         self.assertFalse(report['completed'])
@@ -185,7 +586,7 @@ class SoloTests(unittest.TestCase):
     def test_result_note_mismatch_preserves_numbers_without_stopping(self):
         clear, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
         workflow = self._collection([clear, judge, judge, home, home], clear, None, judge)
-        report = {'chart': {'total_note_count': 260}}
+        report = {'engine':'legacy','playback':{'release_confirmed':True},'chart': {'total_note_count': 260}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report, Path(directory))
         self.assertFalse(report['completed'])
@@ -196,7 +597,7 @@ class SoloTests(unittest.TestCase):
     def test_home_after_animation_tap_prevents_another_back(self):
         clear,judge,other,home=[np.full((720,1280,3),value,np.uint8) for value in [180,190,200,210]]
         workflow=self._collection([clear,other,judge,judge,home,home],clear,None,judge)
-        report={'chart':{'total_note_count':259}}
+        report={'engine':'legacy','playback':{'release_confirmed':True},'chart':{'total_note_count':259}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report,Path(directory))
         self.assertTrue(report['completed'])
@@ -206,7 +607,7 @@ class SoloTests(unittest.TestCase):
     def test_judgement_page_arriving_in_confirmation_frame_is_read_before_back(self):
         clear,judge,home=[np.full((720,1280,3),value,np.uint8) for value in [180,190,210]]
         workflow=self._collection([clear,judge,judge,home,home],clear,None,judge)
-        report={'chart':{'total_note_count':259}}
+        report={'engine':'legacy','playback':{'release_confirmed':True},'chart':{'total_note_count':259}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report,Path(directory))
         self.assertTrue(report['completed'])
@@ -216,7 +617,7 @@ class SoloTests(unittest.TestCase):
     def test_live_clear_banner_in_confirmation_frame_counts_only_after_result_and_home(self):
         other,clear,judge,home=[np.full((720,1280,3),value,np.uint8) for value in [170,180,190,210]]
         workflow=self._collection([other,clear,judge,judge,home,home],clear,None,judge)
-        report={'chart':{'total_note_count':259}}
+        report={'engine':'legacy','playback':{'release_confirmed':True},'chart':{'total_note_count':259}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report,Path(directory))
         self.assertTrue(report['completed'])
@@ -406,24 +807,53 @@ class SoloTests(unittest.TestCase):
                 workflow.ensure_bonus_available('large',1,report,Path(directory))
         self.assertEqual(workflow.navigator._recover_and_verify.call_count,2)
 
-    def test_confirmed_drink_progress_is_persisted_before_a_later_bottle_fails(self):
+    def test_confirmed_batch_is_persisted_before_notice_dismissal_fails(self):
         workflow, report = self._availability_workflow([2])
         frame = np.zeros((720,1280,3),np.uint8)
-        workflow.read_available_bonus = Mock(side_effect=[(3,Reading('3/50',.99)),(4,Reading('4/50',.99))])
-        def partial(before, mode, count, *, on_recovered):
-            on_recovered(1,frame)
-            on_recovered(2,frame)
-            raise RuntimeError('后续饮料等待失败')
-        workflow.navigator._recover_and_verify.side_effect = partial
+        workflow.read_available_bonus = Mock(return_value=(7,Reading('7/50',.99)))
+        def recovered(before, mode, count, *, on_recovered):
+            on_recovered(count,frame)
+            raise RuntimeError('完成提示关闭失败')
+        workflow.navigator._recover_and_verify.side_effect = recovered
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError,'后续饮料'):
+            with self.assertRaisesRegex(RuntimeError,'完成提示'):
                 workflow.ensure_bonus_available('small',5,report,Path(directory))
             saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
-        self.assertEqual(saved['recovery']['completed_bottles'],2)
-        self.assertEqual(saved['recovery']['available_after'],4)
+        self.assertEqual(saved['recovery']['completed_bottles'],5)
+        self.assertEqual(saved['recovery']['available_after'],7)
         self.assertEqual(saved['recovery']['requested_bottles'],5)
+        self.assertEqual(saved['recovery']['status'],'credited')
         workflow.navigator._recover_and_verify.assert_called_once()
         workflow.navigator.ensure_auto.assert_not_called()
+
+    def test_failed_batch_keeps_actual_readings_without_claiming_all_bottles(self):
+        workflow, report = self._availability_workflow([2])
+        workflow.navigator.recovery_evidence = {'available_before':2, 'available_after':3,
+                                                'expected_increase':5, 'ok_requested':True}
+        workflow.navigator._recover_and_verify.side_effect = RuntimeError('未足额到账')
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError,'未足额'):
+                workflow.ensure_bonus_available('small',5,report,Path(directory))
+            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['recovery']['completed_bottles'],0)
+        self.assertEqual(saved['recovery']['available_after'],3)
+        self.assertEqual(saved['recovery']['status'],'started')
+        workflow.navigator._recover_and_verify.assert_called_once()
+
+    def test_new_report_inherits_unconfirmed_batch_and_never_reselects(self):
+        workflow,report = self._availability_workflow([4])
+        workflow.navigator.recovery_evidence = {'status':'started','ok_requested':True,
+            'requested_bottles':5,'completed_bottles':0,'available_before':2,'available_after':5}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError,'先前已请求'):
+                workflow.ensure_bonus_available('small',5,report,Path(directory))
+            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
+        self.assertTrue(saved['recovery']['inherited_pending_batch'])
+        self.assertEqual(saved['recovery']['current_available'],4)
+        self.assertEqual(saved['recovery']['available_before'],2)
+        self.assertEqual(saved['recovery']['available_after'],5)
+        workflow.navigator.tap.assert_not_called()
+        workflow.navigator._recover_and_verify.assert_not_called()
 
     def test_recovery_still_insufficient_stops_without_extra_drinks_or_lowering_consumption(self):
         workflow,report = self._availability_workflow([0,1])
@@ -553,6 +983,162 @@ class SoloTests(unittest.TestCase):
         self.assertFalse(reports[0]['completed'])
         self.assertTrue(reports[1]['completed'])
 
+    def test_start_detects_two_preplay_zero_frames_without_extra_capture_or_ocr(self):
+        frame = np.full((720, 1280, 3), 50, np.uint8)
+        zero = np.zeros((29, 97, 3), np.uint8)
+        zero[8:20, 43:49] = 255
+        frame[8:37, 1090:1187] = zero
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device = Mock()
+        workflow.navigator = Mock(threshold=.83, templates={'life_hud': frame})
+        workflow.navigator.zero_life_template = ZeroLifeTemplate(zero)
+        workflow.navigator.match.side_effect = lambda image, name, *args: (float(name == 'life_hud'), (0, 0))
+        workflow.life_guard = LifeGuard()
+        workflow.matcher = Mock()
+        workflow.matcher.match.side_effect = ValueError('尚未确认开场身份')
+        workflow.log = Mock()
+        clock = SimpleNamespace(now=0.)
+        def capture():
+            clock.now += 1.
+            return frame
+        workflow.screenshot = Mock(side_effect=capture)
+        workflow.pause = lambda _: None
+        workflow.read_optional_number = Mock(side_effect=AssertionError('禁止追加OCR'))
+        report = {"requested_difficulty": "easy"}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.time.perf_counter', side_effect=lambda: clock.now), self.assertRaises(LifeDepleted):
+            workflow.start(None, None, report, Path(directory), ready_action=lambda: None, opening_timeout=10.)
+        self.assertEqual(workflow.screenshot.call_count, 3)
+        workflow.device.screenshot.assert_not_called()
+        workflow.read_optional_number.assert_not_called()
+        self.assertTrue(report['preplay_death_confirmed'])
+
+    def test_preplay_life_unknown_healthy_and_missing_template_never_mean_death(self):
+        zero = np.zeros((29, 97, 3), np.uint8)
+        zero[8:20, 43:49] = 255
+        for mode in ('healthy_bar', 'number_1000', 'missing_life', 'missing_template', 'blank'):
+            with self.subTest(mode=mode):
+                workflow = SoloLive.__new__(SoloLive)
+                frame = np.full((720, 1280, 3), 50, np.uint8)
+                frame[8:37, 1090:1187] = zero
+                if mode == 'healthy_bar': frame[40:48, 1008:1177] = (0, 255, 0)
+                if mode == 'number_1000': frame[8:25, 1091:1101] = 255
+                if mode == 'blank': frame[:] = 0
+                workflow.life_guard = LifeGuard()
+                workflow.navigator = Mock(threshold=.83, templates={'life_hud': frame})
+                workflow.navigator.zero_life_template = None if mode == 'missing_template' else ZeroLifeTemplate(zero)
+                workflow.navigator.match.return_value = (0. if mode == 'missing_life' else 1., (0, 0))
+                workflow.read_optional_number = Mock(side_effect=AssertionError('禁止开场OCR'))
+                report = {}
+                for when in (10., 10.1, 12.):
+                    workflow.observe_preplay_life(frame, when, report)
+                self.assertFalse(workflow.life_guard.zero_confirmed)
+                self.assertEqual(len(report['preplay_life_monitor']['samples']), 2)
+                workflow.read_optional_number.assert_not_called()
+
+    def test_preplay_followup_requires_current_release_and_healthy_recheck_does_not_exit(self):
+        workflow = SoloLive.__new__(SoloLive)
+        frame = np.full((720, 1280, 3), 50, np.uint8)
+        zero = np.zeros((29, 97, 3), np.uint8)
+        zero[8:20, 43:49] = 255
+        frame[8:37, 1090:1187] = zero
+        workflow.navigator = Mock(threshold=.83, templates={'life_hud': frame})
+        workflow.navigator.zero_life_template = ZeroLifeTemplate(zero)
+        workflow.navigator.match.return_value = (1., (0, 0))
+        workflow.life_guard = LifeGuard()
+        clock = SimpleNamespace(now=0.)
+        workflow.pause = lambda duration: setattr(clock, 'now', clock.now + duration)
+        workflow.screenshot = Mock(return_value=frame)
+        report = {'engine': 'native', 'playback': {'engine': 'native', 'sent_actions': 0, 'release_confirmed': True}}
+        workflow.observe_preplay_life(frame, 0., report)
+        self.assertFalse(workflow.recheck_failed_preplay_life(report))
+        workflow.screenshot.assert_not_called()
+        report['playback']['release'] = {'release_proof': 'no-touch-possible-and-cleanup'}
+        frame[40:48, 1008:1177] = (0, 255, 0)
+        with patch('project_sekai.solo_live.time.perf_counter', side_effect=lambda: clock.now):
+            self.assertFalse(workflow.recheck_failed_preplay_life(report))
+        self.assertFalse(workflow.life_guard.zero_confirmed)
+        self.assertEqual(workflow.life_guard.zero_streak, 0)
+        workflow.screenshot.assert_called_once()
+
+    def test_anchor_failure_with_one_strict_zero_rechecks_once_after_native_cleanup(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device, workflow.log = Mock(), Mock()
+        workflow.stop_requested = lambda: False
+        workflow.repository = Mock()
+        workflow.repository.songs = {730: {'charts': {'easy': {'music_id': 730, 'difficulty': 'easy',
+            'sha256': 'hash', 'path': 'chart.sus', 'total_note_count': 1}}}}
+        identity = SimpleNamespace(song_id=730, to_dict=lambda: {'song_id': 730})
+        workflow.select = Mock(return_value=(identity, np.zeros((1, 1, 3), np.uint8)))
+        workflow.prepare_bonus, workflow.ensure_bonus_available, workflow.collect = Mock(), Mock(), Mock()
+        frame = np.full((720, 1280, 3), 50, np.uint8)
+        zero = np.zeros((29, 97, 3), np.uint8)
+        zero[8:20, 43:49] = 255
+        frame[8:37, 1090:1187] = zero
+        workflow.navigator = Mock(threshold=.83, templates={'life_hud': frame})
+        workflow.navigator.zero_life_template = ZeroLifeTemplate(zero)
+        workflow.navigator.match.return_value = (1., (0, 0))
+        clock = SimpleNamespace(now=0.)
+        workflow.pause = lambda duration: setattr(clock, 'now', clock.now + duration)
+        workflow.screenshot = Mock(return_value=frame)
+        order = []
+        player = Mock()
+        player.report = {'engine': 'native', 'planned_actions': 1, 'sent_actions': 0, 'executed_actions': 0, 'release_confirmed': False}
+        def failed(chart, identity, report, directory):
+            workflow.observe_preplay_life(frame, clock.now, report)
+            self.assertEqual(workflow.life_guard.zero_streak, 1)
+            raise RuntimeError('原首音两秒门槛拒绝')
+        def close():
+            order.append('release')
+            player.report.update(release_confirmed=True, release={'release_proof': 'no-touch-possible-and-cleanup'})
+        player.close.side_effect = close
+        workflow.start = Mock(side_effect=failed)
+        workflow.exit_depleted_live = Mock(side_effect=lambda *args: order.append('exit'))
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.perf_counter', side_effect=lambda: clock.now), patch('project_sekai.solo_live.parse_sus') as parse, patch('project_sekai.solo_live.compile_touches', return_value=[]), patch('project_sekai.native_player.NativePlayer', return_value=player), self.assertRaises(LifeDepleted):
+            workflow.report_root = Path(directory)
+            parse.return_value.duration = 1.
+            workflow.run(1, 'easy', 'current', engine='native')
+        self.assertEqual(order, ['release', 'exit'])
+        self.assertGreaterEqual(clock.now, 2.)
+        workflow.screenshot.assert_called_once()
+        self.assertIn('原首音', workflow.last_report['error'])
+        self.assertTrue(workflow.last_report['preplay_death_confirmed'])
+        player.play.assert_not_called()
+        workflow.collect.assert_not_called()
+
+    def test_native_preplay_death_closes_original_player_before_solo_exit(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.device, workflow.log = Mock(), Mock()
+        workflow.stop_requested = lambda: False
+        workflow.repository = Mock()
+        workflow.repository.songs = {730: {'charts': {'easy': {'music_id': 730, 'difficulty': 'easy',
+            'sha256': 'hash', 'path': 'chart.sus', 'total_note_count': 1}}}}
+        identity = SimpleNamespace(song_id=730, to_dict=lambda: {'song_id': 730})
+        workflow.select = Mock(return_value=(identity, np.zeros((1, 1, 3), np.uint8)))
+        workflow.prepare_bonus, workflow.ensure_bonus_available = Mock(), Mock()
+        workflow.collect = Mock()
+        order = []
+        player = Mock()
+        player.report = {'engine': 'native', 'planned_actions': 1, 'sent_actions': 0, 'executed_actions': 0, 'release_confirmed': False}
+        def dying(chart, identity, report, directory):
+            report['preplay_death_confirmed'] = True
+            report['death_confirmed'] = True
+            workflow.life_guard.zero_confirmed = True
+            raise LifeDepleted('开场两帧真实生命零')
+        def close():
+            order.append('release')
+            player.report.update(release_confirmed=True, release={'release_proof': 'no-touch-possible-and-cleanup'})
+        player.close.side_effect = close
+        workflow.start = Mock(side_effect=dying)
+        workflow.exit_depleted_live = Mock(side_effect=lambda *args: order.append('exit'))
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.parse_sus') as parse, patch('project_sekai.solo_live.compile_touches', return_value=[]), patch('project_sekai.native_player.NativePlayer', return_value=player), self.assertRaises(LifeDepleted):
+            workflow.report_root = Path(directory)
+            parse.return_value.duration = 1.
+            workflow.run(1, 'easy', 'current', engine='native')
+        self.assertEqual(order, ['release', 'exit'])
+        player.play.assert_not_called()
+        workflow.collect.assert_not_called()
+        self.assertEqual(workflow.completed_rounds, 0)
+
     def _opening_workflow(self, sequence, identities):
         workflow = SoloLive.__new__(SoloLive)
         workflow.device = Mock()
@@ -579,6 +1165,29 @@ class SoloTests(unittest.TestCase):
         self.assertEqual(report['final_identity']['song_id'],730)
         workflow.matcher.match.assert_called_once()
         workflow.log.assert_not_called()
+
+    def test_dense_context_comes_from_actual_chart_before_and_after_final_identity(self):
+        first = Gesture((Point(1., 2, 12, 2),), 'tap', critical=True)
+        followers = tuple(Gesture((Point(1. + index * .016, 3, 10, 6),), 'trace', critical=True)
+                          for index in range(1, 5))
+        chart = Chart((first, *followers), 480, ((0., 120.),))
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                final, playing = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 160)]
+                identity = SimpleNamespace(song_id=814, difficulty='expert', title='song', to_dict=lambda: {'song_id': 814})
+                workflow = self._opening_workflow([final, playing], [identity])
+                loaded = Mock(return_value=chart)
+                with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.StartAnchor') as factory:
+                    factory.return_value.observe.return_value = 123.
+                    factory.return_value.samples = []
+                    factory.return_value.fit = {}
+                    self.assertEqual(workflow.start(None if deferred else chart, identity, {}, Path(directory),
+                                                    on_final_identity=loaded if deferred else None), 123.)
+                    self.assertEqual(factory.call_args.kwargs['dense_following_gestures'], followers)
+                    self.assertEqual(factory.call_args.kwargs['simultaneous_gestures'], ())
+                    factory.assert_called_once()
+                if deferred:
+                    loaded.assert_called_once_with(identity)
 
     def test_loading_frames_are_retried_until_opening_cover_and_title_match(self):
         loading,final,playing = [np.full((720,1280,3),value,np.uint8) for value in [255,140,160]]
@@ -639,6 +1248,71 @@ class SoloTests(unittest.TestCase):
             self.assertFalse(any(np.array_equal(image,frames[1]) for image in pixels))
             self.assertEqual([item['captured_at'] for item in saved],sorted(item['captured_at'] for item in saved))
 
+    def test_anchor_evidence_keeps_all_early_accepted_samples_with_capacity(self):
+        final = np.full((80, 160, 3), 10, np.uint8)
+        frames = [np.full((80, 160, 3), value, np.uint8) for value in range(20, 60)]
+        identity = SimpleNamespace(song_id=730, difficulty='normal', title='song', to_dict=lambda: {'song_id': 730})
+        workflow = self._opening_workflow([final] + frames, [identity])
+        workflow.navigator.match.side_effect = lambda frame, name, *args: (float(name == 'playing' and frame is not final), (0, 0))
+        chart = SimpleNamespace(first=SimpleNamespace(start=4.), gestures=[])
+        report = {}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.StartAnchor') as factory:
+            anchor = factory.return_value
+            anchor.samples = []
+            anchor.failure_reason = None
+            def observe(frame, when, **kwargs):
+                if frame is frames[1] or frame is frames[2]:
+                    anchor.samples.append((when, 213. if frame is frames[1] else 217.))
+                if frame is frames[-1]:
+                    raise RuntimeError('轨迹失败')
+                return None
+            anchor.observe.side_effect = observe
+            with self.assertRaisesRegex(RuntimeError, '轨迹失败'):
+                workflow.start(chart, identity, report, Path(directory))
+            retained = [read_image(Path(directory) / item['path']) for item in report['anchor_frames']]
+            for frame in frames[1:3]:
+                self.assertTrue(any(np.array_equal(frame, image) for image in retained))
+            self.assertLessEqual(len(retained), 65)
+            self.assertEqual(report['anchor_attempt']['sample_frames_retained'], 2)
+            self.assertFalse(report['anchor_attempt']['sample_frames_truncated'])
+
+    def test_optional_room_deadline_provider_can_extend_only_pre_final_wait(self):
+        first = np.full((80, 160, 3), 10, np.uint8)
+        playing = np.full((80, 160, 3), 20, np.uint8)
+        identity = SimpleNamespace(song_id=730, difficulty='normal', title='song', to_dict=lambda: {'song_id': 730})
+        workflow = self._opening_workflow([first, playing], [ValueError('身份尚未明确'), identity])
+        clock = SimpleNamespace(now=0.)
+        workflow.pause = lambda _: setattr(clock, 'now', 2.)
+        provider = Mock(side_effect=[1., 1000.])
+        chart = SimpleNamespace(first=SimpleNamespace(start=4.), gestures=[])
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.StartAnchor') as factory:
+            factory.return_value.samples = []
+            factory.return_value.fit = {}
+            factory.return_value.observe.return_value = 123.
+            self.assertEqual(workflow.start(chart, identity, {}, Path(directory), ready_action=lambda: None,
+                                           opening_timeout=1., opening_deadline_provider=provider), 123.)
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(workflow.matcher.match.call_count, 2)
+
+    def test_room_deadline_provider_stops_after_final_identity_and_keeps_fixed_120_seconds(self):
+        final = np.full((80, 160, 3), 10, np.uint8)
+        playing = np.full((80, 160, 3), 20, np.uint8)
+        identity = SimpleNamespace(song_id=730, difficulty='normal', title='song', to_dict=lambda: {'song_id': 730})
+        workflow = self._opening_workflow([final, playing], [identity])
+        clock = SimpleNamespace(now=0.)
+        workflow.pause = lambda _: setattr(clock, 'now', 131.)
+        provider = Mock(return_value=1000.)
+        chart = SimpleNamespace(first=SimpleNamespace(start=4.), gestures=[])
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.StartAnchor') as factory:
+            factory.return_value.samples = []
+            factory.return_value.observe.return_value = 123.
+            with self.assertRaisesRegex(RuntimeError, '锚点未确认'):
+                workflow.start(chart, identity, {}, Path(directory), ready_action=lambda: None,
+                               opening_timeout=180, opening_deadline_provider=provider)
+            factory.return_value.observe.assert_not_called()
+        self.assertEqual(provider.call_count, 1)
+        workflow.matcher.match.assert_called_once()
+
     def test_success_defers_encoding_and_retains_early_candidate_frame(self):
         final=np.full((80,160,3),10,np.uint8)
         frames=[np.full((80,160,3),value,np.uint8) for value in range(20,60)]
@@ -660,54 +1334,3 @@ class SoloTests(unittest.TestCase):
             self.assertEqual(report['anchor_attempt']['sample_state'],'accepted')
             self.assertEqual(len(workflow.anchor_frames),33)
             self.assertTrue(any(np.array_equal(image,frames[1]) for _,image in workflow.anchor_frames))
-
-
-    def test_confirmed_batch_is_persisted_before_notice_dismissal_fails(self):
-        workflow, report = self._availability_workflow([2])
-        frame = np.zeros((720,1280,3),np.uint8)
-        workflow.read_available_bonus = Mock(return_value=(7,Reading('7/50',.99)))
-        def recovered(before, mode, count, *, on_recovered):
-            on_recovered(count,frame)
-            raise RuntimeError('完成提示关闭失败')
-        workflow.navigator._recover_and_verify.side_effect = recovered
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError,'完成提示'):
-                workflow.ensure_bonus_available('small',5,report,Path(directory))
-            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
-        self.assertEqual(saved['recovery']['completed_bottles'],5)
-        self.assertEqual(saved['recovery']['available_after'],7)
-        self.assertEqual(saved['recovery']['requested_bottles'],5)
-        self.assertEqual(saved['recovery']['status'],'credited')
-        workflow.navigator._recover_and_verify.assert_called_once()
-        workflow.navigator.ensure_auto.assert_not_called()
-
-
-    def test_failed_batch_keeps_actual_readings_without_claiming_all_bottles(self):
-        workflow, report = self._availability_workflow([2])
-        workflow.navigator.recovery_evidence = {'available_before':2, 'available_after':3,
-                                                'expected_increase':5, 'ok_requested':True}
-        workflow.navigator._recover_and_verify.side_effect = RuntimeError('未足额到账')
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError,'未足额'):
-                workflow.ensure_bonus_available('small',5,report,Path(directory))
-            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
-        self.assertEqual(saved['recovery']['completed_bottles'],0)
-        self.assertEqual(saved['recovery']['available_after'],3)
-        self.assertEqual(saved['recovery']['status'],'started')
-        workflow.navigator._recover_and_verify.assert_called_once()
-
-
-    def test_new_report_inherits_unconfirmed_batch_and_never_reselects(self):
-        workflow,report = self._availability_workflow([4])
-        workflow.navigator.recovery_evidence = {'status':'started','ok_requested':True,
-            'requested_bottles':5,'completed_bottles':0,'available_before':2,'available_after':5}
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError,'先前已请求'):
-                workflow.ensure_bonus_available('small',5,report,Path(directory))
-            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
-        self.assertTrue(saved['recovery']['inherited_pending_batch'])
-        self.assertEqual(saved['recovery']['current_available'],4)
-        self.assertEqual(saved['recovery']['available_before'],2)
-        self.assertEqual(saved['recovery']['available_after'],5)
-        workflow.navigator.tap.assert_not_called()
-        workflow.navigator._recover_and_verify.assert_not_called()
