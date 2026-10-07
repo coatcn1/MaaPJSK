@@ -431,9 +431,11 @@ class SoloLive:
             self.pause(.12)
         write_image(directory / "bonus.png", frame)
         report["bonus"] = {"requested_consumption": consumption, "consumption": target,
-                           "confirmed": True, "readings": readings, "original_consumption": original}
+                           "confirmed": False, "readings": readings, "original_consumption": original}
         self.navigator.tap(762, 655, f"保存 {target} 体力消耗")
         frame = self.navigator.wait(return_page)
+        # 菜单读数只证明当前选择；保存回执和实际返回成功之后才可缓存或宣称设置保留。
+        report["bonus"]["confirmed"] = True
         if not setup_playback:
             return
         self.prepare_playback(report, frame=frame)

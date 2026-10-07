@@ -744,14 +744,52 @@ class SoloTests(unittest.TestCase):
         self.assertNotIn((762,655),[call.args[:2] for call in workflow.navigator.tap.call_args_list])
 
     def test_task_snapshot_is_not_cached_after_setting_save_failure(self):
-        workflow = self._bonus_workflow(5)
-        workflow.navigator.wait.side_effect = RuntimeError('保存后未回到准备页')
-        snapshot = {}
-        with tempfile.TemporaryDirectory() as directory:
-            report = {'report_path': str(Path(directory) / 'report.json')}
-            with self.assertRaisesRegex(RuntimeError, '未回到准备页'):
-                workflow.prepare_task_bonus('current', report, Path(directory), snapshot)
-        self.assertEqual(snapshot, {})
+        for failure in ('save_request', 'return_page'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                workflow = self._bonus_workflow(5)
+                def tap(x, y, reason):
+                    if failure == 'save_request' and (x, y) == (762, 655):
+                        raise RuntimeError('保存请求失败')
+                workflow.navigator.tap.side_effect = tap
+                if failure == 'return_page':
+                    workflow.navigator.wait.side_effect = RuntimeError('保存后未回到准备页')
+                snapshot = {}
+                report = {'report_path': str(Path(directory) / 'report.json')}
+                with self.assertRaisesRegex(RuntimeError, '保存请求失败|未回到准备页'):
+                    workflow.prepare_task_bonus('current', report, Path(directory), snapshot)
+                self.assertEqual(snapshot, {})
+                self.assertFalse(report['bonus']['confirmed'])
+
+    def test_calibration_failed_setting_save_is_not_reported_as_retained(self):
+        from project_sekai.calibration import CalibrationProfiles, CalibrationRunner
+        from project_sekai.performance_settings import PerformanceSettings
+        for failure in ('save_request', 'return_page'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workflow = self._bonus_workflow(5)
+                workflow.stop_requested = lambda: False
+                workflow.restore_calibration_bonus = Mock(return_value={'confirmed': True, 'consumption': 5})
+                def tap(x, y, reason):
+                    if failure == 'save_request' and (x, y) == (762, 655):
+                        raise RuntimeError('保存请求失败')
+                workflow.navigator.tap.side_effect = tap
+                if failure == 'return_page':
+                    workflow.navigator.wait.side_effect = RuntimeError('保存后未回到准备页')
+                def run(*args, **kwargs):
+                    workflow.last_report = {'report_path': str(root / 'report.json')}
+                    workflow.prepare_task_bonus(kwargs['bonus_consumption'], workflow.last_report,
+                                                root, kwargs['_bonus_snapshot'])
+                    self.fail('保存失败不得进入校准演奏')
+                workflow.run = run
+                runner = CalibrationRunner(workflow, CalibrationProfiles(root / 'profiles'), {},
+                                           PerformanceSettings(), root / 'sessions', test_bonus_consumption=5)
+                with self.assertRaisesRegex(RuntimeError, '保存请求失败|未回到准备页'):
+                    runner.run('easy', 'current')
+                session = json.loads(next((root / 'sessions').glob('*/session.json')).read_text(encoding='utf-8'))
+                self.assertEqual(session['status'], 'failed')
+                self.assertFalse(workflow.last_report['bonus']['confirmed'])
+                self.assertNotIn('retained', session['bonus_restoration'])
+                workflow.restore_calibration_bonus.assert_called_once()
 
     def test_task_snapshot_inherits_current_setting_without_fresh_ocr(self):
         workflow = self._bonus_workflow(7)
