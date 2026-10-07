@@ -1406,6 +1406,7 @@ class CooperativeLive(SoloLive):
         self.room_progress = {}
         self.join_request_count = 0
         self.max_rematches = max_rematches
+        bonus_snapshot = {}
         reports = []
         self.safe_log(f"协力谱面演出：已完成 0 / 总数 {count}；{'自由' if room == 'free' else '资深'}公房；{difficulty.upper()}")
         while self.performed_rounds < count:
@@ -1420,6 +1421,9 @@ class CooperativeLive(SoloLive):
                       "requested_bonus_consumption": bonus_consumption, "completed": False,
                       "recovery_settings": {"mode": recovery_mode, "count": recovery_count}, "attempts": [],
                       "life_zero_policy": "release_then_android_home_and_stop"}
+            if bonus_snapshot:
+                # 新报告可能先在连接或入口失败，仍须说明本任务已确认的消耗来源。
+                report["bonus"] = dict(bonus_snapshot, confirmation_source="task_snapshot")
             self.current_report = self.last_report = report
             self.recovery_sample_frames = deque(maxlen=8)
             self.recovery_observation_count = 0
@@ -1431,8 +1435,9 @@ class CooperativeLive(SoloLive):
             try:
                 self.device.preflight()
                 self.open_rooms()
-                if not (self.resume_selection or self.resume_stage):
-                    self.prepare_bonus(bonus_consumption, report, directory, setup_playback=False, return_page="cooperative_room")
+                if bonus_snapshot or not (self.resume_selection or self.resume_stage):
+                    self.prepare_task_bonus(bonus_consumption, report, directory, bonus_snapshot,
+                                            return_page="cooperative_room")
                 for attempt in range(max_rematches - self.round_rematches + 1):
                     native_player = None
                     self.life_guard, self.life_frames = LifeGuard(bar_area=COOPERATIVE_LIFE_BAR), []

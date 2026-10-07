@@ -1212,7 +1212,9 @@ class CooperativeTests(unittest.TestCase):
         workflow.open_rooms = Mock()
         workflow.recover_runtime_failure = Mock(side_effect=InterruptedError("测试取消恢复等待"))
         workflow.pause = Mock(side_effect=InterruptedError("测试取消等待"))
-        workflow.prepare_bonus = Mock()
+        workflow.prepare_bonus = Mock(side_effect=lambda requested, report, *args, **kwargs: report.update(bonus={
+            'requested_consumption': requested, 'consumption': 5, 'confirmed': True, 'original_consumption': 5,
+            'readings': [{'text': '5'}, {'text': '5'}]}))
         workflow.ensure_bonus_available = Mock()
         workflow.choose = Mock(return_value=(identity(), np.zeros((720, 1280, 3), np.uint8)))
         workflow.wait_page = Mock()
@@ -1407,6 +1409,19 @@ class CooperativeTests(unittest.TestCase):
         self.assertFalse(workflow.member_room_can_leave(frames['matching_full']))
         workflow.navigator.templates.pop('cooperative_member_decided')
         self.assertFalse(workflow.member_room_can_leave(frames['matching_decided']))
+
+
+
+    def test_cooperative_completed_rounds_reuse_consumption_but_check_available_each_round(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.run_workflow(Path(directory))
+            reports = self.execute(workflow, count=2)
+            self.assertEqual(workflow.prepare_bonus.call_count, 1)
+            self.assertEqual(workflow.ensure_bonus_available.call_count, 2)
+            self.assertEqual(reports[1]['bonus']['confirmation_source'], 'task_snapshot')
+            self.assertNotIn('readings', reports[1]['bonus'])
+            self.execute(workflow)
+            self.assertEqual(workflow.prepare_bonus.call_count, 2)
 
     def test_runtime_matching_exit_reaches_room_and_consumes_only_one_rematch(self):
         workflow, clock, frames = self.ui_workflow(['matching_decided', 'matching_decided', 'matching_decided', 'room', 'room'])

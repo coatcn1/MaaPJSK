@@ -436,6 +436,26 @@ class SoloLive:
         frame = self.navigator.wait(return_page)
         if not setup_playback:
             return
+        self.prepare_playback(report, frame=frame)
+
+    def prepare_task_bonus(self, consumption, report, directory, snapshot, *, return_page="prepare"):
+        if snapshot:
+            # 后续局沿用本任务已保存的确认，不把历史读数包装成当前两帧检测。
+            report["bonus"] = dict(snapshot, confirmation_source="task_snapshot")
+            return
+        self.prepare_bonus(consumption, report, directory, setup_playback=False, return_page=return_page)
+        bonus = report["bonus"]
+        if bonus.get("confirmed") is not True:
+            raise RuntimeError("任务体力消耗尚未确认，拒绝缓存和开演")
+        bonus.update(confirmation_source="observed", source_report=report["report_path"])
+        # 只有菜单保存及返回成功才缓存；每局可用体力和回复证据不属于设置快照。
+        snapshot.update({key: bonus[key] for key in ("requested_consumption", "consumption", "confirmed",
+                                                   "original_consumption", "source_report")})
+
+    def prepare_playback(self, report, *, frame=None):
+        self.navigator.ensure_auto(False)
+        if frame is None:
+            frame = self.navigator.wait("prepare")
         # 轻量背景提供固定开场锚点，不修改用户的流速或游戏判定偏移。
         for _ in range(5):
             mode = self.ocr.read(frame, (43, 647, 153, 685))
@@ -448,7 +468,7 @@ class SoloLive:
         else:
             raise RuntimeError("未确认轻量演出，拒绝使用未知背景开演")
         self.navigator.ensure_auto(False)
-        self.log(f"每局消耗 {target} 体力已确认：AUTO 关闭、轻量背景")
+        self.log("本局演奏准备已确认：AUTO 关闭、轻量背景")
 
     def restore_calibration_bonus(self, consumption: int, directory: Path):
         frame = self.screenshot()
@@ -1208,7 +1228,7 @@ class SoloLive:
     def run(self, count: int, difficulty: str, song_mode: str, offset_ms: int = 0, *,
             bonus_consumption: str | int = "current", recovery_mode: str = "off", recovery_count: int = 1,
             engine: str = "legacy", latency_offsets: dict | None = None, calibration_profile: dict | None = None,
-            song_name: str | None = None):
+            song_name: str | None = None, _bonus_snapshot: dict | None = None):
         if difficulty not in {*DIFFICULTY_POINTS, "append"} or song_mode not in {"current", "random", "specified"}:
             raise ValueError("单人谱面任务选项无效")
         expected_song_id = self.resolve_specified_song(song_name, difficulty) if song_mode == "specified" else None
@@ -1222,6 +1242,8 @@ class SoloLive:
         if engine not in {"legacy", "native"}:
             raise ValueError("演奏引擎无效")
         self.completed_rounds = 0
+        # 普通 run 每次都是新任务；校准的排练与验证显式共用同一个任务快照。
+        bonus_snapshot = {} if _bonus_snapshot is None else _bonus_snapshot
         reports = []
         consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
         recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
@@ -1256,7 +1278,8 @@ class SoloLive:
                 self.set_performance_trace_plan(events)
                 report["chart"]["duration"] = chart.duration
                 report["chart"]["planned_actions"] = len(events)
-                self.prepare_bonus(bonus_consumption, report, directory)
+                self.prepare_task_bonus(bonus_consumption, report, directory, bonus_snapshot)
+                self.prepare_playback(report)
                 self.ensure_bonus_available(recovery_mode, recovery_count, report, directory)
                 if engine == "native":
                     from .native_player import NativePlayer

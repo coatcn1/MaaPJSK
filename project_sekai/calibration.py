@@ -197,6 +197,7 @@ class CalibrationRunner:
         session["initial_offset_source"] = source
         session["warm_seed_offset_ms"] = seed
         pending_profile = None
+        bonus_snapshot = {}
         try:
             _write_json(directory / "session.json", session)
             for index, stage in enumerate(("rehearsal", "formal-validation"), 1):
@@ -205,7 +206,7 @@ class CalibrationRunner:
                 reports = self.workflow.run(1, difficulty, song_mode if index == 1 else "current", offset,
                                             bonus_consumption=self.test_bonus_consumption, recovery_mode=self.test_recovery_mode,
                                             recovery_count=self.test_recovery_count,
-                                            engine="native", latency_offsets=latency)
+                                            engine="native", latency_offsets=latency, _bonus_snapshot=bonus_snapshot)
                 report = reports[-1]
                 session.setdefault("original_bonus_consumption", report.get("bonus", {}).get("original_consumption"))
                 if index == 2 and report["preparation_identity"]["song_id"] != session["rounds"][0]["song_id"]:
@@ -248,7 +249,8 @@ class CalibrationRunner:
             restoration_error = None
             if type(original) is int and hasattr(self.workflow, "restore_calibration_bonus"):
                 try:
-                    latest = getattr(self.workflow, "last_report", {}).get("bonus", {})
+                    # 后一局导航失败可能还未创建消耗证据；已保存的任务快照仍证明设置保留。
+                    latest = bonus_snapshot or getattr(self.workflow, "last_report", {}).get("bonus", {})
                     if latest.get("confirmed") is True and latest.get("consumption") == original:
                         # 已确认并且未改动的用户数量不重复打开菜单，也不掩盖准备页的原始错误。
                         session["bonus_restoration"] = {"confirmed": True, "consumption": original, "retained": True}

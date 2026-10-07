@@ -743,6 +743,33 @@ class SoloTests(unittest.TestCase):
                 workflow.prepare_bonus(3,{},Path(directory))
         self.assertNotIn((762,655),[call.args[:2] for call in workflow.navigator.tap.call_args_list])
 
+    def test_task_snapshot_is_not_cached_after_setting_save_failure(self):
+        workflow = self._bonus_workflow(5)
+        workflow.navigator.wait.side_effect = RuntimeError('保存后未回到准备页')
+        snapshot = {}
+        with tempfile.TemporaryDirectory() as directory:
+            report = {'report_path': str(Path(directory) / 'report.json')}
+            with self.assertRaisesRegex(RuntimeError, '未回到准备页'):
+                workflow.prepare_task_bonus('current', report, Path(directory), snapshot)
+        self.assertEqual(snapshot, {})
+
+    def test_task_snapshot_inherits_current_setting_without_fresh_ocr(self):
+        workflow = self._bonus_workflow(7)
+        snapshot = {}
+        with tempfile.TemporaryDirectory() as directory:
+            first = {'report_path': str(Path(directory) / 'first.json')}
+            workflow.prepare_task_bonus('current', first, Path(directory), snapshot)
+            workflow.read_bonus.reset_mock()
+            workflow.navigator.tap.reset_mock()
+            second = {'report_path': str(Path(directory) / 'second.json')}
+            workflow.prepare_task_bonus('current', second, Path(directory), snapshot)
+        self.assertEqual(second['bonus']['consumption'], 7)
+        self.assertEqual(second['bonus']['confirmation_source'], 'task_snapshot')
+        self.assertEqual(second['bonus']['source_report'], first['report_path'])
+        self.assertNotIn('readings', second['bonus'])
+        workflow.read_bonus.assert_not_called()
+        workflow.navigator.tap.assert_not_called()
+
     def test_bonus_settings_validate_limits_before_any_device_input(self):
         workflow = SoloLive.__new__(SoloLive)
         workflow.device = Mock()
@@ -855,6 +882,7 @@ class SoloTests(unittest.TestCase):
         workflow.navigator.tap.assert_not_called()
         workflow.navigator._recover_and_verify.assert_not_called()
 
+
     def test_recovery_still_insufficient_stops_without_extra_drinks_or_lowering_consumption(self):
         workflow,report = self._availability_workflow([0,1])
         with tempfile.TemporaryDirectory() as directory:
@@ -926,7 +954,10 @@ class SoloTests(unittest.TestCase):
                                                           'path':'chart.sus','total_note_count':1}}}}
         identity = SimpleNamespace(song_id=730,to_dict=lambda:{'song_id':730})
         workflow.select = Mock(return_value=(identity,np.zeros((1,1,3),np.uint8)))
-        workflow.prepare_bonus = Mock()
+        workflow.prepare_bonus = Mock(side_effect=lambda requested, report, *args, **kwargs: report.update(bonus={
+            'requested_consumption': requested, 'consumption': 5, 'confirmed': True, 'original_consumption': 5,
+            'readings': [{'text': '5'}, {'text': '5'}]}))
+        workflow.prepare_playback = Mock()
         workflow.ensure_bonus_available = Mock()
         workflow.start = Mock(return_value=0)
         workflow.play = Mock()
@@ -936,12 +967,24 @@ class SoloTests(unittest.TestCase):
               patch('project_sekai.solo_live.compile_touches',return_value=[])):
             workflow.report_root = Path(directory)
             parse.return_value.duration = 1.0
-            workflow.run(2,'easy','current',bonus_consumption=5,recovery_mode='small',recovery_count=3)
+            reports = workflow.run(2,'easy','current',bonus_consumption=5,recovery_mode='small',recovery_count=3)
         self.assertEqual(workflow.completed_rounds,2)
-        self.assertEqual(workflow.prepare_bonus.call_count,2)
+        self.assertEqual(workflow.prepare_bonus.call_count,1)
+        self.assertEqual(workflow.prepare_playback.call_count,2)
+        self.assertEqual(reports[1]['bonus']['confirmation_source'], 'task_snapshot')
+        self.assertEqual(reports[1]['bonus']['source_report'], reports[0]['report_path'])
+        self.assertNotIn('readings', reports[1]['bonus'])
         self.assertTrue(all(call.args[0]==5 for call in workflow.prepare_bonus.call_args_list))
         self.assertTrue(all(call.args[:2]==('small',3) for call in workflow.ensure_bonus_available.call_args_list))
         workflow.restore_bonus.assert_not_called()
+
+        with (tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.parse_sus') as parse,
+              patch('project_sekai.solo_live.compile_touches', return_value=[])):
+            workflow.report_root = Path(directory)
+            parse.return_value.duration = 1.0
+            fresh = workflow.run(1, 'easy', 'current', bonus_consumption=5)
+        self.assertEqual(workflow.prepare_bonus.call_count, 2)
+        self.assertEqual(fresh[0]['bonus']['confirmation_source'], 'observed')
 
     def test_partial_solo_result_continues_and_persists_before_progress(self):
         workflow = SoloLive.__new__(SoloLive)
@@ -953,7 +996,8 @@ class SoloTests(unittest.TestCase):
             'music_id': 730, 'difficulty': 'easy', 'sha256': 'hash', 'path': 'chart.sus', 'total_note_count': 259}}}}
         selected = SimpleNamespace(song_id=730, to_dict=lambda: {'song_id': 730})
         workflow.select = Mock(return_value=(selected, np.zeros((1, 1, 3), np.uint8)))
-        workflow.prepare_bonus = Mock()
+        workflow.prepare_task_bonus = Mock()
+        workflow.prepare_playback = Mock()
         workflow.ensure_bonus_available = Mock()
         workflow.start = Mock(return_value=0)
         workflow.play = Mock()
@@ -1069,7 +1113,8 @@ class SoloTests(unittest.TestCase):
             'sha256': 'hash', 'path': 'chart.sus', 'total_note_count': 1}}}}
         identity = SimpleNamespace(song_id=730, to_dict=lambda: {'song_id': 730})
         workflow.select = Mock(return_value=(identity, np.zeros((1, 1, 3), np.uint8)))
-        workflow.prepare_bonus, workflow.ensure_bonus_available, workflow.collect = Mock(), Mock(), Mock()
+        workflow.prepare_task_bonus, workflow.ensure_bonus_available, workflow.collect = Mock(), Mock(), Mock()
+        workflow.prepare_playback = Mock()
         frame = np.full((720, 1280, 3), 50, np.uint8)
         zero = np.zeros((29, 97, 3), np.uint8)
         zero[8:20, 43:49] = 255
@@ -1114,7 +1159,8 @@ class SoloTests(unittest.TestCase):
             'sha256': 'hash', 'path': 'chart.sus', 'total_note_count': 1}}}}
         identity = SimpleNamespace(song_id=730, to_dict=lambda: {'song_id': 730})
         workflow.select = Mock(return_value=(identity, np.zeros((1, 1, 3), np.uint8)))
-        workflow.prepare_bonus, workflow.ensure_bonus_available = Mock(), Mock()
+        workflow.prepare_task_bonus, workflow.ensure_bonus_available = Mock(), Mock()
+        workflow.prepare_playback = Mock()
         workflow.collect = Mock()
         order = []
         player = Mock()
