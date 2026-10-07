@@ -425,7 +425,8 @@ class CooperativeLive(SoloLive):
         return frame
 
     def open_rooms(self):
-        if getattr(self, "resume_selection", False):
+        if (getattr(self, "resume_selection", False)
+                or getattr(self, "resume_stage", None) in {"select", "shuffle", "ready", "cancel"}):
             return
         self.matched = False
         if getattr(self, "entry_deadline", None) is None:

@@ -1410,7 +1410,66 @@ class CooperativeTests(unittest.TestCase):
         workflow.navigator.templates.pop('cooperative_member_decided')
         self.assertFalse(workflow.member_room_can_leave(frames['matching_decided']))
 
+    def test_real_recovery_run_resumes_shuffle_ready_and_cancel_without_entry_timeout(self):
+        for state in ('shuffle', 'ready', 'cancel'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                workflow = self.run_workflow(Path(directory))
+                states = ([state] * 4 + ['ready'] * 12) if state == 'shuffle' else [state] * 16
+                ui, clock, frames = self.ui_workflow(states)
+                workflow.screenshot, workflow.pause, workflow.navigator = ui.screenshot, ui.pause, ui.navigator
+                workflow.device.screenshot.side_effect = ui.screenshot
+                workflow.stop_requested = lambda: clock.now > 80.
+                workflow.ocr, workflow.matcher = Mock(), Mock()
+                workflow.ocr.read.return_value = Reading('軽量', 1.)
+                workflow.matcher.match.return_value = identity()
+                entry_calls = 0
+                def open_rooms():
+                    nonlocal entry_calls
+                    entry_calls += 1
+                    if entry_calls > 1:
+                        return CooperativeLive.open_rooms(workflow)
+                workflow.open_rooms = open_rooms
+                workflow.recover_runtime_failure = lambda *args: CooperativeLive.recover_runtime_failure(workflow, *args)
+                workflow.wait_page = lambda *args, **kwargs: CooperativeLive.wait_page(workflow, *args, **kwargs)
+                calls = 0
+                def choose(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        workflow.matched = True
+                        args[3]['joined_room'] = True
+                        raise OSError('房内连接回执失败')
+                    return CooperativeLive.choose(workflow, *args)
+                workflow.choose.side_effect = choose
+                def start(chart, actual, report, target, *, on_final_identity):
+                    if actual is None:
+                        on_final_identity(identity())
+                    report['final_identity'] = identity().to_dict()
+                    return 0.
+                workflow.start.side_effect = start
+                with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+                    reports = self.execute(workflow)
+                self.assertEqual(workflow.performed_rounds, 1)
+                self.assertEqual(calls, 2)
+                self.assertEqual(entry_calls, 2)
+                self.assertEqual(workflow.round_rematches, 0)
+                self.assertLess(clock.now, 60.)
+                self.assertEqual(workflow.prepare_bonus.call_count, 1)
+                self.assertEqual(reports[-1]['bonus']['confirmation_source'], 'task_snapshot')
+                self.assertEqual(reports[-1]['bonus']['source_report'], reports[0]['report_path'])
+                self.assertNotIn('readings', reports[-1]['bonus'])
+                self.assertFalse(any(call.args[:2] in ((920, 245), (908, 536), (1070, 543))
+                                     for call in workflow.navigator.tap.call_args_list))
+                self.assertTrue(reports[-1]['final_identity'])
 
+    def test_unknown_resume_stage_cannot_skip_room_entry(self):
+        workflow, clock, _ = self.ui_workflow(['black'])
+        workflow.resume_stage = 'untrusted-stage'
+        workflow.entry_deadline = clock.now - 1.
+        with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), \
+                self.assertRaisesRegex(TimeoutError, '60 秒'):
+            workflow.open_rooms()
+        workflow.navigator.tap.assert_not_called()
 
     def test_cooperative_completed_rounds_reuse_consumption_but_check_available_each_round(self):
         with tempfile.TemporaryDirectory() as directory:
