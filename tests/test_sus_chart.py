@@ -1,10 +1,11 @@
 from pathlib import Path
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 import cv2
 import numpy as np
 
-from project_sekai.chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_y, validate_touches
+from project_sekai.chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_y, first_note_context, dense_first_note_context, validate_touches
 from project_sekai.sus_chart import Chart, Gesture, Point, parse_sus, slide_x
 
 
@@ -12,6 +13,233 @@ HEADER = '#REQUEST "ticks_per_beat 480"\n#00002:4\n#BPM01:120\n#00008:01\n'
 
 
 class SusTests(unittest.TestCase):
+    def dense_gold_chart(self):
+        first = Gesture((Point(1., 2, 12, 2),), 'tap', critical=True)
+        followers = tuple(Gesture((Point(1. + (index + 1) * .015957447, 3 if index % 2 == 0 else 2,
+                                                10 if index % 2 == 0 else 12, 6),), 'trace', critical=True) for index in range(4))
+        return Chart((first, *followers), 480, ((0., 120.),))
+
+    def dense_gold_frame(self, *, triangle=False, crossed_bottom=False):
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        orange = cv2.cvtColor(np.uint8([[[30, 180, 220]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        core = cv2.cvtColor(np.uint8([[[30, 70, 250]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        if crossed_bottom:
+            frame[300:640, 120:1150] = orange
+            frame[516:564, 140:1126] = core
+        else:
+            frame[80:298, 360:920] = orange
+            if triangle:
+                cv2.fillPoly(frame, [np.array([(365, 272), (910, 272), (640, 298)], np.int32)], tuple(int(value) for value in core))
+            else:
+                frame[272:298, 365:910] = core
+        return frame
+
+    def test_dense_gold_tap_trace_core_keeps_original_single_head_geometry(self):
+        chart = self.dense_gold_chart()
+        frame = self.dense_gold_frame()
+        self.assertIsNone(first_note_y(frame, chart.first))
+        detected = first_note_y(frame, chart.first, dense_following_gestures=dense_first_note_context(chart))
+        self.assertIsNotNone(detected)
+        self.assertAlmostEqual(detected, 285.)
+
+    def test_dense_context_rejects_invalid_source_and_timing(self):
+        chart = self.dense_gold_chart()
+        followers = chart.gestures[1:]
+        wrong = [(), followers[:2], (None, *followers[1:])]
+        for field in ('critical', 'flick', 'kind'):
+            value = {'critical': False, 'flick': 1, 'kind': 'tap'}[field]
+            wrong.append((replace(followers[0], **{field: value}), *followers[1:]))
+        for point in (Point(1., 3, 10, 6), Point(float('nan'), 3, 10, 6),
+                      Point(1.1, 3, 10, 6), Point(1.01, 2, 13, 6),
+                      Point(followers[0].start, 2, 10, 6)):
+            wrong.append((replace(followers[0], points=(point,)), *followers[1:]))
+        for context in wrong:
+            with self.subTest(context=context):
+                self.assertIsNone(first_note_y(self.dense_gold_frame(), chart.first, dense_following_gestures=context))
+                self.assertIsNone(first_note_y(self.dense_gold_frame(crossed_bottom=True), chart.first, dense_following_gestures=context))
+        simultaneous = Chart((chart.first, chart.first, *followers), 480, ((0., 120.),))
+        self.assertEqual(dense_first_note_context(simultaneous), ())
+
+    def test_dense_trace_only_triangle_and_passed_head_are_rejected(self):
+        chart = self.dense_gold_chart()
+        for frame in (self.dense_gold_frame(triangle=True), self.dense_gold_frame(crossed_bottom=True)):
+            self.assertIsNone(first_note_y(frame, chart.first, dense_following_gestures=dense_first_note_context(chart)))
+
+    def test_dense_context_preserves_primary_detection_and_other_colors(self):
+        chart = self.dense_gold_chart()
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        frame[272:298, 365:910] = cv2.cvtColor(np.uint8([[[30, 180, 250]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        baseline = first_note_y(frame, chart.first)
+        self.assertEqual(baseline, 285.)
+        self.assertEqual(first_note_y(frame, chart.first, dense_following_gestures=dense_first_note_context(chart)), baseline)
+        for first in (replace(chart.first, critical=False), replace(chart.first, flick=1),
+                      Gesture((Point(1., 2, 12, 1),), 'tap'), Gesture((Point(1., 2, 12, 5),), 'trace')):
+            self.assertIsNone(first_note_y(self.dense_gold_frame(), first, dense_following_gestures=chart.gestures[1:]))
+
+    def test_dense_anchor_forwards_only_valid_context(self):
+        chart = self.dense_gold_chart()
+        anchor = StartAnchor(chart.first, minimum_samples=4, dense_following_gestures=dense_first_note_context(chart))
+        anchor.observe(np.zeros((720, 1280, 3), np.uint8), 10.)
+        self.assertIsNone(anchor.observe(self.dense_gold_frame(), 10.1))
+        self.assertEqual(anchor.samples, [(10.1, 285.)])
+        with self.assertRaisesRegex(RuntimeError, '候选未确认运动'):
+            anchor.observe(self.dense_gold_frame(), 12.11)
+
+    def mixed_gold_chart(self):
+        first = Gesture((Point(0.,2,6,1),Point(2.5,2,3,2)), 'slide', critical=True)
+        right = Gesture((Point(0.,8,6,2),), 'tap', flick=1, critical=True)
+        return Chart((first,right),480,((0.,120.),))
+
+    def test_mixed_gold_slide_tap_uses_real_first_onset_group(self):
+        chart = self.mixed_gold_chart()
+        frame = np.zeros((720,1280,3),np.uint8)
+        frame[349:397,283:994] = (30,210,255)
+        self.assertIsNone(first_note_y(frame,chart.first))
+        self.assertEqual(first_note_context(chart),chart.gestures)
+        self.assertEqual(first_note_y(frame,chart.first,simultaneous_gestures=first_note_context(chart)),373.)
+
+    def test_mixed_gold_context_rejects_missing_wrong_or_invalid_gestures(self):
+        chart = self.mixed_gold_chart()
+        first,right = chart.gestures
+        frame = np.zeros((720,1280,3),np.uint8)
+        frame[349:397,283:994] = (30,210,255)
+        wrong = [(),(right,), (first,replace(right,critical=False)),
+                 (first,replace(right,flick=0)), (first,replace(right,flick=True)), (replace(first,flick=1),right),
+                 (first,replace(right,points=(Point(.01,8,6,2),))),
+                 (first,replace(right,points=(Point(0.,9,5,2),))),
+                 (first,replace(right,points=(Point(0.,8,7,2),))),
+                 (first,replace(right,points=(Point(float('nan'),8,6,2),))),
+                 (first,replace(right,points=(Point(0.,8,6,1),))),
+                 (replace(first,points=(Point(0.,2,6,1),)),right),
+                 (first,right,right), (first,None)]
+        for context in wrong:
+            with self.subTest(context=context):
+                self.assertIsNone(first_note_y(frame,chart.first,simultaneous_gestures=context))
+                self.assertEqual(StartAnchor(chart.first,simultaneous_gestures=context).simultaneous_gestures,())
+
+    def test_actual_mixed_context_rejects_an_extra_other_color_onset(self):
+        chart = self.mixed_gold_chart()
+        extra = Gesture((Point(0.,4,2,1),),'tap')
+        self.assertEqual(first_note_context(Chart((*chart.gestures,extra),480,((0.,120.),))),())
+
+    def test_gold_slide_bottom_crop_is_rejected_with_or_without_context(self):
+        chart = self.mixed_gold_chart()
+        frame = np.zeros((720,1280,3),np.uint8)
+        frame[535:609,107:621] = (30,210,255)
+        for context in ((),chart.gestures,(None,)):
+            with self.subTest(context=context):
+                self.assertIsNone(first_note_y(frame,chart.first,simultaneous_gestures=context))
+                anchor = StartAnchor(chart.first,minimum_samples=4,simultaneous_gestures=context)
+                anchor.observe(np.zeros_like(frame),10.)
+                with self.assertRaisesRegex(RuntimeError,'首长条头已越过'):
+                    anchor.observe(frame,10.1)
+                self.assertEqual(anchor.failure_reason,'first_head_outside_window')
+                self.assertEqual(anchor.samples,[])
+
+    def test_gold_slide_upper_body_does_not_use_tap_upper_crop_gate(self):
+        chart = self.mixed_gold_chart()
+        frame = np.zeros((720,1280,3),np.uint8)
+        frame[0:47,596:638] = (30,210,255)
+        self.assertEqual(first_note_y(frame,chart.first),43.5)
+
+    def test_mixed_context_preserves_original_single_head_detection(self):
+        chart = self.mixed_gold_chart()
+        frame = np.zeros((720,1280,3),np.uint8)
+        frame[349:397,283:625] = (30,210,255)
+        baseline = first_note_y(frame,chart.first)
+        self.assertEqual(baseline,373.)
+        self.assertEqual(first_note_y(frame,chart.first,simultaneous_gestures=chart.gestures),baseline)
+
+    def test_dark_blue_background_needs_bright_note_core(self):
+        import cv2
+        gesture = Gesture((Point(0, 5, 3, 1),), 'tap')
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        dark = cv2.cvtColor(np.uint8([[[110, 200, 169]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        frame[200:210, 550:640] = dark
+        self.assertIsNone(first_note_y(frame, gesture))
+        frame[203:207, 570:610] = 255
+        self.assertAlmostEqual(first_note_y(frame, gesture), 205.)
+        frame[203:207, 570:610] = cv2.cvtColor(np.uint8([[[110, 200, 220]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        self.assertAlmostEqual(first_note_y(frame, gesture), 205.)
+
+    def test_adjacent_gold_first_bars_keep_real_bar_height(self):
+        gesture = Gesture((Point(1.9672131147540983, 2, 6, 2),), 'tap', flick=1, critical=True)
+        for left, right, y1, y2 in [(550, 730, 65, 77), (255, 1022, 381, 432)]:
+            with self.subTest(bounds=(left, y1, right - left, y2 - y1)):
+                frame = np.zeros((720, 1280, 3), np.uint8)
+                middle = (left + right) // 2
+                # 相邻金色双首音同色相连；完整横条高度仍是可信的真实路径观察。
+                frame[y1:y2, left:middle] = (30, 210, 255)
+                frame[y1:y2, middle:right] = (30, 210, 255)
+                detected = first_note_y(frame, gesture, simultaneous_gestures=(gesture,
+                    Gesture((Point(gesture.start, 8, 6, 2),), "tap", flick=1, critical=True)))
+                self.assertIsNotNone(detected)
+                self.assertAlmostEqual(detected, (y1 + y2) / 2., delta=1.)
+
+    def test_merged_bar_context_rejects_wrong_time_color_adjacency_or_missing_first(self):
+        first = Gesture((Point(1., 2, 6, 2),), 'tap', flick=1, critical=True)
+        right = Gesture((Point(1., 8, 6, 2),), 'tap', flick=1, critical=True)
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        frame[65:77, 550:730] = (30, 210, 255)
+        contexts = [(), (first, Gesture((Point(1.1, 8, 6, 2),), 'tap', flick=1, critical=True)),
+                    (first, Gesture((Point(1., 8, 6, 1),), 'tap', flick=1)),
+                    (first, Gesture((Point(1., 9, 5, 2),), 'tap', flick=1, critical=True)),
+                    (right,), (first, Gesture((Point(1., 8, 6, 2),), 'slide', flick=1, critical=True))]
+        for context in contexts:
+            with self.subTest(context=context):
+                self.assertIsNone(first_note_y(frame, first, simultaneous_gestures=context))
+
+    def test_actual_chart_first_context_excludes_later_gestures(self):
+        first = Gesture((Point(1., 2, 6, 2),), 'tap', flick=1, critical=True)
+        right = Gesture((Point(1., 8, 6, 2),), 'tap', flick=1, critical=True)
+        later = Gesture((Point(2., 8, 6, 2),), 'tap', flick=1, critical=True)
+        chart = Chart((first, right, later), 480, ((0., 120.),))
+        self.assertEqual(first_note_context(chart), (first, right))
+        anchor = StartAnchor(first, minimum_samples=4, simultaneous_gestures=first_note_context(chart))
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        anchor.observe(frame, 0.)
+        with patch('project_sekai.chart_player.first_note_y', return_value=None) as detect:
+            anchor.observe(frame, .1)
+        self.assertEqual(detect.call_args.kwargs['simultaneous_gestures'], (first, right))
+
+    def test_sparse_merged_foreground_cannot_claim_expected_window_width(self):
+        first = Gesture((Point(1., 2, 6, 2),), 'tap', flick=1, critical=True)
+        right = Gesture((Point(1., 8, 6, 2),), 'tap', flick=1, critical=True)
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        # 宽连接块只擦到首音窗口边缘；切分后真实宽度不足，不准虚构预期宽度。
+        frame[65:77, 645:730] = (30, 210, 255)
+        frame[65:77, 550:556] = (30, 210, 255)
+        frame[65:66, 550:730] = (30, 210, 255)
+        self.assertIsNone(first_note_y(frame, first, simultaneous_gestures=(first, right)))
+
+    def test_green_adjacent_hold_flick_context_keeps_original_detection(self):
+        first = Gesture((Point(1., 2, 6), Point(2., 2, 6)), 'slide', flick=1)
+        right = Gesture((Point(1., 8, 6), Point(2., 8, 6)), 'slide', flick=1)
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        frame[65:77, 550:730] = (80, 255, 30)
+        baseline = first_note_y(frame, first)
+        self.assertIsNone(baseline)
+        self.assertEqual(first_note_y(frame, first, simultaneous_gestures=(first, right)), baseline)
+
+    def test_legal_gold_flick_boundary_bar_keeps_original_clipped_height(self):
+        first = Gesture((Point(1., 2, 6, 2),), 'tap', flick=1, critical=True)
+        for bounds, expected in [((592, 35, 636, 47), 43.5), ((200, 522, 641, 549), 531.)]:
+            with self.subTest(bounds=bounds):
+                frame = np.zeros((720, 1280, 3), np.uint8)
+                x1, y1, x2, y2 = bounds
+                frame[y1:y2, x1:x2] = (30, 210, 255)
+                self.assertAlmostEqual(first_note_y(frame, first), expected)
+
+    def test_full_gold_arrow_crossing_vertical_mask_edges_is_not_a_bar(self):
+        gesture = Gesture((Point(1.9672131147540983, 2, 6, 2),), 'tap', flick=1, critical=True)
+        arrows = [np.array([(500, -20), (740, -20), (620, 62)], np.int32),
+                  np.array([(148, 466), (698, 466), (423, 650)], np.int32)]
+        for vertices in arrows:
+            with self.subTest(vertices=vertices.tolist()):
+                frame = np.zeros((720, 1280, 3), np.uint8)
+                cv2.fillPoly(frame, [vertices], (30, 210, 255))
+                self.assertIsNone(first_note_y(frame, gesture))
+
     def test_bpm_and_meter_changes_use_beats_not_measure_fraction(self):
         chart = parse_sus(HEADER + '#BPM02:240\n#00008:0002\n#00102:3\n#00112:14\n#00212:14')
         self.assertAlmostEqual(chart.gestures[0].start, 1.5)

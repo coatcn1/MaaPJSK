@@ -22,6 +22,45 @@ EARLY_TRAJECTORY = (
 
 
 class AnchorStabilityTests(unittest.TestCase):
+    def test_upward_background_candidate_never_becomes_motion_trajectory(self):
+        frame = np.zeros((1, 1, 3), np.uint8)
+        anchor = StartAnchor(Gesture((Point(0, 8, 3),), 'tap'), minimum_samples=4)
+        anchor.observe(frame, 9.)
+        with patch('project_sekai.chart_player.first_note_y', side_effect=[213., 209., *[74 * math.exp(3 * dt) - 30 for dt in (0., .2, .4, .6)]]):
+            anchor.observe(frame, 10.)
+            anchor.observe(frame, 10.266)
+            self.assertEqual(anchor.samples, [(10., 213.)])
+            anchor.observe(frame, 10.5)
+            self.assertEqual(anchor.samples, [(10.5, 44.)])
+            for when in [10.7, 10.9, 11.1]:
+                epoch = anchor.observe(frame, when, capture_seconds=.02)
+        self.assertIsNotNone(epoch)
+        self.assertEqual(len(anchor.samples), 4)
+
+    def test_high_single_candidate_cannot_restart_from_later_note(self):
+        frame = np.zeros((1, 1, 3), np.uint8)
+        anchor = StartAnchor(Gesture((Point(0, 8, 3),), 'tap'), minimum_samples=4)
+        anchor.baseline = frame
+        anchor.samples = [(10.1, 300.)]
+        with patch('project_sekai.chart_player.first_note_y', side_effect=[200., 260., 340., 440.]):
+            self.assertIsNone(anchor.observe(frame, 10.5, capture_seconds=.03))
+            self.assertEqual(anchor.samples, [(10.1, 300.)])
+            for when in (10.6, 10.7, 10.8):
+                self.assertIsNone(anchor.observe(frame, when, capture_seconds=.03))
+        with self.assertRaisesRegex(RuntimeError, '轨迹未通过'):
+            anchor.observe(frame, 12.11)
+
+    def test_established_downward_motion_cannot_be_reset_by_upward_noise(self):
+        frame = np.zeros((1, 1, 3), np.uint8)
+        anchor = StartAnchor(Gesture((Point(0, 8, 3),), 'tap'), minimum_samples=4)
+        anchor.baseline = frame
+        anchor.samples = [(10., 100.), (10.1, 120.)]
+        with patch('project_sekai.chart_player.first_note_y', return_value=116.):
+            anchor.observe(frame, 10.2)
+        self.assertEqual(anchor.samples, [(10., 100.), (10.1, 120.)])
+        with self.assertRaisesRegex(RuntimeError, '轨迹未通过'):
+            anchor.observe(frame, 12.01)
+
     def test_single_candidate_timeout_still_rejects_without_claiming_first_note_passed(self):
         anchor=StartAnchor(Gesture((Point(0,8,3),),'tap'),minimum_samples=4)
         anchor.baseline=np.zeros((1,1,3),np.uint8)
