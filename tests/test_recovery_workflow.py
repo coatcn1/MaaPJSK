@@ -35,6 +35,12 @@ class RecoveryButtonLayoutTests(unittest.TestCase):
     def test_unresponsive_plus_stops_without_confirming(self) -> None:
         self._exercise_selection(ignored_clicks=99, expected_clicks=3, fails=True)
 
+    def test_five_drinks_are_selected_before_one_decide_and_one_ok(self) -> None:
+        self._exercise_selection(count=5, expected_clicks=5)
+
+    def test_partial_selection_does_not_retry_after_decide_is_enabled(self) -> None:
+        self._exercise_selection(count=5, ignored_clicks=1, expected_clicks=5)
+
     def test_unknown_confirmation_is_not_clicked(self) -> None:
         self._exercise_selection(unknown_prompt=True)
 
@@ -45,7 +51,7 @@ class RecoveryButtonLayoutTests(unittest.TestCase):
         self._exercise_selection(confirm_delay=12, expected_clicks=2)
 
     def _exercise_selection(self, *, ignored_clicks=0, confirm_delay=0, expected_clicks=1,
-                            fails=False, unknown_prompt=False):
+                            fails=False, unknown_prompt=False, count=1):
         navigator = Navigator.__new__(Navigator)
         navigator.threshold = 0.95
         navigator.dry_run = False
@@ -109,17 +115,48 @@ class RecoveryButtonLayoutTests(unittest.TestCase):
                 "project_sekai.navigator.time.monotonic", side_effect=lambda: state["time"]):
             if unknown_prompt:
                 with self.assertRaisesRegex(TimeoutError, "OK"):
-                    navigator.recover_bonus_from_dialog("large")
+                    navigator.recover_bonus_from_dialog("large", count)
             elif fails:
-                with self.assertRaisesRegex(RuntimeError, "选择一瓶"):
-                    navigator.recover_bonus_from_dialog("large")
+                with self.assertRaisesRegex(RuntimeError, "选择 1 瓶"):
+                    navigator.recover_bonus_from_dialog("large", count)
             else:
-                navigator.recover_bonus_from_dialog("large")
+                navigator.recover_bonus_from_dialog("large", count)
         self.assertEqual(state["clicks"], expected_clicks)
         self.assertEqual(state["closed"], not (fails or unknown_prompt))
         self.assertEqual(taps.count((759, 422)), 0 if (fails or unknown_prompt) else 1)
-        self.assertLessEqual(state["max_quantity"], 1)
+        self.assertLessEqual(state["max_quantity"], count)
+        self.assertEqual(taps.count((880, 656)), 0 if fails else 1)
         self.assertNotIn((640, 656), taps)
+
+    def test_confirmation_requests_ok_once_when_dialog_never_closes(self):
+        navigator = Navigator.__new__(Navigator)
+        navigator.threshold = .83
+        navigator.stop_requested = lambda: False
+        navigator.templates = {"recovery_ok_button": np.zeros((20,30,3),np.uint8)}
+        navigator.device = SimpleNamespace(screenshot=Mock(return_value=np.zeros((720,1280,3),np.uint8)))
+        navigator.match = Mock(return_value=(1.,(658,405)))
+        navigator.tap = Mock()
+        navigator._save_failure = Mock()
+        with patch("project_sekai.navigator.time.sleep"), patch(
+                "project_sekai.navigator.time.monotonic", side_effect=range(30)):
+            with self.assertRaisesRegex(TimeoutError,"OK"):
+                navigator._confirm_bonus_recovery()
+        navigator.tap.assert_called_once()
+        self.assertTrue(navigator.recovery_evidence['ok_requested'])
+
+    def test_failed_ok_receipt_does_not_retry_consuming_the_batch(self):
+        navigator = Navigator.__new__(Navigator)
+        navigator.threshold = .83
+        navigator.stop_requested = lambda: False
+        navigator.templates = {"recovery_ok_button": np.zeros((20,30,3),np.uint8)}
+        navigator.device = SimpleNamespace(screenshot=Mock(return_value=np.zeros((720,1280,3),np.uint8)))
+        navigator.match = Mock(return_value=(1.,(658,405)))
+        navigator.tap = Mock(side_effect=RuntimeError("控制器点击失败"))
+        with patch("project_sekai.navigator.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError,"控制器点击失败"):
+                navigator._confirm_bonus_recovery()
+        navigator.tap.assert_called_once()
+        self.assertTrue(navigator.recovery_evidence['ok_requested'])
 
     def test_decide_is_located_in_both_two_and_three_button_layouts(self) -> None:
         for button_x in (658, 778):

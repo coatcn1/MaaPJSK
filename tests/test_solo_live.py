@@ -660,3 +660,54 @@ class SoloTests(unittest.TestCase):
             self.assertEqual(report['anchor_attempt']['sample_state'],'accepted')
             self.assertEqual(len(workflow.anchor_frames),33)
             self.assertTrue(any(np.array_equal(image,frames[1]) for _,image in workflow.anchor_frames))
+
+
+    def test_confirmed_batch_is_persisted_before_notice_dismissal_fails(self):
+        workflow, report = self._availability_workflow([2])
+        frame = np.zeros((720,1280,3),np.uint8)
+        workflow.read_available_bonus = Mock(return_value=(7,Reading('7/50',.99)))
+        def recovered(before, mode, count, *, on_recovered):
+            on_recovered(count,frame)
+            raise RuntimeError('完成提示关闭失败')
+        workflow.navigator._recover_and_verify.side_effect = recovered
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError,'完成提示'):
+                workflow.ensure_bonus_available('small',5,report,Path(directory))
+            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['recovery']['completed_bottles'],5)
+        self.assertEqual(saved['recovery']['available_after'],7)
+        self.assertEqual(saved['recovery']['requested_bottles'],5)
+        self.assertEqual(saved['recovery']['status'],'credited')
+        workflow.navigator._recover_and_verify.assert_called_once()
+        workflow.navigator.ensure_auto.assert_not_called()
+
+
+    def test_failed_batch_keeps_actual_readings_without_claiming_all_bottles(self):
+        workflow, report = self._availability_workflow([2])
+        workflow.navigator.recovery_evidence = {'available_before':2, 'available_after':3,
+                                                'expected_increase':5, 'ok_requested':True}
+        workflow.navigator._recover_and_verify.side_effect = RuntimeError('未足额到账')
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError,'未足额'):
+                workflow.ensure_bonus_available('small',5,report,Path(directory))
+            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['recovery']['completed_bottles'],0)
+        self.assertEqual(saved['recovery']['available_after'],3)
+        self.assertEqual(saved['recovery']['status'],'started')
+        workflow.navigator._recover_and_verify.assert_called_once()
+
+
+    def test_new_report_inherits_unconfirmed_batch_and_never_reselects(self):
+        workflow,report = self._availability_workflow([4])
+        workflow.navigator.recovery_evidence = {'status':'started','ok_requested':True,
+            'requested_bottles':5,'completed_bottles':0,'available_before':2,'available_after':5}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError,'先前已请求'):
+                workflow.ensure_bonus_available('small',5,report,Path(directory))
+            saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
+        self.assertTrue(saved['recovery']['inherited_pending_batch'])
+        self.assertEqual(saved['recovery']['current_available'],4)
+        self.assertEqual(saved['recovery']['available_before'],2)
+        self.assertEqual(saved['recovery']['available_after'],5)
+        workflow.navigator.tap.assert_not_called()
+        workflow.navigator._recover_and_verify.assert_not_called()

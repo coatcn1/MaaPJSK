@@ -18,7 +18,7 @@ from .chart_player import ChartPlayer, StartAnchor, compile_touches
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition
-from .navigator import Navigator
+from .navigator import Navigator, read_available_bonus
 from .ocr import LineOcr, Reading
 from .performance_trace import PerformanceTrace
 from .song_identity import SongMatcher, normalize_title, write_image
@@ -250,23 +250,7 @@ class SoloLive:
         raise RuntimeError("用户指定的体力消耗数量未确认，停止调整")
 
     def read_available_bonus(self, frame: np.ndarray) -> tuple[int, Reading]:
-        box = (1057, 27, 1128, 59)
-        raw = self.ocr.read(frame, box)
-        x1, y1, x2, y2 = box
-        hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, (0, 0, 190), (179, 95, 255))
-        digits = cv2.cvtColor(255 - mask, cv2.COLOR_GRAY2BGR)
-        digits = cv2.copyMakeBorder(digits, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        processed = self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0]))
-        values = []
-        for reading in (raw, processed):
-            match = re.fullmatch(r"(\d{1,4})[/／](\d{1,4})", re.sub(r"\s+", "", reading.text))
-            if reading.confidence >= .75 and match and int(match[2]) > 0:
-                values.append((int(match[1]), reading))
-        # 只读取顶部实际体力，不识别饮料库存或已选瓶数；冲突读数不能触发用药。
-        if not values or len({value for value, _ in values}) != 1:
-            raise ValueError(f"当前体力无法确认：{raw}，{processed}")
-        return values[0]
+        return read_available_bonus(self.ocr, frame)
 
     def wait_available_bonus(self) -> tuple[np.ndarray, int, list[dict]]:
         deadline = time.monotonic() + 8
@@ -301,19 +285,34 @@ class SoloLive:
         report["bonus"]["availability"] = "insufficient"
         if mode == "off":
             raise RuntimeError(f"当前体力 {available}，每局需要 {consumption}；自动用药已关闭，请补充体力或修改任务设置")
+        previous = getattr(self.navigator, "recovery_evidence", None)
+        if (isinstance(previous, dict) and previous.get("ok_requested")
+                and previous.get("status") == "started"):
+            report["recovery"] = dict(previous, inherited_pending_batch=True,
+                                      current_available=available)
+            _write_json(directory / "report.json", report)
+            raise RuntimeError("本任务先前已请求批量用药但到账未确认，请用户处理；不追加或重复整批")
         report["recovery"] = {"mode": mode, "requested_bottles": count, "completed_bottles": 0, "available_before": available,
                               "status": "started"}
         _write_json(directory / "report.json", report)
         self.log(f"体力不足：当前 {available} / 每局需要 {consumption}，按用户设置自动回复")
         self.navigator.tap(1086, 42, "打开体力回复")
-        def record_bottle(completed, frame):
+        def record_batch(completed, frame):
             value, reading = self.read_available_bonus(frame)
-            # 每瓶实际到账后落盘，后续确认失败也保留已用数量，不能把一批重新执行。
+            # 整批足额到账后先落盘，关闭提示失败也保留已用数量，不能把本批重新执行。
             report["recovery"].update(completed_bottles=completed, available_after=value,
-                                      last_bottle_reading=asdict(reading))
+                                      batch_reading=asdict(reading), status="credited",
+                                      expected_increase=count * (1 if mode == "small" else 10))
             _write_json(directory / "report.json", report)
 
-        self.navigator._recover_and_verify(before, mode, count, on_recovered=record_bottle)
+        try:
+            self.navigator._recover_and_verify(before, mode, count, on_recovered=record_batch)
+        except Exception:
+            evidence = getattr(self.navigator, "recovery_evidence", None)
+            if isinstance(evidence, dict):
+                report["recovery"].update(evidence)
+            _write_json(directory / "report.json", report)
+            raise
         frame, after, readings = self.wait_available_bonus()
         write_image(directory / "recovery-after.png", frame)
         report["recovery"].update(available_after=after, completed_bottles=count, readings=readings, status="confirmed")
