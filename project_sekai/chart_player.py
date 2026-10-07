@@ -13,7 +13,7 @@ from .sus_chart import Chart, Gesture, slide_x
 
 TOUCH_PLAN_VERSION = 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 5
-START_ANCHOR_VERSION = 11
+START_ANCHOR_VERSION = 12
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -340,10 +340,11 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         for part in cv2.findContours(local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
             lx, ly, lw, lh = cv2.boundingRect(part)
             consider(left + lx, y + ly, lw, lh, mixed_candidates if gold_slide else candidates)
+    if passed_slide_head and reject_passed_slide:
+        # 同帧后继横条不能覆盖首头已越界的证据，否则会从歌曲中途建立 epoch。
+        raise FirstHeadOutsideWindow("首长条头已越过同步窗口，拒绝从后继音或歌曲中途启动")
     if candidates:
         return max(candidates)
-    if passed_slide_head and reject_passed_slide:
-        raise FirstHeadOutsideWindow("首长条头已越过同步窗口，拒绝从后继音或歌曲中途启动")
     if mixed_candidates:
         return max(mixed_candidates)
     if not validated_dense_followers(gesture, dense_following_gestures):

@@ -142,6 +142,20 @@ class SusTests(unittest.TestCase):
         frame[0:47,596:638] = (30,210,255)
         self.assertEqual(first_note_y(frame,chart.first),43.5)
 
+    def test_passed_gold_slide_head_rejects_same_frame_legal_successor(self):
+        chart = self.mixed_gold_chart()
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        frame[535:609, 107:621] = (30, 210, 255)
+        frame[349:397, 283:625] = (30, 210, 255)
+        for context in ((), chart.gestures, (None,)):
+            with self.subTest(context=context):
+                anchor = StartAnchor(chart.first, minimum_samples=4, simultaneous_gestures=context)
+                anchor.observe(np.zeros_like(frame), 10.)
+                with self.assertRaisesRegex(RuntimeError, '首长条头已越过'):
+                    anchor.observe(frame, 10.1)
+                self.assertEqual(anchor.failure_reason, 'first_head_outside_window')
+                self.assertEqual(anchor.samples, [])
+
     def test_mixed_context_preserves_original_single_head_detection(self):
         chart = self.mixed_gold_chart()
         frame = np.zeros((720,1280,3),np.uint8)
