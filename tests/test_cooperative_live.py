@@ -172,12 +172,12 @@ class CooperativeTests(unittest.TestCase):
         clock = Clock()
         frames = {name: np.full((720, 1280, 3), index + 40, np.uint8) for index, name in enumerate(set(states))}
         tags = {"room": "cooperative_room", "matching": "cooperative_matching", "select": "cooperative_select",
-                "matching_full": "cooperative_matching", "matching_locked": "cooperative_matching",
+                "matching_decided": "cooperative_matching", "matching_full": "cooperative_matching", "matching_locked": "cooperative_matching",
                 "matching_disabled": "cooperative_matching",
-                "ready": "cooperative_ready", "cancel": "cooperative_cancel", "disbanded": "cooperative_disbanded",
+                "shuffle": "cooperative_shuffle", "ready": "cooperative_ready", "cancel": "cooperative_cancel", "disbanded": "cooperative_disbanded",
                 "personal": "cooperative_personal_result", "playing": "playing", "home": "home", "clear": "live_clear",
                 "failed":"live_failed"}
-        for state in {"matching", "matching_full"} & frames.keys():
+        for state in {"matching", "matching_full", "matching_decided"} & frames.keys():
             cv2.circle(frames[state], (43, 42), 25, (255, 255, 255), -1)
         if "black" in frames:
             frames["black"][:] = 0
@@ -194,6 +194,7 @@ class CooperativeTests(unittest.TestCase):
             matched = any(frame is image and (tags.get(state) == page
                           or state == "playing" and page == "life_hud"
                           or state in {"matching", "matching_disabled"} and page == "cooperative_member_waiting"
+                          or state == "matching_decided" and page == "cooperative_member_decided"
                           or state in {"dialog", "dialog_no_ok"} and page == "cooperative_disbanded_dialog"
                           or state == "dialog" and page == "cooperative_disbanded_dialog_ok")
                           for state, image in frames.items())
@@ -214,6 +215,7 @@ class CooperativeTests(unittest.TestCase):
         workflow.ocr = Mock()
         workflow.matcher = Mock()
         workflow.current_report = None
+        workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
         return workflow, clock, frames
 
     def test_matching_shuffle_and_waiting_pages_send_no_inputs_and_can_be_cancelled(self):
@@ -387,7 +389,7 @@ class CooperativeTests(unittest.TestCase):
             selected, _ = workflow.choose("free", "easy", "random", report, Path(directory))
         self.assertEqual(selected.song_id, 520)
         self.assertEqual(report["song_vote"]["mode"], "random")
-        workflow.device.tap.assert_called_once_with(43, 43)
+        workflow.device.tap.assert_not_called()
         workflow.device.back.assert_not_called()
         workflow.device.home.assert_not_called()
         self.assertEqual(len(report["attempts"]), 1)
@@ -1210,7 +1212,9 @@ class CooperativeTests(unittest.TestCase):
         workflow.open_rooms = Mock()
         workflow.recover_runtime_failure = Mock(side_effect=InterruptedError("测试取消恢复等待"))
         workflow.pause = Mock(side_effect=InterruptedError("测试取消等待"))
-        workflow.prepare_bonus = Mock()
+        workflow.prepare_bonus = Mock(side_effect=lambda requested, report, *args, **kwargs: report.update(bonus={
+            'requested_consumption': requested, 'consumption': 5, 'confirmed': True, 'original_consumption': 5,
+            'readings': [{'text': '5'}, {'text': '5'}]}))
         workflow.ensure_bonus_available = Mock()
         workflow.choose = Mock(return_value=(identity(), np.zeros((720, 1280, 3), np.uint8)))
         workflow.wait_page = Mock()
@@ -1294,7 +1298,10 @@ class CooperativeTests(unittest.TestCase):
         workflow.wait_page = CooperativeLive.wait_page.__get__(workflow)
         workflow.return_after_disbanded = CooperativeLive.return_after_disbanded.__get__(workflow)
         workflow.navigator.tap.side_effect = join
-        workflow.device.tap.side_effect = lambda *_: state.update(page="room")
+        workflow.device.back.side_effect = lambda *_: state.update(page="room")
+        workflow.device.screenshot.side_effect = screenshot
+        workflow.recover_runtime_failure = CooperativeLive.recover_runtime_failure.__get__(workflow)
+        workflow.stop_requested = lambda: clock.now > 1000.
         workflow.choose = Mock(side_effect=choose)
         return workflow, clock
 
@@ -1304,14 +1311,13 @@ class CooperativeTests(unittest.TestCase):
             with patch("project_sekai.cooperative_live.time.monotonic", side_effect=lambda: clock.now):
                 self.execute(workflow)
             self.assertEqual(workflow.choose.call_count, 2)
-            workflow.device.tap.assert_called_once_with(43, 43)
-            workflow.device.back.assert_not_called()
+            workflow.device.tap.assert_not_called()
+            workflow.device.back.assert_called_once()
             workflow.device.home.assert_not_called()
             self.assertEqual(workflow.completed_rounds, 1)
-            self.assertEqual([item["status"] for item in workflow.last_report["attempts"]], ["matching_timeout", "cleared"])
-            self.assertTrue(workflow.last_report["attempts"][0]["room_recovery"]["returned_to_room"])
+            self.assertEqual([item["status"] for item in workflow.last_report["attempts"]], ["cleared"])
             with (Path(directory) / "results.csv").open(encoding="utf-8-sig") as stream:
-                self.assertEqual(len(list(csv.DictReader(stream))), 1)
+                self.assertEqual(len(list(csv.DictReader(stream))), 2)
 
     def test_repeated_stalled_matching_shares_three_rematches_and_never_counts_progress(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1320,8 +1326,8 @@ class CooperativeTests(unittest.TestCase):
                 with self.assertRaises(InterruptedError):
                     self.execute(workflow)
             self.assertEqual(workflow.choose.call_count, 4)
-            self.assertEqual(workflow.device.tap.call_args_list, [unittest.mock.call(43, 43)] * 4)
-            workflow.device.back.assert_not_called()
+            workflow.device.tap.assert_not_called()
+            self.assertEqual(workflow.device.back.call_count, 4)
             self.assertEqual(workflow.completed_rounds, 0)
             workflow.play.assert_not_called()
             workflow.repository.load_chart.assert_not_called()
@@ -1360,6 +1366,536 @@ class CooperativeTests(unittest.TestCase):
             self.assertEqual([report['runtime_recovery']['state'] for report in reports if 'runtime_recovery' in report],['ready','ready'])
             with (Path(directory)/'results.csv').open(encoding='utf-8-sig') as stream:
                 self.assertEqual(len(list(csv.DictReader(stream))),4)
+
+    def test_real_run_resumes_matching_selection_without_joining_a_new_room(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.run_workflow(Path(directory))
+            ui, clock, frames = self.ui_workflow(['matching_decided'] * 3 + ['select'] * 4 + ['ready'] * 12)
+            workflow.screenshot, workflow.pause, workflow.navigator = ui.screenshot, ui.pause, ui.navigator
+            workflow.stop_requested = lambda: clock.now > 30.
+            workflow.device.screenshot.side_effect = ui.screenshot
+            workflow.ocr = Mock()
+            workflow.ocr.read.return_value = Reading('軽量', 1.)
+            workflow.matcher = Mock()
+            workflow.matcher.match.return_value = identity()
+            workflow.recover_runtime_failure = lambda *args: CooperativeLive.recover_runtime_failure(workflow, *args)
+            workflow.wait_page = lambda *args, **kwargs: CooperativeLive.wait_page(workflow, *args, **kwargs)
+            calls = 0
+            def choose(*args):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    workflow.matched = True
+                    args[3]['attempts'][-1]['room_recovery'] = {'reason': 'member_matching_timeout'}
+                    args[3]['attempts'][-1]['member_wait_deadline'] = clock.now - 1.
+                    raise TimeoutError('匹配退出确认时连接暂失')
+                return CooperativeLive.choose(workflow, *args)
+            workflow.choose.side_effect = choose
+            with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+                try:
+                    self.execute(workflow)
+                except InterruptedError:
+                    self.fail(str(workflow.last_report))
+            self.assertEqual(workflow.performed_rounds, 1)
+            self.assertEqual(calls, 2)
+            self.assertEqual(workflow.round_rematches, 0)
+            self.assertEqual(workflow.prepare_bonus.call_count, 1)
+            self.assertEqual(workflow.ensure_bonus_available.call_count, 1)
+            self.assertFalse(any(call.args[:2] == (920, 245) for call in workflow.navigator.tap.call_args_list))
+
+    def test_decided_matching_positive_label_allows_bounded_exit_but_missing_template_does_not(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided', 'matching_full'])
+        self.assertTrue(workflow.member_room_can_leave(frames['matching_decided']))
+        self.assertFalse(workflow.member_room_can_leave(frames['matching_full']))
+        workflow.navigator.templates.pop('cooperative_member_decided')
+        self.assertFalse(workflow.member_room_can_leave(frames['matching_decided']))
+
+    def test_real_recovery_run_resumes_shuffle_ready_and_cancel_without_entry_timeout(self):
+        for state in ('shuffle', 'ready', 'cancel'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                workflow = self.run_workflow(Path(directory))
+                states = ([state] * 4 + ['ready'] * 12) if state == 'shuffle' else [state] * 16
+                ui, clock, frames = self.ui_workflow(states)
+                workflow.screenshot, workflow.pause, workflow.navigator = ui.screenshot, ui.pause, ui.navigator
+                workflow.device.screenshot.side_effect = ui.screenshot
+                workflow.stop_requested = lambda: clock.now > 80.
+                workflow.ocr, workflow.matcher = Mock(), Mock()
+                workflow.ocr.read.return_value = Reading('軽量', 1.)
+                workflow.matcher.match.return_value = identity()
+                entry_calls = 0
+                def open_rooms():
+                    nonlocal entry_calls
+                    entry_calls += 1
+                    if entry_calls > 1:
+                        return CooperativeLive.open_rooms(workflow)
+                workflow.open_rooms = open_rooms
+                workflow.recover_runtime_failure = lambda *args: CooperativeLive.recover_runtime_failure(workflow, *args)
+                workflow.wait_page = lambda *args, **kwargs: CooperativeLive.wait_page(workflow, *args, **kwargs)
+                calls = 0
+                def choose(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        workflow.matched = True
+                        args[3]['joined_room'] = True
+                        raise OSError('房内连接回执失败')
+                    return CooperativeLive.choose(workflow, *args)
+                workflow.choose.side_effect = choose
+                def start(chart, actual, report, target, *, on_final_identity):
+                    if actual is None:
+                        on_final_identity(identity())
+                    report['final_identity'] = identity().to_dict()
+                    return 0.
+                workflow.start.side_effect = start
+                with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+                    reports = self.execute(workflow)
+                self.assertEqual(workflow.performed_rounds, 1)
+                self.assertEqual(calls, 2)
+                self.assertEqual(entry_calls, 2)
+                self.assertEqual(workflow.round_rematches, 0)
+                self.assertLess(clock.now, 60.)
+                self.assertEqual(workflow.prepare_bonus.call_count, 1)
+                self.assertEqual(reports[-1]['bonus']['confirmation_source'], 'task_snapshot')
+                self.assertEqual(reports[-1]['bonus']['source_report'], reports[0]['report_path'])
+                self.assertNotIn('readings', reports[-1]['bonus'])
+                self.assertFalse(any(call.args[:2] in ((920, 245), (908, 536), (1070, 543))
+                                     for call in workflow.navigator.tap.call_args_list))
+                self.assertTrue(reports[-1]['final_identity'])
+
+    def test_unknown_resume_stage_cannot_skip_room_entry(self):
+        workflow, clock, _ = self.ui_workflow(['black'])
+        workflow.resume_stage = 'untrusted-stage'
+        workflow.entry_deadline = clock.now - 1.
+        with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), \
+                self.assertRaisesRegex(TimeoutError, '60 秒'):
+            workflow.open_rooms()
+        workflow.navigator.tap.assert_not_called()
+
+    def test_cooperative_completed_rounds_reuse_consumption_but_check_available_each_round(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.run_workflow(Path(directory))
+            reports = self.execute(workflow, count=2)
+            self.assertEqual(workflow.prepare_bonus.call_count, 1)
+            self.assertEqual(workflow.ensure_bonus_available.call_count, 2)
+            self.assertEqual(reports[1]['bonus']['confirmation_source'], 'task_snapshot')
+            self.assertNotIn('readings', reports[1]['bonus'])
+            self.execute(workflow)
+            self.assertEqual(workflow.prepare_bonus.call_count, 2)
+
+    def test_runtime_matching_exit_reaches_room_and_consumes_only_one_rematch(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided', 'matching_decided', 'matching_decided', 'room', 'room'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        workflow.round_rematches = 0
+        workflow.max_rematches = 3
+        workflow.persist_runtime_report = Mock()
+        report = {'joined_room': True, 'attempts': [{'member_wait_deadline': clock.now - 1.}]}
+        workflow.current_report = report
+        workflow.last_report = report
+        workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.recover_runtime_failure(report, Path(directory), TimeoutError('匹配等待已超时'))
+        workflow.device.tap.assert_not_called()
+        workflow.device.back.assert_called_once()
+        self.assertEqual(workflow.round_rematches, 1)
+        self.assertTrue(report['rematch_budget_consumed'])
+        self.assertEqual(report['task_state'], 'ready')
+
+    def test_matching_recovery_selection_resumes_same_room_without_new_join(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided', 'select'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        workflow.round_rematches = 1
+        report = {'attempts': [{'room_recovery': {'reason': 'member_matching_timeout'}}]}
+        workflow.current_report = report
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.recover_runtime_failure(report, Path(directory), TimeoutError('退出前转选歌'))
+        self.assertTrue(workflow.resume_selection)
+        self.assertEqual(workflow.round_rematches, 1)
+        workflow.device.tap.assert_not_called()
+        workflow.device.back.assert_not_called()
+
+    def test_real_run_input_failure_after_join_recovers_home_with_new_entry_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.run_workflow(Path(directory))
+            ui, clock, frames = self.ui_workflow(['room', 'home', 'home', 'home', 'home', 'menu', 'menu', 'room', 'room'])
+            original = ui.navigator.match.side_effect
+            ui.navigator.match.side_effect = lambda frame, name, *args: ((1., (0, 0)) if frame is frames['menu'] and name == 'live_menu' else original(frame, name, *args))
+            workflow.screenshot, workflow.pause, workflow.navigator = ui.screenshot, ui.pause, ui.navigator
+            workflow.device.screenshot.side_effect = ui.screenshot
+            workflow.stop_requested = lambda: clock.now > 260.
+            workflow.open_rooms = lambda: CooperativeLive.open_rooms(workflow)
+            workflow.recover_runtime_failure = lambda *args: CooperativeLive.recover_runtime_failure(workflow, *args)
+            def choose(*args):
+                workflow.matched = True
+                return identity(), frames['room']
+            workflow.choose.side_effect = choose
+            def play(events, epoch, offset, report, target):
+                report['playback'] = {'release_confirmed': True, 'planned_actions': 2, 'sent_actions': 2, 'executed_actions': 2}
+                if workflow.play.call_count == 1:
+                    clock.advance(200.)
+                    raise OSError('输入回执连接异常')
+            workflow.play.side_effect = play
+            with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+                reports = self.execute(workflow)
+            self.assertEqual(workflow.performed_rounds, 1)
+            self.assertEqual(len(reports), 2)
+            self.assertTrue(reports[0]['rematch_budget_consumed'])
+            self.assertIn('输入回执', reports[0]['error'])
+            self.assertEqual(workflow.play.call_count, 2)
+            workflow.device.home.assert_not_called()
+
+    def test_resume_selection_provenance_survives_new_report_blank_failure(self):
+        workflow, clock, frames = self.ui_workflow(['select'])
+        workflow.resume_selection = True
+        workflow.entry_deadline = -1.
+        workflow.entry_request_count, workflow.menu_request_count = 2, 2
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        report = {'attempts': [{}], 'playback': None}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.recover_runtime_failure(report, Path(directory), RuntimeError('原房间选歌复查遇到转场'))
+        self.assertTrue(workflow.resume_selection)
+        self.assertIsNone(workflow.entry_deadline)
+        self.assertEqual((workflow.entry_request_count, workflow.menu_request_count), (2, 2))
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_stop_during_ordinary_recovery_backoff_updates_cancelled_json(self):
+        workflow, clock, frames = self.ui_workflow(['home'])
+        workflow.wait_runtime_destination = Mock(side_effect=OSError('恢复连接失败'))
+        workflow.check_runtime_stop = Mock(side_effect=InterruptedError('退避前用户停止'))
+        report = {'error': 'TimeoutError: 原房间失败', 'cancelled': False}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            with self.assertRaises(InterruptedError):
+                workflow.recover_runtime_failure(report, target, RuntimeError('原房间失败'))
+            saved = json.loads((target / 'report.json').read_text(encoding='utf-8'))
+            self.assertTrue(saved['cancelled'])
+            self.assertIn('stopped_at', saved)
+            self.assertEqual(saved['error'], 'TimeoutError: 原房间失败')
+        self.assertTrue(report['cancelled'])
+        self.assertEqual(report['error'], 'TimeoutError: 原房间失败')
+        self.assertIn('stopped_at', report)
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_runtime_fresh_matching_confirms_join_after_failed_ack_and_counts_rematch(self):
+        workflow, clock, frames = self.ui_workflow(['matching', 'matching', 'matching', 'room', 'room'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
+        workflow.persist_runtime_report = Mock()
+        workflow.current_report = workflow.last_report = report = {'attempts': [{}]}
+        workflow.room_progress = {'stage': 'matching', 'deadline': 0.}
+        workflow.round_rematches, workflow.max_rematches = 0, 3
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.recover_runtime_failure(report, Path(directory), OSError('入房请求回执失败'))
+        self.assertTrue(workflow.matched)
+        self.assertTrue(report['joined_room'])
+        self.assertIn('join_confirmed_at', report['attempts'][0])
+        self.assertEqual(workflow.round_rematches, 1)
+        workflow.device.back.assert_called_once()
+
+    def test_room_with_disband_notice_is_not_a_successful_timeout_destination(self):
+        workflow, clock, frames = self.ui_workflow(['room'])
+        original = workflow.navigator.match.side_effect
+        workflow.navigator.match.side_effect = lambda frame, name, *args: ((1., (0, 0)) if name == 'cooperative_disbanded' else original(frame, name, *args))
+        workflow.current_report = {}
+        workflow.room_progress = {'stage': 'matching', 'deadline': 0.}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(TimeoutError):
+            workflow.return_after_room_timeout({}, Path(directory))
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_runtime_room_overlay_cannot_enter_safe_destination_branch(self):
+        workflow, clock, frames = self.ui_workflow(['room'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        original = workflow.navigator.match.side_effect
+        workflow.navigator.match.side_effect = lambda frame, name, *args: ((1., (0, 0)) if name == 'cooperative_disbanded_dialog' else original(frame, name, *args))
+        workflow.stop_requested = lambda: clock.now >= 5.
+        report = {}
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(InterruptedError):
+            workflow.recover_runtime_failure(report, Path(directory), RuntimeError('解散覆盖房间页'))
+        workflow.device.preflight.assert_not_called()
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_cooperative_preplay_guard_uses_lower_bar_and_two_zero_source_frames(self):
+        workflow, clock, frames = self.ui_workflow(['playing'])
+        frame = np.full((720, 1280, 3), 50, np.uint8)
+        zero = np.zeros((29, 97, 3), np.uint8)
+        zero[8:20, 43:49] = 255
+        frame[16:45, 1090:1187] = zero
+        workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
+        workflow.navigator.zero_life_template = ZeroLifeTemplate(zero)
+        workflow.navigator.match.side_effect = None
+        workflow.navigator.match.return_value = (1., (0, 0))
+        frame[48:56, 1008:1177] = (0, 255, 0)
+        report = {}
+        workflow.observe_preplay_life(frame, 10., report)
+        self.assertEqual(workflow.life_guard.zero_streak, 0)
+        frame[48:56, 1008:1177] = 50
+        workflow.observe_preplay_life(frame, 12., report)
+        with self.assertRaises(LifeDepleted): workflow.observe_preplay_life(frame, 14., report)
+        self.assertTrue(report['preplay_death_confirmed'])
+        self.assertIn('death_confirmed_at', report)
+        self.assertEqual([sample['zero_streak'] for sample in report['preplay_life_monitor']['samples']], [0, 1, 2])
+        for method in ('tap', 'back', 'home', 'screenshot'): getattr(workflow.device, method).assert_not_called()
+
+    def test_native_preplay_death_releases_zero_input_player_before_cooperative_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.run_workflow(Path(directory))
+            workflow.matched = True
+            frame = np.full((720, 1280, 3), 50, np.uint8)
+            zero = np.zeros((29, 97, 3), np.uint8)
+            zero[8:20, 43:49] = 255
+            frame[16:45, 1090:1187] = zero
+            workflow.navigator.templates = {'life_hud': frame}
+            workflow.navigator.zero_life_template = ZeroLifeTemplate(zero)
+            workflow.navigator.match.side_effect = lambda image, name, *args: (float(name == 'life_hud'), (0, 0))
+            workflow.repository.load_chart.return_value = '#BPM01:120\n#00008:01\n#00012:11\n#00113:11'
+            workflow.submit_ready = Mock(return_value=identity())
+            workflow.matcher = Mock()
+            workflow.matcher.match.side_effect = ValueError('最终身份尚未确认')
+            clock = Clock()
+            def capture():
+                clock.advance(1.)
+                return frame
+            workflow.screenshot = Mock(side_effect=capture)
+            workflow.pause = lambda _: None
+            workflow.start = lambda *args, **kwargs: CooperativeLive.start(workflow, *args, **kwargs)
+            player = Mock()
+            player.report = {'engine': 'native', 'planned_actions': 2, 'sent_actions': 0, 'executed_actions': 0, 'release_confirmed': False}
+            order = []
+            def close():
+                order.append('release')
+                player.report.update(release_confirmed=True, release={'release_proof': 'no-touch-possible-and-cleanup'})
+            player.close.side_effect = close
+            workflow.device.home.side_effect = lambda: order.append('home')
+            with patch('project_sekai.native_player.NativePlayer', return_value=player), patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.time.perf_counter', side_effect=lambda: clock.now), self.assertRaises(LifeDepleted):
+                try:
+                    workflow.run(1, 'easy', 'current', engine='native')
+                except InterruptedError:
+                    self.fail(str(workflow.last_report.get('error')) + str(workflow.last_report.get('preplay_life_monitor')))
+            self.assertEqual(order, ['release', 'home'])
+            player.play.assert_not_called()
+            workflow.device.back.assert_not_called()
+            workflow.collect.assert_not_called()
+            self.assertEqual(workflow.performed_rounds, 0)
+            saved = json.loads(Path(workflow.last_report['report_path']).read_text(encoding='utf-8'))
+            self.assertTrue(saved['life_monitor']['zero_confirmed'])
+            self.assertTrue(saved['preplay_death_confirmed'])
+            self.assertEqual(saved['playback']['sent_actions'], 0)
+
+    def test_room_idle_back_ack_failure_consumes_all_three_requests_without_reset(self):
+        workflow, clock, frames = self.ui_workflow(['ready'])
+        workflow.current_report = {}
+        workflow.room_progress = {'stage': 'ready', 'deadline': 0.}
+        workflow.device.back.side_effect = OSError('ESC回执失败')
+        attempt = {}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            for count in range(1, 4):
+                with self.assertRaises(OSError):
+                    workflow.return_after_room_timeout(attempt, Path(directory))
+                self.assertEqual(attempt['room_recovery']['exit_requests'], count)
+            with self.assertRaises(TimeoutError):
+                workflow.return_after_room_timeout(attempt, Path(directory))
+        self.assertEqual(workflow.device.back.call_count, 3)
+        workflow.device.tap.assert_not_called()
+
+    def test_prepared_native_without_current_release_proof_cannot_use_room_exit(self):
+        workflow, clock, frames = self.ui_workflow(['cancel'])
+        workflow.current_report = {'playback': {'engine': 'native', 'planned_actions': 2, 'sent_actions': 0,
+                                  'executed_actions': 0, 'release_confirmed': True}}
+        workflow.room_progress = {'stage': 'cancel', 'deadline': 0.}
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(RuntimeError):
+            workflow.return_after_room_timeout({}, Path(directory))
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_room_progress_advances_only_forward_and_recovery_keeps_deadline(self):
+        workflow, clock, frames = self.ui_workflow(['matching', 'select', 'shuffle', 'ready', 'cancel', 'black'])
+        with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.observe_room_progress(frames['matching'])
+            original = workflow.room_progress['deadline']
+            clock.advance(100.)
+            workflow.observe_room_progress(frames['matching'])
+            workflow.observe_room_progress(frames['black'])
+            self.assertEqual(workflow.room_progress['deadline'], original)
+            workflow.observe_room_progress(frames['select'])
+            advanced = workflow.room_progress['deadline']
+            self.assertGreater(advanced, original)
+            clock.advance(20.)
+            workflow.observe_room_progress(frames['matching'])
+            self.assertEqual(workflow.room_progress['deadline'], advanced)
+            workflow.observe_room_progress(frames['shuffle'])
+            workflow.observe_room_progress(frames['ready'])
+            workflow.observe_room_progress(frames['cancel'])
+            self.assertEqual(workflow.room_progress['stage'], 'cancel')
+
+    def test_room_idle_exit_uses_back_even_with_gray_arrow_and_never_taps(self):
+        workflow, clock, frames = self.ui_workflow(['matching_disabled', 'matching_disabled', 'room'])
+        workflow.current_report = {}
+        workflow.room_progress = {'stage': 'matching', 'deadline': 0.}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            result = workflow.return_after_room_timeout({}, Path(directory))
+        self.assertIsNone(result)
+        workflow.device.back.assert_called_once()
+        workflow.device.tap.assert_not_called()
+
+    def test_room_idle_exit_rechecks_progress_after_encoding_before_back(self):
+        workflow, clock, frames = self.ui_workflow(['select', 'ready'])
+        workflow.current_report = {}
+        workflow.room_progress = {'stage': 'select', 'deadline': 0.}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            result = workflow.return_after_room_timeout({}, Path(directory))
+        self.assertEqual(result[1], 'ready')
+        workflow.device.back.assert_not_called()
+        workflow.device.tap.assert_not_called()
+
+    def test_room_idle_exit_rejects_unknown_loading_final_or_playing_and_preserves_budget(self):
+        for state in ('black', 'final', 'shuffle_unknown', 'playing'):
+            workflow, clock, frames = self.ui_workflow([state])
+            workflow.current_report = {}
+            workflow.room_progress = {'stage': 'ready', 'deadline': 0.}
+            attempt = {}
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(TimeoutError):
+                workflow.return_after_room_timeout(attempt, Path(directory))
+            self.assertEqual(attempt['room_recovery']['exit_requests'], 0)
+            for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_resume_prepared_cancel_start_does_not_send_ready_or_vote(self):
+        from project_sekai.solo_live import SoloLive
+        workflow, clock, frames = self.ui_workflow(['cancel'])
+        workflow.resume_stage = 'cancel'
+        workflow.submit_ready = Mock()
+        report = {}
+        def parent(*args, **kwargs):
+            kwargs['ready_action']()
+            return 12.
+        with tempfile.TemporaryDirectory() as directory, patch.object(SoloLive, 'start', side_effect=parent):
+            self.assertEqual(workflow.start(None, None, report, Path(directory)), 12.)
+        workflow.submit_ready.assert_not_called()
+        self.assertTrue(report['ready_confirmed'])
+        self.assertEqual(report.get('final_identity'), None)
+        workflow.navigator.tap.assert_not_called()
+
+    def test_actual_join_conflicting_pages_cannot_cancel_sixty_second_deadline(self):
+        workflow, clock, frames = self.ui_workflow(['matching'])
+        original = workflow.navigator.match.side_effect
+        workflow.navigator.match.side_effect = lambda frame, name, *args: ((1., (0, 0)) if name == 'cooperative_ready' else original(frame, name, *args))
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(TimeoutError):
+            workflow.confirm_room_join({})
+        self.assertIsNotNone(workflow.join_deadline)
+        self.assertFalse(workflow.matched)
+
+    def test_room_button_ack_without_actual_join_times_out_in_sixty_seconds(self):
+        workflow, clock, frames = self.ui_workflow(['room'])
+        report = {'attempts': [{}]}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(TimeoutError):
+            workflow.current_directory = Path(directory)
+            workflow.choose('free', 'easy', 'random', report, Path(directory))
+        self.assertGreaterEqual(clock.now, 61.)
+        self.assertLess(clock.now, 62.)
+        self.assertNotIn('member_wait_deadline', report['attempts'][0])
+
+    def test_cooperative_start_uses_one_hundred_eighty_seconds_without_changing_solo_default(self):
+        from project_sekai.solo_live import SoloLive
+        workflow = CooperativeLive.__new__(CooperativeLive)
+        with tempfile.TemporaryDirectory() as directory, patch.object(SoloLive, 'start', return_value=12.) as start:
+            self.assertEqual(workflow.start(None, None, {}, Path(directory)), 12.)
+        self.assertEqual(start.call_args.kwargs.get('opening_timeout'), 180)
+
+    def test_cold_matching_without_deadline_starts_full_wait_without_exit_input(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        workflow.stop_requested = lambda: clock.now >= 20.
+        report = {}
+        workflow.current_report = report
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(InterruptedError):
+            workflow.recover_runtime_failure(report, Path(directory), TimeoutError('进入菜单时连接异常'))
+        self.assertIn('member_wait_deadline', report['runtime_attempt'])
+        self.assertGreater(report['runtime_attempt']['member_wait_deadline'], clock.now)
+        self.assertGreaterEqual(report['runtime_attempt']['member_wait_deadline'], 181.)
+        workflow.device.tap.assert_not_called()
+
+    def test_actual_room_ends_entry_deadline_without_resetting_button_budget(self):
+        workflow, clock, frames = self.ui_workflow(['room'])
+        workflow.entry_deadline = -1.
+        workflow.entry_request_count, workflow.menu_request_count = 2, 1
+        with patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.open_rooms()
+        self.assertIsNone(workflow.entry_deadline)
+        self.assertEqual((workflow.entry_request_count, workflow.menu_request_count), (2, 1))
+
+    def test_expired_entry_without_actual_room_keeps_deadline_and_waits(self):
+        workflow, clock, frames = self.ui_workflow(['home'])
+        workflow.entry_deadline = -1.
+        workflow.entry_request_count, workflow.menu_request_count = 1, 1
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        workflow.stop_requested = lambda: clock.now >= 5.
+        report = {}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(InterruptedError):
+            workflow.recover_runtime_failure(report, Path(directory), TimeoutError('未进入房间的入口超时'))
+        self.assertEqual(workflow.entry_deadline, -1.)
+        self.assertEqual((workflow.entry_request_count, workflow.menu_request_count), (1, 1))
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_member_exit_rejects_conflicting_known_preparation_pages(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided'])
+        original = workflow.navigator.match.side_effect
+        for conflict in ('cooperative_select', 'cooperative_ready', 'cooperative_cancel', 'cooperative_disbanded_dialog'):
+            with self.subTest(conflict=conflict):
+                workflow.navigator.match.side_effect = lambda frame, name, *args: ((1., (0, 0)) if name == conflict else original(frame, name, *args))
+                self.assertFalse(workflow.member_room_can_leave(frames['matching_decided']))
+
+    def test_runtime_matching_before_original_deadline_waits_and_resumes_selection(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided', 'select'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        report = {'attempts': [{'member_wait_deadline': 121.}]}
+        workflow.current_report = report
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.recover_runtime_failure(report, Path(directory), OSError('加入后短暂连接异常'))
+        self.assertTrue(workflow.resume_selection)
+        workflow.device.tap.assert_not_called()
+
+    def test_matching_exit_deadline_and_request_budget_never_reset_on_reentry(self):
+        workflow, clock, frames = self.ui_workflow(['matching_decided'])
+        workflow.current_report = {}
+        report = {'room_recovery': {'exit_clicks': 3, 'exit_deadline': 1.}}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(TimeoutError):
+            workflow.return_after_matching_timeout(report, Path(directory))
+        self.assertEqual(report['room_recovery']['exit_clicks'], 3)
+        self.assertEqual(report['room_recovery']['exit_deadline'], 1.)
+        workflow.device.tap.assert_not_called()
+
+    def test_recovery_cancel_updates_report_and_preserves_original_failure(self):
+        workflow, clock, frames = self.ui_workflow(['black'])
+        workflow.device.screenshot.side_effect = workflow.screenshot
+        workflow.stop_requested = lambda: clock.now >= 5.
+        report = {'error': 'TimeoutError: 原匹配失败', 'completed': False}
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(InterruptedError):
+            workflow.recover_runtime_failure(report, Path(directory), TimeoutError('原匹配失败'))
+        self.assertTrue(report['cancelled'])
+        self.assertIn('stopped_at', report)
+        self.assertEqual(report['error'], 'TimeoutError: 原匹配失败')
+        for method in ('tap', 'back', 'home'): getattr(workflow.device, method).assert_not_called()
+
+    def test_front_entry_menu_retries_share_original_total_deadline(self):
+        workflow, clock, frames = self.ui_workflow(['home', 'menu', 'room'])
+        original = workflow.navigator.match.side_effect
+        workflow.navigator.match.side_effect = lambda frame, name, *args: ((1., (0, 0)) if frame is frames['menu'] and name == 'live_menu' else original(frame, name, *args))
+        workflow.screenshot = lambda: (clock.advance(.04) or frames['home'] if clock.now < 25 else clock.advance(.04) or frames['menu'])
+        workflow.tap_page = Mock(return_value=None)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(TimeoutError):
+            workflow.current_directory = Path(directory)
+            workflow.open_rooms()
+        self.assertLess(clock.now, 61.5)
+        self.assertLessEqual(workflow.tap_page.call_count, 6)
+
+    def test_matching_exit_failed_ack_consumes_persistent_request_budget(self):
+        workflow, clock, frames = self.ui_workflow(['matching'])
+        workflow.current_report = {}
+        workflow.device.tap.side_effect = OSError('可能已发出，回执失败')
+        report = {}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+            for index in range(3):
+                with self.assertRaises(OSError):
+                    workflow.return_after_matching_timeout(report, Path(directory))
+                self.assertEqual(report['room_recovery']['exit_clicks'], index + 1)
+        self.assertEqual(workflow.device.tap.call_count, 3)
 
     def test_home_live_entry_retries_only_on_fresh_confirmed_home(self):
         workflow,clock,frames=self.ui_workflow(['home','live_menu','room'])
@@ -1584,6 +2120,68 @@ class CooperativeTests(unittest.TestCase):
             self.assertEqual(csv_path.read_bytes(), b'\xff\xfeinvalid')
             self.assertEqual(workflow.completed_rounds, 0)
             self.assertEqual(workflow.last_report['task_state'], 'waiting_persistence')
+
+    def test_recovery_zero_samples_save_both_source_frames_and_final_guard(self):
+        workflow, clock, frames = self.ui_workflow(['playing'])
+        workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
+        workflow.navigator.zero_life_template = None
+        workflow.read_optional_number = Mock(return_value=0)
+        report = {'playback': {'release_confirmed': True}, 'engine': 'legacy'}
+        workflow.last_report = report
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertFalse(workflow.observe_recovery_death(frames['playing'], root, captured_at=10.))
+            self.assertTrue(workflow.observe_recovery_death(frames['playing'], root, captured_at=12.))
+            workflow.save_recovery_evidence(report, root)
+            self.assertTrue(report['life_monitor']['zero_confirmed'])
+            samples = report['recovery_observation']['samples']
+            self.assertEqual([sample['captured_at'] for sample in samples], [10., 12.])
+            self.assertEqual([sample['zero_streak'] for sample in samples], [1, 2])
+            replay = LifeGuard(bar_area=(1008, 48, 1177, 56))
+            for sample in samples:
+                frame = cv2.imread(str(root / sample['path']))
+                self.assertEqual(sample['zero_method'], 'ocr')
+                self.assertEqual(sample['zero_value'], 0)
+                self.assertEqual(sample['filled_pixels'], 0)
+                replay.observe(frame, lambda image: sample['zero_value'] == 0)
+            self.assertTrue(replay.zero_confirmed)
+
+    def test_recovery_blank_sample_does_not_inherit_failed_page_evidence(self):
+        workflow, clock, frames = self.ui_workflow(['failed', 'black'])
+        workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
+        workflow.last_report = {}
+        with tempfile.TemporaryDirectory() as directory:
+            for when, name in [(10., 'failed'), (12., 'black'), (14., 'failed')]:
+                self.assertFalse(workflow.observe_recovery_death(frames[name], Path(directory), captured_at=when))
+        samples = workflow.last_report['recovery_observation']['samples']
+        self.assertEqual(samples[0]['confirmation_frames'], 1)
+        self.assertTrue(samples[1]['blank_transition'])
+        self.assertIsNone(samples[1]['pause_score'])
+        self.assertIsNone(samples[1]['life_hud_score'])
+        self.assertIsNone(samples[1]['abnormal_page'])
+        self.assertEqual(samples[1]['confirmation_frames'], 0)
+        self.assertFalse(samples[1]['bar_observed'])
+        self.assertEqual(samples[2]['confirmation_frames'], 1)
+        self.assertFalse(workflow.life_guard.zero_confirmed)
+
+    def test_recovery_observation_is_bounded_and_unknown_zero_never_confirms(self):
+        for mode in ('healthy', 'unknown_zero', 'pause_only'):
+            workflow, clock, frames = self.ui_workflow(['playing'])
+            workflow.life_guard = LifeGuard(bar_area=(1008, 48, 1177, 56))
+            workflow.navigator.zero_life_template = None
+            workflow.read_optional_number = Mock(side_effect=ValueError('数字未知'))
+            frame = frames['playing']
+            if mode == 'healthy': frame[48:56, 1008:1177] = (0, 255, 0)
+            if mode == 'pause_only':
+                original = workflow.navigator.match.side_effect
+                workflow.navigator.match.side_effect = lambda image, name, *args: ((0., (0, 0)) if name == 'life_hud' else original(image, name, *args))
+            workflow.last_report = {}
+            with tempfile.TemporaryDirectory() as directory:
+                for index in range(12):
+                    self.assertFalse(workflow.observe_recovery_death(frame, Path(directory), captured_at=index * 2.))
+            self.assertEqual(len(workflow.recovery_sample_frames), 8)
+            self.assertFalse(workflow.life_guard.zero_confirmed)
+            if mode in ('healthy', 'pause_only'): workflow.read_optional_number.assert_not_called()
 
     def test_persistence_retry_updates_final_json_and_indexes_run_only_once(self):
         from project_sekai.cooperative_live import append_cooperative_result_index as real_index

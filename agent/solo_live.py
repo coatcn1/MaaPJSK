@@ -50,8 +50,10 @@ def task_id(argv) -> int:
 def validate_option(key: str, value):
     if key == "difficulty" and value in {"easy", "normal", "hard", "expert", "master", "append"}:
         return value
-    if key == "song_mode" and value in {"current", "random"}:
+    if key == "song_mode" and value in {"current", "random", "specified"}:
         return value
+    if key == "song_name" and isinstance(value, str) and value.strip():
+        return value.strip()
     if key == "bonus_consumption" and value == "current":
         return value
     if key == "recovery_mode" and value in {"off", "small", "large"}:
@@ -115,7 +117,10 @@ class ProjectSekaiSoloLive(CustomAction):
             if context.tasker.stopping:
                 return False
             settings = _SETTINGS.pop(task_id(argv))
-            if set(settings) != {"difficulty", "song_mode", "count", "recovery_mode", "recovery_count"}:
+            expected_keys = {"difficulty", "song_mode", "count", "recovery_mode", "recovery_count"}
+            if settings.get("song_mode") == "specified":
+                expected_keys.add("song_name")
+            if set(settings) != expected_keys:
                 raise ValueError("单人谱面任务配置不完整")
             root = Path(__file__).resolve().parents[1]
             performance = load_performance(root)
@@ -132,7 +137,8 @@ class ProjectSekaiSoloLive(CustomAction):
                          bonus_consumption=performance.bonus_consumption, recovery_mode=settings["recovery_mode"],
                          recovery_count=settings["recovery_count"], engine=performance.engine,
                          latency_offsets=profile.get("latency_offsets", {}) if profile else None,
-                         calibration_profile=profile)
+                         calibration_profile=profile,
+                         **({"song_name": settings["song_name"]} if settings["song_mode"] == "specified" else {}))
             return True
         except InterruptedError:
             return False

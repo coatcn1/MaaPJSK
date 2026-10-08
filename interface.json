@@ -79,7 +79,9 @@
       "entry": "OneShotChartLive",
       "default_check": false,
       "description": "手动进入单人或协力演出后，最长等待 5 分钟最终歌曲封面与标题；按所选难度演奏一曲即停止，保留游戏结算页面。任务难度须与手动选择的游戏难度一致。引擎和手动偏移沿用演奏设置。",
-      "option": ["OneShotChartLiveDifficulty"]
+      "option": [
+        "OneShotChartLiveDifficulty"
+      ]
     },
     {
       "name": "SoloChartCalibration",
@@ -99,12 +101,72 @@
       "label": "谱面难度",
       "default_case": "EASY",
       "cases": [
-        {"name": "EASY", "label": "EASY", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "easy"}}}},
-        {"name": "NORMAL", "label": "NORMAL", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "normal"}}}},
-        {"name": "HARD", "label": "HARD", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "hard"}}}},
-        {"name": "EXPERT", "label": "EXPERT", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "expert"}}}},
-        {"name": "MASTER", "label": "MASTER", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "master"}}}},
-        {"name": "APPEND", "label": "APPEND", "pipeline_override": {"OneShotChartLiveDifficultyConfig": {"custom_action_param": {"difficulty": "append"}}}}
+        {
+          "name": "EASY",
+          "label": "EASY",
+          "pipeline_override": {
+            "OneShotChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "easy"
+              }
+            }
+          }
+        },
+        {
+          "name": "NORMAL",
+          "label": "NORMAL",
+          "pipeline_override": {
+            "OneShotChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "normal"
+              }
+            }
+          }
+        },
+        {
+          "name": "HARD",
+          "label": "HARD",
+          "pipeline_override": {
+            "OneShotChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "hard"
+              }
+            }
+          }
+        },
+        {
+          "name": "EXPERT",
+          "label": "EXPERT",
+          "pipeline_override": {
+            "OneShotChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "expert"
+              }
+            }
+          }
+        },
+        {
+          "name": "MASTER",
+          "label": "MASTER",
+          "pipeline_override": {
+            "OneShotChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "master"
+              }
+            }
+          }
+        },
+        {
+          "name": "APPEND",
+          "label": "APPEND",
+          "pipeline_override": {
+            "OneShotChartLiveDifficultyConfig": {
+              "custom_action_param": {
+                "difficulty": "append"
+              }
+            }
+          }
+        }
       ]
     },
     "AutoLiveSongMode": {
@@ -242,6 +304,23 @@
               "custom_action_param": {
                 "song_mode": "random"
               }
+            }
+          }
+        },
+        {
+          "name": "Specified",
+          "label": "指定歌曲搜索",
+          "option": [
+            "SoloChartLiveSongName"
+          ],
+          "pipeline_override": {
+            "SoloChartLiveSongConfig": {
+              "custom_action_param": {
+                "song_mode": "specified"
+              },
+              "next": [
+                "SoloChartLiveSongNameConfig"
+              ]
             }
           }
         }
@@ -705,6 +784,27 @@
           }
         }
       ]
+    },
+    "SoloChartLiveSongName": {
+      "type": "input",
+      "label": "完整歌曲名",
+      "inputs": [
+        {
+          "name": "SongName",
+          "label": "本地目录中的完整曲名",
+          "default": "",
+          "pipeline_type": "string",
+          "verify": "^.+$",
+          "pattern_msg": "请输入完整曲名"
+        }
+      ],
+      "pipeline_override": {
+        "SoloChartLiveSongNameConfig": {
+          "custom_action_param": {
+            "song_name": "{SongName}"
+          }
+        }
+      }
     }
   }
 }

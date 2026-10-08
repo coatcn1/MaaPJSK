@@ -150,5 +150,16 @@
         ]
       }
     }
+  },
+  "SoloChartLiveSongNameConfig": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "ProjectSekaiSoloLiveConfig",
+    "custom_action_param": {
+      "song_name": ""
+    },
+    "next": [
+      "SoloChartLiveCountConfig"
+    ]
   }
 }

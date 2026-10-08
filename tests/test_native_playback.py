@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 from project_sekai import native_engine
 from project_sekai.chart_player import Touch, compile_touches
@@ -332,6 +333,47 @@ class SettingsCalibrationTests(unittest.TestCase):
             self.assertEqual(calls[0][0][3],-23)
             self.assertEqual(session['initial_offset_source'],'explicit')
             self.assertEqual(session['initial_offset_ms'],-23)
+
+    def test_calibration_two_rounds_share_one_task_snapshot_and_next_run_refreshes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshots = []
+            def run(*args, **kwargs):
+                snapshot = kwargs['_bonus_snapshot']
+                snapshots.append(snapshot)
+                snapshot.setdefault('consumption', 5)
+                return [good_report()]
+            workflow = SimpleNamespace(log=lambda _: None, run=run, stop_requested=lambda: False)
+            runner = CalibrationRunner(workflow, CalibrationProfiles(root / 'profiles'), {},
+                                       PerformanceSettings(), root / 'sessions')
+            runner.run('easy', 'current')
+            runner.run('easy', 'current')
+            self.assertIs(snapshots[0], snapshots[1])
+            self.assertIs(snapshots[2], snapshots[3])
+            self.assertIsNot(snapshots[0], snapshots[2])
+
+    def test_calibration_validation_navigation_failure_retains_confirmed_task_consumption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = []
+            workflow = SimpleNamespace(log=lambda _: None, stop_requested=lambda: False,
+                                       restore_calibration_bonus=Mock())
+            def run(*args, **kwargs):
+                if reports:
+                    workflow.last_report = {'error': '正式验证选曲失败'}
+                    raise RuntimeError('正式验证选曲失败')
+                kwargs['_bonus_snapshot'].update(consumption=5, confirmed=True, original_consumption=5)
+                report = good_report()
+                report['bonus'] = {'consumption': 5, 'confirmed': True, 'original_consumption': 5}
+                reports.append(report)
+                workflow.last_report = report
+                return [report]
+            workflow.run = run
+            runner = CalibrationRunner(workflow, CalibrationProfiles(root / 'profiles'), {},
+                                       PerformanceSettings(), root / 'sessions', test_bonus_consumption='current')
+            with self.assertRaisesRegex(RuntimeError, '正式验证选曲失败'):
+                runner.run('easy', 'current')
+            workflow.restore_calibration_bonus.assert_not_called()
 
     def test_formal_validation_requires_real_full_execution_and_correct_chart_total(self):
         self.assertTrue(validation_passed(good_report(95)))

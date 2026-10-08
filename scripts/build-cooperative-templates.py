@@ -16,7 +16,11 @@ def build(captures: Path, output: Path, manifest: Path):
     specifications = json.loads(manifest.read_text(encoding="utf-8-sig"))
     paths = {}
     for name, region in specifications["regions"].items():
-        frame = read_image(captures / region["capture"])
+        source = captures / region["capture"]
+        # 只有显式可选且缺失的截图可跳过；已有坏图或非法裁剪仍须报错。
+        if region.get("optional") is True and not source.exists():
+            continue
+        frame = read_image(source)
         x1, y1, x2, y2 = region["box"]
         if frame.shape[:2] != (720, 1280) or not (0 <= x1 < x2 <= 1280 and 0 <= y1 < y2 <= 720):
             raise ValueError(f"协力截图尺寸或裁剪区域无效：{name}")

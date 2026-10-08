@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from collections import deque
 from datetime import datetime
 import csv
 import json
@@ -14,11 +15,11 @@ import cv2
 import numpy as np
 
 from .chart_catalog import ChartRepository, _write_json
-from .chart_player import ChartPlayer, StartAnchor, compile_touches
+from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context
 from .calibration import verify_profile_anchor
-from .life_monitor import LifeDepleted, LifeGuard
-from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition
-from .navigator import Navigator
+from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
+from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
+from .navigator import Navigator, read_available_bonus
 from .ocr import LineOcr, Reading
 from .performance_trace import PerformanceTrace
 from .song_identity import SongMatcher, normalize_title, write_image
@@ -27,6 +28,9 @@ from .sus_chart import parse_sus
 
 DIFFICULTY_POINTS = {"easy": (854, 488), "normal": (934, 492), "hard": (1016, 497),
                      "expert": (1094, 501), "master": (1175, 504)}
+SEARCH_QUERY_BOX = (151, 24, 580, 62)
+SEARCH_QUERY_BOXES = (SEARCH_QUERY_BOX, (151, 20, 580, 65), (151, 27, 580, 57))
+SEARCH_NATIVE_QUERY_BOX = (12, 642, 460, 696)
 
 
 def numeric(reading: Reading) -> int:
@@ -112,7 +116,231 @@ class SoloLive:
             self.navigator._check_stop()
             time.sleep(min(.04, max(0, end - time.monotonic())))
 
-    def select(self, difficulty: str, song_mode: str):
+    def resolve_specified_song(self, song_name: str, difficulty: str) -> int:
+        if not isinstance(song_name, str) or not song_name.strip():
+            raise ValueError("指定歌曲名不能为空")
+        matches = [song_id for song_id, song in self.repository.songs.items()
+                   if normalize_title(song['title']) == normalize_title(song_name)]
+        if len(matches) != 1:
+            raise ValueError("指定歌曲须与本地目录的唯一完整曲名匹配")
+        song_id = matches[0]
+        if difficulty not in self.repository.songs[song_id]['charts']:
+            raise ValueError("指定歌曲的请求难度未收录本地谱面")
+        # 搜索前校验实际文件，不能为了找歌先输入，之后才发现本地谱面损坏。
+        self.repository.load_chart(song_id, difficulty)
+        return song_id
+
+    def checked_search_page(self):
+        self.navigator._check_stop()
+        frame = self.screenshot()
+        if (blank_transition(frame) or self.navigator.match(frame, 'playing')[0] >= self.navigator.threshold
+                or self.navigator.match(frame, 'life_hud', LIFE_HUD_AREA)[0] >= self.navigator.threshold):
+            raise RuntimeError("指定搜索未确认无演奏 HUD 的单人选曲页")
+        if self.navigator.match(frame, 'song_select')[0] < self.navigator.threshold:
+            # 无结果的决定按钮变灰，但搜索页固定双标题仍可提供独立正证据。
+            layout = self.ocr.read(frame, (680, 25, 757, 59))
+            order = self.ocr.read(frame, (995, 25, 1142, 59))
+            if (layout.confidence < .85 or normalize_title(layout.text) != normalize_title('リスト')
+                    or order.confidence < .85 or normalize_title(order.text) != normalize_title('配信順')):
+                raise RuntimeError("指定搜索页面模板与固定双标题均未确认")
+        return frame
+
+    def select_all_search_category(self):
+        # 分类列表可能滚动到中段；只在已确认页面内有界向下滑动，找到实际文字才点击。
+        for attempt in range(4):
+            frame = self.checked_search_page()
+            matches = []
+            for y in range(85, 636, 50):
+                reading = self.ocr.read(frame, (35, y, 114, y + 50))
+                if reading.confidence >= .85 and normalize_title(reading.text) == normalize_title('すべて'):
+                    matches.append((74, y + 25))
+            if len(matches) == 1:
+                fresh = self.checked_search_page()
+                x, y = matches[0]
+                verified = self.ocr.read(fresh, (35, y - 25, 114, y + 25))
+                if verified.confidence < .85 or normalize_title(verified.text) != normalize_title('すべて'):
+                    raise RuntimeError("搜索分类在操作前已变化")
+                self.navigator._check_stop()
+                self.navigator.tap(*matches[0], '搜索分类：すべて')
+                self.pause(.3)
+                for _ in range(3):
+                    fresh = self.checked_search_page()
+                    selected = self.ocr.read(fresh, (35, y - 25, 114, y + 25))
+                    hsv = cv2.cvtColor(fresh[y - 25:y + 25, 35:114], cv2.COLOR_BGR2HSV)
+                    active = cv2.countNonZero(cv2.inRange(hsv, (75, 60, 120), (100, 255, 255))) >= 80
+                    # 分类选中由青色文字确认；点击回执和白色すべて不能证明已切换。
+                    if selected.confidence >= .85 and normalize_title(selected.text) == normalize_title('すべて') and active:
+                        return
+                    self.pause(.2)
+                raise RuntimeError("すべて分类点击后未确认选中，拒绝搜索")
+            if matches or attempt == 3:
+                raise RuntimeError("未唯一确认搜索分类すべて，拒绝在局部分类搜索")
+            self.navigator._check_stop()
+            self.device.swipe(70, 180, 70, 550)
+            self.pause(.3)
+
+    @staticmethod
+    def native_search_text_present(frame) -> bool:
+        x1, y1, x2, y2 = SEARCH_NATIVE_QUERY_BOX
+        gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        if float(np.mean(gray)) < 220:
+            return False
+        _, _, stats, _ = cv2.connectedComponentsWithStats(np.uint8(gray < 190), connectivity=8)
+        # 原生白色文本行只测有无字形；忽略细光标与右边界被 toast 裁入的分量，不解释曲名。
+        return any(width >= 3 and height >= 3 and area >= 12 and x + width < gray.shape[1]
+                   for x, y, width, height, area in stats[1:])
+
+    def submit_song_search(self, title: str):
+        query = title.replace(' ', '')
+        report = getattr(self, 'last_report', None)
+        if isinstance(report, dict):
+            report['search_query'] = query
+        frame = self.checked_search_page()
+        if self.search_clear_visible(frame):
+            # 新搜索前清除正向确认的旧查询；提交后绝不再次点击 X。
+            self.navigator._check_stop()
+            self.navigator.tap(610, 42, '搜索前清除旧查询')
+            self.pause(.3)
+            frame = self.checked_search_page()
+            if self.search_clear_visible(frame):
+                raise RuntimeError("搜索前清除后查询 X 仍在")
+        self.navigator.tap(350, 42, '打开歌曲搜索输入')
+        self.pause(.2)
+        frame = self.checked_search_page()
+        confirm = self.ocr.read(frame, (1180, 644, 1254, 693))
+        if confirm.confidence < .85 or normalize_title(confirm.text) != normalize_title('确定'):
+            raise RuntimeError("未确认原生搜索输入框的确定按钮")
+        if self.native_search_text_present(frame):
+            raise RuntimeError("原生搜索编辑框并非空白，拒绝重复输入")
+        self.navigator._check_stop()
+        if not self.device.controller.post_input_text(query).wait().succeeded:
+            raise RuntimeError("歌曲搜索文本输入失败")
+        self.wait_search_submission(title)
+        self.navigator._check_stop()
+        self.navigator.tap(1215, 667, '提交歌曲搜索')
+        self.pause(.4)
+
+    def search_query_readings(self, frame):
+        # 固定有限几何仅保留诊断读数，不作为输入或身份的语义门槛。
+        return [{'source': 'top', 'box': list(box), **asdict(self.ocr.read(frame, box))}
+                for box in SEARCH_QUERY_BOXES]
+
+    def wait_search_submission(self, title: str):
+        deadline = time.monotonic() + 2
+        consecutive = 0
+        while True:
+            frame = self.checked_search_page()
+            readings = self.search_query_readings(frame)
+            confirm = self.ocr.read(frame, (1180, 644, 1254, 693))
+            confirm_valid = confirm.confidence >= .85 and normalize_title(confirm.text) == normalize_title('确定')
+            if confirm_valid:
+                # 原生左文本行是独立黑白通道，避开右侧粘贴 toast；只有真实编辑框成立才读取。
+                readings.append({'source': 'native', 'box': list(SEARCH_NATIVE_QUERY_BOX),
+                                 **asdict(self.ocr.read(frame, SEARCH_NATIVE_QUERY_BOX))})
+            present = self.native_search_text_present(frame)
+            chosen = readings[0]
+            evidence = {'query_box': chosen['box'], 'typed': {'text': chosen['text'], 'confidence': chosen['confidence']},
+                        'confirm': asdict(confirm), 'query_readings': readings, 'native_text_present': present}
+            report = getattr(self, 'last_report', None)
+            if isinstance(report, dict):
+                report['search_submission_readings'] = evidence
+            valid = present and confirm_valid
+            consecutive = consecutive + 1 if valid else 0
+            if consecutive >= 2:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"原生搜索编辑状态未确认，拒绝提交：{evidence}")
+            # 文本粘贴回执不等于画面刷新；限时只读新帧，不重复粘贴、清除或提交。
+            self.pause(min(.15, remaining))
+
+    @staticmethod
+    def search_clear_visible(frame) -> bool:
+        # 固定搜索框内的深色双对角 X；放大镜只有单侧柄，不能作为清除按钮证据。
+        gray = cv2.cvtColor(frame[30:54, 598:622], cv2.COLOR_BGR2GRAY)
+        dark = np.uint8(gray < 115) * 255
+        lines = cv2.HoughLinesP(dark, 1, np.pi / 180, 9, minLineLength=12, maxLineGap=2)
+        slopes = set()
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                dx, dy = int(x2 - x1), int(y2 - y1)
+                if abs(dx) >= 10 and .7 <= abs(dy / dx) <= 1.3:
+                    slopes.add(1 if dx * dy > 0 else -1)
+        return slopes == {-1, 1}
+
+    def search_specified_song(self, song_id: int, difficulty: str):
+        title = self.repository.songs[song_id]['title']
+        self.select_all_search_category()
+        self.submit_song_search(title)
+        selected = None
+        # 完整曲名查询通常自动选中唯一结果；只接受真实选中身份，不猜第一张卡的位置。
+        for index in range(2):
+            frame = self.checked_search_page()
+            readings = self.search_query_readings(frame)
+            confirm = self.ocr.read(frame, (1180, 644, 1254, 693))
+            native_open = confirm.confidence >= .85 and normalize_title(confirm.text) == normalize_title('确定')
+            committed = not native_open and self.search_clear_visible(frame)
+            report = getattr(self, 'last_report', None)
+            if isinstance(report, dict):
+                report['search_result_query_readings'] = readings
+                report['search_result_query_verification'] = {
+                    'method': 'actual_target_after_commit' if committed else 'unconfirmed',
+                    'native_open': native_open, 'query_x_visible': committed, 'target_confirmed': False}
+            if not committed:
+                raise RuntimeError("提交后的指定歌曲查询词或提交状态未确认")
+            identity = self.matcher.match(frame, difficulty, 'song_select')
+            if isinstance(report, dict):
+                report['search_result_query_verification']['actual_song_id'] = identity.song_id
+            if identity.song_id != song_id:
+                raise RuntimeError("搜索结果未选中指定歌曲，拒绝演出其他歌曲")
+            if isinstance(report, dict):
+                report['search_result_query_verification'].update(target_confirmed=True, target_confirmation_frames=index + 1)
+            selected = identity
+            self.pause(.2)
+        return selected
+
+    @staticmethod
+    def selected_card_padlock(frame) -> bool:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white = cv2.inRange(hsv, (0, 0, 235), (179, 40, 255))
+        selected = []
+        for contour in cv2.findContours(white[170:550, 170:710], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            x, y, width, height = cv2.boundingRect(contour)
+            if 165 <= width <= 190 and 165 <= height <= 190 and cv2.contourArea(contour) > width * height * .8:
+                selected.append((x + 170, y + 170, width, height))
+        if len(selected) != 1:
+            return False
+        x, y, width, height = selected[0]
+        cx, cy = x + width // 2, y + height // 2
+        crop = frame[cy - 30:cy + 30, cx - 26:cx + 26]
+        mask = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV), (0, 0, 235), (179, 40, 255))
+        for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            lx, ly, lw, lh = cv2.boundingRect(contour)
+            if not (30 <= lw <= 42 and 36 <= lh <= 48):
+                continue
+            part = mask[ly:ly + lh, lx:lx + lw] > 0
+            dark = cv2.cvtColor(crop[ly:ly + lh, lx:lx + lw], cv2.COLOR_BGR2GRAY) < 110
+            # 白锁须同时有实心底座、暗色锁环内孔与钥匙孔，不能把白色文字当作锁。
+            if (np.mean(part[round(lh * .4):]) >= .85
+                    and np.mean(dark[round(lh * .12):round(lh * .33), round(lw * .27):round(lw * .73)]) >= .65
+                    and np.mean(dark[round(lh * .48):round(lh * .86), round(lw * .35):round(lw * .65)]) >= .2):
+                return True
+        return False
+
+    def specified_decide_state(self, frame) -> str:
+        reading = self.ocr.read(frame, (976, 578, 1042, 608))
+        if reading.confidence < .7 or normalize_title(reading.text) not in {normalize_title('決定'), normalize_title('决定')}:
+            return 'unknown'
+        value = float(np.median(cv2.cvtColor(frame[573:606, 955:1060], cv2.COLOR_BGR2HSV)[:, :, 2]))
+        locked = self.selected_card_padlock(frame)
+        if locked and 50 <= value <= 100:
+            return 'locked'
+        if not locked and value >= 115:
+            return 'ready'
+        return 'unknown'
+
+    def select(self, difficulty: str, song_mode: str, *, song_name: str | None = None):
+        expected_song_id = self.resolve_specified_song(song_name, difficulty) if song_mode == 'specified' else None
         self.navigator.return_to_home()
         self.navigator.tap(1194, 649, "主页 Live")
         self.navigator.wait("live_menu")
@@ -132,17 +360,31 @@ class SoloLive:
                 raise RuntimeError("选曲页未切换到请求的难度组")
         if song_mode == "random":
             self.navigator._select_random_song(frame)
+        elif song_mode == 'specified':
+            selected = self.search_specified_song(expected_song_id, difficulty)
         if difficulty == "append":
             # Append 组只显示中央一个难度按钮，与普通五难度组的坐标不同。
             self.navigator.tap(1015, 500, "Append 难度")
         else:
             self.navigator.tap(*DIFFICULTY_POINTS[difficulty], f"{difficulty.upper()} 难度")
         self.pause(.4)
+        if expected_song_id is not None:
+            frame = self.checked_search_page()
+            actual = self.matcher.match(frame, difficulty, 'song_select')
+            if actual.song_id != expected_song_id:
+                raise RuntimeError("指定歌曲在切换难度后发生变化")
+            state = self.specified_decide_state(frame)
+            if state == 'locked':
+                raise RuntimeError("指定歌曲尚未解锁，请先在游戏音乐商店解锁")
+            if state != 'ready':
+                raise RuntimeError("指定歌曲的决定按钮未确认可用，拒绝点击")
         self.navigator.tap(1007, 590, "选曲确认")
         frame = self.navigator.wait("prepare")
         prepared = self.matcher.match(frame, difficulty, "prepare")
         if selected is not None and selected.song_id != prepared.song_id:
             raise RuntimeError("切换难度后当前歌曲发生变化，拒绝演出其他歌曲")
+        if expected_song_id is not None and prepared.song_id != expected_song_id:
+            raise RuntimeError("指定歌曲与准备页实际歌曲不符，拒绝演出")
         return prepared, frame
 
     def prepare_bonus(self, consumption: str | int, report: dict, directory: Path, *, setup_playback=True, return_page="prepare"):
@@ -189,11 +431,33 @@ class SoloLive:
             self.pause(.12)
         write_image(directory / "bonus.png", frame)
         report["bonus"] = {"requested_consumption": consumption, "consumption": target,
-                           "confirmed": True, "readings": readings, "original_consumption": original}
+                           "confirmed": False, "readings": readings, "original_consumption": original}
         self.navigator.tap(762, 655, f"保存 {target} 体力消耗")
         frame = self.navigator.wait(return_page)
+        # 菜单读数只证明当前选择；保存回执和实际返回成功之后才可缓存或宣称设置保留。
+        report["bonus"]["confirmed"] = True
         if not setup_playback:
             return
+        self.prepare_playback(report, frame=frame)
+
+    def prepare_task_bonus(self, consumption, report, directory, snapshot, *, return_page="prepare"):
+        if snapshot:
+            # 后续局沿用本任务已保存的确认，不把历史读数包装成当前两帧检测。
+            report["bonus"] = dict(snapshot, confirmation_source="task_snapshot")
+            return
+        self.prepare_bonus(consumption, report, directory, setup_playback=False, return_page=return_page)
+        bonus = report["bonus"]
+        if bonus.get("confirmed") is not True:
+            raise RuntimeError("任务体力消耗尚未确认，拒绝缓存和开演")
+        bonus.update(confirmation_source="observed", source_report=report["report_path"])
+        # 只有菜单保存及返回成功才缓存；每局可用体力和回复证据不属于设置快照。
+        snapshot.update({key: bonus[key] for key in ("requested_consumption", "consumption", "confirmed",
+                                                   "original_consumption", "source_report")})
+
+    def prepare_playback(self, report, *, frame=None):
+        self.navigator.ensure_auto(False)
+        if frame is None:
+            frame = self.navigator.wait("prepare")
         # 轻量背景提供固定开场锚点，不修改用户的流速或游戏判定偏移。
         for _ in range(5):
             mode = self.ocr.read(frame, (43, 647, 153, 685))
@@ -206,7 +470,7 @@ class SoloLive:
         else:
             raise RuntimeError("未确认轻量演出，拒绝使用未知背景开演")
         self.navigator.ensure_auto(False)
-        self.log(f"每局消耗 {target} 体力已确认：AUTO 关闭、轻量背景")
+        self.log("本局演奏准备已确认：AUTO 关闭、轻量背景")
 
     def restore_calibration_bonus(self, consumption: int, directory: Path):
         frame = self.screenshot()
@@ -250,23 +514,7 @@ class SoloLive:
         raise RuntimeError("用户指定的体力消耗数量未确认，停止调整")
 
     def read_available_bonus(self, frame: np.ndarray) -> tuple[int, Reading]:
-        box = (1057, 27, 1128, 59)
-        raw = self.ocr.read(frame, box)
-        x1, y1, x2, y2 = box
-        hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, (0, 0, 190), (179, 95, 255))
-        digits = cv2.cvtColor(255 - mask, cv2.COLOR_GRAY2BGR)
-        digits = cv2.copyMakeBorder(digits, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        processed = self.ocr.read(digits, (0, 0, digits.shape[1], digits.shape[0]))
-        values = []
-        for reading in (raw, processed):
-            match = re.fullmatch(r"(\d{1,4})[/／](\d{1,4})", re.sub(r"\s+", "", reading.text))
-            if reading.confidence >= .75 and match and int(match[2]) > 0:
-                values.append((int(match[1]), reading))
-        # 只读取顶部实际体力，不识别饮料库存或已选瓶数；冲突读数不能触发用药。
-        if not values or len({value for value, _ in values}) != 1:
-            raise ValueError(f"当前体力无法确认：{raw}，{processed}")
-        return values[0]
+        return read_available_bonus(self.ocr, frame)
 
     def wait_available_bonus(self) -> tuple[np.ndarray, int, list[dict]]:
         deadline = time.monotonic() + 8
@@ -290,30 +538,52 @@ class SoloLive:
 
     def ensure_bonus_available(self, mode: str, count: int, report: dict, directory: Path):
         consumption = report["bonus"]["consumption"]
+        previous = getattr(self.navigator, "recovery_evidence", None)
+        pending_batch = (isinstance(previous, dict) and previous.get("ok_requested")
+                         and previous.get("status") == "started")
+        if pending_batch:
+            # 当前体力足够开演也不能证明原批次已足额到账，跨报告继续保留未确认请求。
+            report["recovery"] = dict(previous, inherited_pending_batch=True)
+            _write_json(directory / "report.json", report)
         if consumption == 0:
             report["bonus"]["availability"] = "not_required"
             return
         before, available, readings = self.wait_available_bonus()
         report["bonus"].update(available_before=available, availability_readings=readings)
+        if pending_batch:
+            report["recovery"]["current_available"] = available
         if available >= consumption:
             report["bonus"]["availability"] = "sufficient"
+            if pending_batch:
+                _write_json(directory / "report.json", report)
             return
         report["bonus"]["availability"] = "insufficient"
         if mode == "off":
             raise RuntimeError(f"当前体力 {available}，每局需要 {consumption}；自动用药已关闭，请补充体力或修改任务设置")
+        if pending_batch:
+            _write_json(directory / "report.json", report)
+            raise RuntimeError("本任务先前已请求批量用药但到账未确认，请用户处理；不追加或重复整批")
         report["recovery"] = {"mode": mode, "requested_bottles": count, "completed_bottles": 0, "available_before": available,
                               "status": "started"}
         _write_json(directory / "report.json", report)
         self.log(f"体力不足：当前 {available} / 每局需要 {consumption}，按用户设置自动回复")
         self.navigator.tap(1086, 42, "打开体力回复")
-        def record_bottle(completed, frame):
+        def record_batch(completed, frame):
             value, reading = self.read_available_bonus(frame)
-            # 每瓶实际到账后落盘，后续确认失败也保留已用数量，不能把一批重新执行。
+            # 整批足额到账后先落盘，关闭提示失败也保留已用数量，不能把本批重新执行。
             report["recovery"].update(completed_bottles=completed, available_after=value,
-                                      last_bottle_reading=asdict(reading))
+                                      batch_reading=asdict(reading), status="credited",
+                                      expected_increase=count * (1 if mode == "small" else 10))
             _write_json(directory / "report.json", report)
 
-        self.navigator._recover_and_verify(before, mode, count, on_recovered=record_bottle)
+        try:
+            self.navigator._recover_and_verify(before, mode, count, on_recovered=record_batch)
+        except Exception:
+            evidence = getattr(self.navigator, "recovery_evidence", None)
+            if isinstance(evidence, dict):
+                report["recovery"].update(evidence)
+            _write_json(directory / "report.json", report)
+            raise
         frame, after, readings = self.wait_available_bonus()
         write_image(directory / "recovery-after.png", frame)
         report["recovery"].update(available_after=after, completed_bottles=count, readings=readings, status="confirmed")
@@ -335,9 +605,94 @@ class SoloLive:
         if len(checks) > 24:
             del checks[0]
 
+    def observe_preplay_life(self, frame, captured_at, report):
+        guard = getattr(self, "life_guard", None)
+        if not isinstance(guard, LifeGuard) or captured_at - guard.last_sample_at < 2.:
+            return
+        guard.last_sample_at = captured_at
+        if not hasattr(self, "preplay_life_frames"):
+            self.preplay_life_frames = deque(maxlen=8)
+        sample = {"captured_at": captured_at, "phase": "anchor" if report.get("final_identity") else "waiting_final",
+                  "life_hud_score": None, "bar_observed": False, "filled_pixels": None, "total_pixels": None,
+                  "zero_template_score": None, "status": "unknown"}
+        depleted = False
+        try:
+            if blank_transition(frame):
+                guard.zero_streak = 0
+                sample["status"] = "blank_transition"
+                return
+            templates = getattr(self.navigator, "templates", {})
+            if not isinstance(templates, dict) or "life_hud" not in templates:
+                guard.zero_streak = 0
+                return
+            score = self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0]
+            sample["life_hud_score"] = float(score)
+            if score < self.navigator.threshold:
+                guard.zero_streak = 0
+                return
+            guard.hud_seen = True
+            template = getattr(self.navigator, "zero_life_template", None)
+            if not isinstance(template, ZeroLifeTemplate) and isinstance(templates.get("life_zero_value"), np.ndarray):
+                template = ZeroLifeTemplate(templates["life_zero_value"])
+                self.navigator.zero_life_template = template
+            area = (1090, 16, 1187, 45) if guard.bar_area[1] == 48 else (1090, 8, 1187, 37)
+            def read_zero(image):
+                if not isinstance(template, ZeroLifeTemplate):
+                    sample["status"] = "zero_template_unavailable"
+                    return False
+                sample["zero_template_score"] = float(template.score(image, area))
+                return sample["zero_template_score"] >= .90
+            sample["bar_observed"] = True
+            sample["status"] = "observed"
+            depleted = guard.observe(frame, read_zero)
+            sample.update(filled_pixels=guard.bar_fill_pixels, total_pixels=guard.bar_total_pixels)
+        except (ValueError, cv2.error) as error:
+            guard.zero_streak = 0
+            sample.update(status="detection_unknown", error=str(error))
+        finally:
+            sample.update(zero_streak=guard.zero_streak, death_confirmed=depleted)
+            # 沿用开场现有帧和两秒节奏；不截图、不 OCR、不编码，释放后才保存证据。
+            self.preplay_life_frames.append((sample, frame.copy()))
+            report["preplay_life_monitor"] = {"capacity": 8, "sample_interval_s": 2., "capture_clock": "request_start",
+                                               "samples": [item[0] for item in self.preplay_life_frames]}
+            report["life_monitor"] = {"samples": guard.samples, "zero_confirmed": guard.zero_confirmed}
+        if depleted:
+            report["preplay_death_confirmed"] = report["death_confirmed"] = True
+            report["death_confirmed_at"] = datetime.now().astimezone().isoformat()
+            raise LifeDepleted("开场／首音同步中连续两帧确认生命零，停止启动并先清理触点")
+
+    def recheck_failed_preplay_life(self, report):
+        guard = self.life_guard
+        samples = report.get("preplay_life_monitor", {}).get("samples", [])
+        if (report.get("start_anchor") or report.get("preplay_death_confirmed")
+                or not samples or samples[-1].get("zero_streak") != 1 or guard.zero_streak != 1
+                or not release_finished(report)):
+            return False
+        # 首音拒绝不改成宽松启动；清理后只补一次正常间隔复查，单帧零不直接退出。
+        self.pause(max(0., guard.last_sample_at + 2. - time.perf_counter()))
+        captured_at = time.perf_counter()
+        frame = self.screenshot()
+        try:
+            self.observe_preplay_life(frame, captured_at, report)
+        except LifeDepleted as death:
+            report["preplay_followup_death_reason"] = str(death)
+            return True
+        return False
+
+    def save_preplay_life_evidence(self, report, directory):
+        playback = report.get("playback")
+        if playback and not release_finished(report):
+            return
+        for index, (sample, frame) in enumerate(getattr(self, "preplay_life_frames", ())):
+            name = f"preplay-life-{index:02d}.png"
+            write_image(directory / name, frame)
+            sample["path"] = name
+
     def start(self, chart, identity, report: dict, directory: Path, *, ready_action=None, frame_guard=None,
-              identity_phase="final", on_final_identity=None, opening_timeout=120, wait_for_opening=False) -> float:
+              identity_phase="final", on_final_identity=None, opening_timeout=120, wait_for_opening=False,
+              opening_deadline_provider=None) -> float:
         self.device.preflight()
+        self.preplay_life_frames = deque(maxlen=8)
         if ready_action is None:
             self.navigator.tap(1013, 563, "开始单人谱面演出")
         else:
@@ -350,28 +705,32 @@ class SoloLive:
         final = None
         # 优先使用四帧；慢截图来不及取得第四帧时，只允许三帧低残差拟合且留足启动余量。
         minimum_samples = 4 if report.get("engine") == "native" else 2
-        anchor = StartAnchor(chart.first, minimum_samples=minimum_samples) if chart is not None else None
+        anchor = (StartAnchor(chart.first, minimum_samples=minimum_samples,
+                              simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
+                              dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else ())
+                  if chart is not None else None)
         loading_saved = False
         last_error = ""
         problem_priority = (-1, -1.0)
         samples = []
         captured_frames = []
-        pinned_frame = None
+        sampled_frames = {}
 
         def retained_anchor_frames():
             retained = {when: screenshot for when, screenshot in captured_frames}
-            if pinned_frame is not None:
-                retained[pinned_frame[0]] = pinned_frame[1]
+            retained.update(sampled_frames)
             return sorted(retained.items())
 
         def update_anchor_attempt(*, failed=False, accepted=False):
-            nonlocal samples, pinned_frame
+            nonlocal samples, sampled_frames
             current = list(anchor.samples)
-            if current and (not samples or current[0] != samples[0]):
-                # 引用已缓存的图像，首个候选被替换时同步更新；最多多保留一张原始帧。
-                pinned_frame = next((item for item in captured_frames if item[0] == current[0][0]), None)
-            if not current:
-                pinned_frame = None
+            wanted = {when for when, _ in current[-32:]}
+            if current:
+                wanted.add(current[0][0])
+            available = {when: screenshot for when, screenshot in captured_frames}
+            available.update(sampled_frames)
+            # 引用现有帧，保留首点与最新 32 个采纳样本；候选替换时释放失效引用。
+            sampled_frames = {when: available[when] for when in wanted if when in available}
             samples = current
             state = ("accepted" if accepted else "no_candidate" if not samples
                      else "candidate_unconfirmed" if len(samples) == 1 else "trajectory_pending")
@@ -381,6 +740,10 @@ class SoloLive:
                 attempt["failure_class"] = (reason if isinstance(reason, str)
                                             else "candidate_motion_unconfirmed" if len(samples) == 1
                                             else "trajectory_unaccepted" if samples else "no_candidate")
+            attempt["sample_frame_capacity"] = 33
+            attempt["sample_frames_retained"] = len(sampled_frames)
+            attempt["sample_frames_truncated"] = len(current) > len(sampled_frames)
+            attempt["frame_capacity"] = 65
             report["anchor_attempt"] = attempt
 
         def save_anchor_frames():
@@ -390,9 +753,11 @@ class SoloLive:
                 write_image(directory / name, screenshot)
                 report["anchor_frames"].append({"captured_at": when, "path": name})
 
-        while time.monotonic() < deadline:
+        frame = None
+        while time.monotonic() < (opening_deadline_provider() if final is None and opening_deadline_provider is not None else deadline):
             before = time.perf_counter()
             frame = self.screenshot()
+            self.observe_preplay_life(frame, before, report)
             if frame_guard is not None:
                 frame_guard(frame)
             # 帧在设备开始 screencap 时生成，gzip 传输及 Agent 图像解码不是拍摄时间。
@@ -429,8 +794,13 @@ class SoloLive:
                     if on_final_identity is not None:
                         chart = on_final_identity(candidate)
                         if anchor is None:
-                            anchor = StartAnchor(chart.first, minimum_samples=minimum_samples)
+                            anchor = StartAnchor(chart.first, minimum_samples=minimum_samples,
+                                                 simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
+                                                 dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else ())
                     final = candidate
+                    if opening_deadline_provider is not None:
+                        # 房间等待可由调用方按正向进展计时；最终身份确认后固定窗口，不再延展首音。
+                        deadline = time.monotonic() + 120
                     if wait_for_opening:
                         # 一键任务的五分钟只限制身份等待；确认后仍须取得完整首音轨迹，不能抢在中途启动。
                         deadline = time.monotonic() + 120
@@ -472,7 +842,8 @@ class SoloLive:
                     self.anchor_frames = retained_anchor_frames()
                     return epoch
             self.pause(.002)
-        write_image(directory / "start-failure.png", frame)
+        if frame is not None:
+            write_image(directory / "start-failure.png", frame)
         if anchor is not None:
             update_anchor_attempt(failed=True)
         save_anchor_frames()
@@ -701,6 +1072,31 @@ class SoloLive:
                                       "planned_actions": len(events),
                                       "lateness_ms_max": max(player.lateness, default=0) * 1000}
 
+    def date_update_notice(self, frame):
+        if blank_transition(frame) or 'life_hud' not in self.navigator.templates:
+            return None
+        hsv = cv2.cvtColor(frame[220:500, 220:1100], cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 0, 225), (179, 25, 245))
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        modal = next((row for row in stats[1:]
+                      if abs(row[0] - 31) <= 8 and abs(row[1] - 28) <= 8
+                      and abs(row[2] - 778) <= 16 and abs(row[3] - 224) <= 16
+                      and row[4] >= row[2] * row[3] * .86), None)
+        if modal is None:
+            return None
+        if (self.navigator.match(frame, 'playing')[0] >= self.navigator.threshold
+                or self.navigator.match(frame, 'life_hud', LIFE_HUD_AREA)[0] >= self.navigator.threshold):
+            return None
+        # 只在结算的已知中部弹窗几何成立后读固定两行；普通结算与开场不追加 OCR。
+        updated = self.ocr.read(frame, (510, 306, 778, 337))
+        title = self.ocr.read(frame, (520, 335, 774, 365))
+        if (updated.confidence < .85 or title.confidence < .85
+                or normalize_title(updated.text) != normalize_title('日付が更新されました。')
+                or normalize_title(title.text) != normalize_title('タイトルに戻ります。')):
+            return None
+        return {'updated': asdict(updated), 'return_to_title': asdict(title),
+                'modal_box': [int(modal[0] + 220), int(modal[1] + 220), int(modal[2]), int(modal[3])]}
+
     def collect(self, report: dict, directory: Path):
         deadline = time.monotonic() + 120
         completed = False
@@ -709,7 +1105,36 @@ class SoloLive:
         last_candidate = None
         stable = 0
         settlement_index = 0
+        date_frames = []
         end_guard = LiveEndGuard(self.navigator, report, life_seen=getattr(getattr(self, "life_guard", None), "hud_seen", False))
+
+        def inspect_date_update(frame):
+            if not release_finished({**report, 'playback': report.get('playback') or {}}):
+                date_frames.clear()
+                return False
+            notice = self.date_update_notice(frame)
+            if notice is None:
+                date_frames.clear()
+                return False
+            date_frames.append(frame)
+            if len(date_frames) < 2:
+                self.pause(.3)
+                return True
+            report.update(requires_relogin=True, requires_relogin_reason='game_date_updated_return_to_title',
+                          requires_relogin_at=datetime.now().astimezone().isoformat(),
+                          date_update_frame='date-update-confirmed.png')
+            report['date_update_notice'] = {**notice, 'confirmation_frames': 2,
+                                            'frames': ['date-update-first.png', 'date-update-confirmed.png']}
+            report['result_status'] = 'recorded' if report.get('judgements') else 'unreadable'
+            # 当前释放已成立才写证据；日更必须人工重登，不能用结算安全像素或 BACK 关闭。
+            write_image(directory / 'date-update-first.png', date_frames[0])
+            write_image(directory / 'date-update-confirmed.png', date_frames[1])
+            raise RuntimeError('游戏日期已更新，需要重新登录；停止结算页面输入')
+
+        def require_current_release():
+            if not release_finished({**report, 'playback': report.get('playback') or {}}):
+                report['completed'] = False
+                raise RuntimeError('结算尚未取得本轮严格触点释放证明，禁止页面输入或记为完成')
 
         def inspect_settlement(frame):
             nonlocal stable, last_candidate, result, completed, failed
@@ -739,12 +1164,15 @@ class SoloLive:
 
         while time.monotonic() < deadline:
             frame = self.screenshot()
+            if inspect_date_update(frame):
+                continue
             if blank_transition(frame):
                 end_guard.observe(frame)
                 self.pause(.3)
                 continue
             candidate = inspect_settlement(frame)
             if self.navigator.match(frame, "home")[0] >= self.navigator.threshold:
+                require_current_release()
                 if failed:
                     report["result_status"] = "recorded" if result else "unreadable"
                     raise RuntimeError("游戏判定演出失败，本局未计入完成次数")
@@ -777,10 +1205,13 @@ class SoloLive:
             if candidate is not None and stable < 2:
                 self.pause(.3)
                 continue
+            require_current_release()
             self.device.tap(1279, 719)
             # 奖励退出动画会先显示模糊主页；留出切换时间后再读，避免旧帧诱发多余 BACK。
             self.pause(1.2)
             confirmation = self.screenshot()
+            if inspect_date_update(confirmation):
+                continue
             if blank_transition(confirmation):
                 end_guard.observe(confirmation)
                 self.pause(.3)
@@ -798,15 +1229,18 @@ class SoloLive:
             if np.mean(confirmation.max(axis=2) < 15) > .95:
                 self.pause(.6)
                 continue
+            require_current_release()
             self.device.back()
             self.pause(1.0)
         raise TimeoutError("结算返回超时")
 
     def run(self, count: int, difficulty: str, song_mode: str, offset_ms: int = 0, *,
             bonus_consumption: str | int = "current", recovery_mode: str = "off", recovery_count: int = 1,
-            engine: str = "legacy", latency_offsets: dict | None = None, calibration_profile: dict | None = None):
-        if difficulty not in {*DIFFICULTY_POINTS, "append"} or song_mode not in {"current", "random"}:
+            engine: str = "legacy", latency_offsets: dict | None = None, calibration_profile: dict | None = None,
+            song_name: str | None = None, _bonus_snapshot: dict | None = None):
+        if difficulty not in {*DIFFICULTY_POINTS, "append"} or song_mode not in {"current", "random", "specified"}:
             raise ValueError("单人谱面任务选项无效")
+        expected_song_id = self.resolve_specified_song(song_name, difficulty) if song_mode == "specified" else None
         if (bonus_consumption != "current" and (isinstance(bonus_consumption, bool)
                 or not isinstance(bonus_consumption, int) or not 0 <= bonus_consumption <= 10)):
             raise ValueError("每局体力消耗只能沿用游戏设置或指定 0 到 10")
@@ -817,6 +1251,8 @@ class SoloLive:
         if engine not in {"legacy", "native"}:
             raise ValueError("演奏引擎无效")
         self.completed_rounds = 0
+        # 普通 run 每次都是新任务；校准的排练与验证显式共用同一个任务快照。
+        bonus_snapshot = {} if _bonus_snapshot is None else _bonus_snapshot
         reports = []
         consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
         recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
@@ -833,11 +1269,14 @@ class SoloLive:
                       "requested_bonus_consumption": bonus_consumption,
                       "recovery_settings": {"mode": recovery_mode, "count": recovery_count}}
             report["engine"] = engine
+            if expected_song_id is not None:
+                report.update(requested_song_name=song_name, expected_song_id=expected_song_id)
             self.last_report = report
             self.begin_performance_trace()
             report["report_path"] = str(directory / "report.json")
             try:
-                identity, frame = self.select(difficulty, song_mode)
+                identity, frame = self.select(difficulty, song_mode,
+                                              **({"song_name": song_name} if song_mode == "specified" else {}))
                 report["preparation_identity"] = identity.to_dict()
                 self.record_identity_check(report, "preparation")
                 write_image(directory / "prepare.png", frame)
@@ -848,14 +1287,16 @@ class SoloLive:
                 self.set_performance_trace_plan(events)
                 report["chart"]["duration"] = chart.duration
                 report["chart"]["planned_actions"] = len(events)
-                self.prepare_bonus(bonus_consumption, report, directory)
+                self.prepare_task_bonus(bonus_consumption, report, directory, bonus_snapshot)
+                self.prepare_playback(report)
                 self.ensure_bonus_available(recovery_mode, recovery_count, report, directory)
                 if engine == "native":
                     from .native_player import NativePlayer
                     native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
                                                  latency_offsets=latency_offsets,
                                                  idle_observer=lambda: self.observe_play_state(directory))
-                    # 设备连接和探测在点击开演之前完成；开场窗口只承担身份确认与首音同步。
+                    # 开场死亡也须清理同一个已准备对象，并保留零派发的释放证明。
+                    report["playback"] = native_player.report
                     native_player.prepare()
                 self.log("点击开始后持续等待加载与开场封面；确认歌曲、标题和难度后同步首音")
                 epoch = self.start(chart, identity, report, directory)
@@ -896,7 +1337,7 @@ class SoloLive:
                 report["completed"] = False
                 report["error"] = f"{type(error).__name__}: {error}"
                 report["cancelled"] = self.stop_requested()
-                if not self.stop_requested():
+                if not self.stop_requested() and not report.get("preplay_death_confirmed"):
                     try:
                         write_image(directory / "failure.png", self.device.screenshot())
                     except Exception:
@@ -912,7 +1353,33 @@ class SoloLive:
                         report["release_error"] = f"{type(release_error).__name__}: {release_error}"
                         self.finish_performance_trace(report, directory)
                         _write_json(directory / "report.json", report)
-                        raise
+                        if not report.get("preplay_death_confirmed"):
+                            raise
+                followup_death = False
+                if not report.get("start_anchor") and not report.get("playback") and engine == "legacy":
+                    report["playback"] = {"engine": "legacy", "sent_actions": 0, "executed_actions": 0,
+                                          "release_confirmed": True, "release": {"release_proof": "no-gameplay-started"}}
+                if not self.stop_requested():
+                    try:
+                        followup_death = self.recheck_failed_preplay_life(report)
+                    except InterruptedError:
+                        report["cancelled"] = True
+                    except Exception as followup_error:
+                        report["preplay_followup_error"] = f"{type(followup_error).__name__}: {followup_error}"
+                if report.get("preplay_death_confirmed") and not self.stop_requested():
+                    if not report.get("playback") and engine == "legacy":
+                        report["playback"] = {"engine": "legacy", "sent_actions": 0, "executed_actions": 0,
+                                              "release_confirmed": True, "release": {"release_proof": "no-gameplay-started"}}
+                    if release_finished(report):
+                        try:
+                            self.exit_depleted_live(report, directory)
+                        except Exception as exit_error:
+                            if self.stop_requested():
+                                report["cancelled"] = True
+                            report["exit_error"] = f"{type(exit_error).__name__}: {exit_error}"
+                    else:
+                        report.setdefault("release_error", "开场死亡的当前触点释放未确认，禁止页面退出")
+                self.save_preplay_life_evidence(report, directory)
                 self.finish_performance_trace(report, directory)
                 for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
                                         ("identity_problem_frame", "identity-unconfirmed.png")):
@@ -939,6 +1406,8 @@ class SoloLive:
                     report["persistence_error"] = f"{type(error).__name__}: {error}"
                     _write_json(directory / "report.json", report)
                     raise
+                if followup_death:
+                    raise LifeDepleted(report["preplay_followup_death_reason"])
             if report.get("completed"):
                 self.completed_rounds += 1
             self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")

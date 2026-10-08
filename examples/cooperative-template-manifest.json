@@ -4,6 +4,8 @@
     "cooperative_room": {"capture": "2选择自由房间或者资深房间.png", "box": [758, 194, 1012, 267]},
     "cooperative_matching": {"capture": "3进入等待成员房间，在这个房间不需要任何操作，直到编号4图像出现.png", "box": [96, 24, 338, 56]},
     "cooperative_member_waiting": {"capture": "特殊4：成员未满员的等待房间.png", "box": [820, 349, 956, 375]},
+    "cooperative_member_decided": {"capture": "特殊5：匹配超时的成员确认房间.png", "box": [1063, 651, 1200, 685], "optional": true},
+    "cooperative_shuffle": {"capture": "5-1歌曲随机抽选的界面，不需要操作.png", "box": [905, 605, 1125, 648], "optional": true},
     "cooperative_select": {"capture": "4选歌场景，我认为与单人大致相同.png", "box": [1028, 529, 1110, 557]},
     "cooperative_ready": {"capture": "6难度选择界面，与单人大致相同.png", "box": [982, 580, 1071, 607]},
     "cooperative_cancel": {"capture": "6-1难度选择完成的界面.png", "box": [966, 580, 1096, 610]},

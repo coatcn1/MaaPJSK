@@ -78,7 +78,8 @@ class LifeTests(unittest.TestCase):
                                                          'path':'master.sus','total_note_count':1}}}}
         identity=SimpleNamespace(song_id=730,to_dict=lambda:{'song_id':730})
         workflow.select=Mock(return_value=(identity,np.zeros((1,1,3),np.uint8)))
-        workflow.prepare_bonus=Mock();workflow.ensure_bonus_available=Mock();workflow.start=Mock(return_value=0)
+        workflow.prepare_task_bonus=Mock();workflow.prepare_playback=Mock()
+        workflow.ensure_bonus_available=Mock();workflow.start=Mock(return_value=0)
         workflow.collect=Mock();workflow.exit_depleted_live=Mock()
         def die(events,epoch,offset,report,directory):
             report['playback']={'release_confirmed':True}
