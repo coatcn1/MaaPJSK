@@ -1408,6 +1408,7 @@ class CooperativeLive(SoloLive):
         self.join_request_count = 0
         self.max_rematches = max_rematches
         bonus_snapshot = {}
+        login_completed = False
         reports = []
         self.safe_log(f"协力谱面演出：已完成 0 / 总数 {count}；{'自由' if room == 'free' else '资深'}公房；{difficulty.upper()}")
         while self.performed_rounds < count:
@@ -1434,6 +1435,11 @@ class CooperativeLive(SoloLive):
             native_player = None
             runtime_error = None
             try:
+                if not login_completed:
+                    login = getattr(self, 'startup_login', None)
+                    if login is not None:
+                        report['startup_login'] = login()
+                    login_completed = True
                 self.device.preflight()
                 self.open_rooms()
                 if bonus_snapshot or not (self.resume_selection or self.resume_stage):

@@ -6,7 +6,11 @@
 
 ## 在 MFA 中运行
 
-1. 准备通用版 MFAAvalonia 运行目录与 Python 环境，运行 `python -m pip install -r requirements.txt`。谱面任务另需 `python scripts/setup-song-ocr.py` 准备离线模型。本机启动脚本默认读取相邻工作区的 `.tools/MFAAvalonia` 与 `.tools/Miniconda3/envs/maabangdream/python.exe`。可通过参数指定其他路径。
+新增默认关闭的 **📺 广告奖励**：进入手机 CM 后每次固定点击左上位置，不读次数或等待额度。请求观看后等 10 秒，再用 Android BACK 返回；20 秒无效时关闭并重启日服游戏，连续三次重启恢复后停止追加。本次最多开始七次，固定点三次无确认即结束循环，领取数量保持未知；详见 [广告奖励与共用登录](docs/ad-rewards.md)。
+
+AUTO、单人、校准及协力在任务启动阶段可复用登录：明确标题且右上三横菜单就绪后，最多三次点击 TAP TO START，60 秒内等待实际主页；三横菜单仅作识别。已运行的非标题页继续各任务原有策略，一键演出不导航，演奏中或结算日更返回标题仍按原规则停止／等待。
+
+1. 准备通用版 MFAAvalonia 运行目录与 Python 环境，运行 `python -m pip install -r requirements.txt`。谱面任务、广告地图／CM 识别及共用登录的公告识别需要运行 `python scripts/setup-song-ocr.py` 准备离线模型。本机启动脚本默认读取相邻工作区的 `.tools/MFAAvalonia` 与 `.tools/Miniconda3/envs/maabangdream/python.exe`。可通过参数指定其他路径。
 2. 把本机页面截图放入 `.local/captures/`，依照 `examples/template-manifest.json` 生成 `.local/config.json` 和模板。当前机器已有这些文件；截图和模板不会提交到 Git。
 3. 在 MuMu 中打开日服游戏，确认分辨率为 1280×720、DPI 为 240，然后运行：
 

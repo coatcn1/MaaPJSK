@@ -28,9 +28,9 @@ class AutoLiveConfigurationTests(unittest.TestCase):
         interface_path = Path(__file__).resolve().parents[1] / "interface.json"
         interface = json.loads(interface_path.read_text(encoding="utf-8"))
         self.assertEqual([task["name"] for task in interface["task"]],
-                         ["AutoLive", "SoloChartLive", "CooperativeChartLive", "OneShotChartLive", "SoloChartCalibration"])
+                         ["AutoLive", "SoloChartLive", "CooperativeChartLive", "OneShotChartLive", "SoloChartCalibration", "AdRewards"])
         self.assertEqual(
-            interface["task"][0]["option"],
+            next(task for task in interface["task"] if task["name"] == "AutoLive")["option"],
             ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryCount"],
         )
         self.assertEqual(interface["option"]["AutoLiveSongMode"]["default_case"], "Current")
@@ -45,8 +45,10 @@ class AutoLiveConfigurationTests(unittest.TestCase):
         self.assertTrue(auto_live.ProjectSekaiRecoveryModeConfig().run(context, argument(task_id, {"mode": "small"})))
         self.assertTrue(auto_live.ProjectSekaiRecoveryCountConfig().run(context, argument(task_id, {"count": 2})))
         self.assertTrue(auto_live.ProjectSekaiSongModeConfig().run(context, argument(task_id, {"mode": "random"})))
-        with patch.object(auto_live, "MaaDevice"), patch.object(auto_live, "Navigator") as navigator_type:
+        with patch.object(auto_live, "MaaDevice"), patch.object(auto_live, "Navigator") as navigator_type, \
+                patch.object(auto_live, "login_at_task_start") as login:
             self.assertTrue(auto_live.ProjectSekaiAutoLive().run(context, argument(task_id, {"count": 5})))
+            login.assert_called_once()
             navigator_type.return_value.auto_live_loop.assert_called_once_with(
                 5, song_mode="random", recovery_mode="small", recovery_count=2
             )
