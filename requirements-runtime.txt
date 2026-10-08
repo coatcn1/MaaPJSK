@@ -1,0 +1,5 @@
+numpy==2.5.1
+opencv-python==4.13.0.92
+maafw==5.10.2
+onnxruntime==1.29.0
+PyYAML==6.0.3

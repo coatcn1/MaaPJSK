@@ -1,6 +1,8 @@
 ﻿param(
     [string]$MfaSource,
-    [string]$RuntimeSource
+    [string]$RuntimeSource,
+    [switch]$ReleasePackage,
+    [string]$PublishOutput
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +30,22 @@ foreach ($name in @('ChartCatalogSettingsUserControl.axaml', 'ChartCatalogSettin
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'mfa-chart-ui\MaaPjskTaskStatus.cs') -Destination (Join-Path $sourceRoot 'MFAAvalonia\Extensions\MaaFW') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'mfa-chart-ui\SystemSleepHelper.cs') -Destination (Join-Path $sourceRoot 'MFAAvalonia\Helper') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'mfa-chart-ui\MaaPjskReleaseUpdate.cs') -Destination (Join-Path $sourceRoot 'MFAAvalonia\Helper') -Force
+
+# 便携包全部更新入口由项目校验器接管；没有清单的开发版继续使用原上游流程。
+$versionPath = Join-Path $sourceRoot 'MFAAvalonia\Helper\VersionChecker.cs'
+$versionSource = [IO.File]::ReadAllText($versionPath)
+$updateEntries = @{
+    'public static async Task CheckForResourceUpdatesAsync\(bool isGithub = true\)\s*\{' = 'if (MaaPjskReleaseUpdate.IsPortable) { await MaaPjskReleaseUpdate.CheckAsync(); return; }'
+    'public static async Task CheckForMFAUpdatesAsync\(bool isGithub = true\)\s*\{' = 'if (MaaPjskReleaseUpdate.IsPortable) { await MaaPjskReleaseUpdate.CheckAsync(); return; }'
+    'public async static Task UpdateResource\(bool isGithub = true, bool closeDialog = false, bool noDialog = false, Action action = null, string currentVersion = "", string\? localPackagePath = null\)\s*\{' = 'if (MaaPjskReleaseUpdate.IsPortable) { await MaaPjskReleaseUpdate.UpdateAsync(localPackagePath); return; }'
+    'public async static Task UpdateMFA\(bool isGithub, bool noDialog = false\)\s*\{' = 'if (MaaPjskReleaseUpdate.IsPortable) { await MaaPjskReleaseUpdate.UpdateAsync(); return; }'
+}
+foreach ($pattern in $updateEntries.Keys) {
+    if ([regex]::Matches($versionSource, $pattern).Count -ne 1) { throw '固定 MFA 更新入口不匹配，禁止生成可绕过保护的包。' }
+    $versionSource = [regex]::Replace($versionSource, $pattern, ('$0' + "`n        " + $updateEntries[$pattern]))
+}
+[IO.File]::WriteAllText($versionPath, $versionSource, [Text.UTF8Encoding]::new($false))
 
 $processorPath = Join-Path $sourceRoot 'MFAAvalonia\Extensions\MaaFW\MaaProcessor.cs'
 $processor = [IO.File]::ReadAllText($processorPath)
@@ -50,6 +68,8 @@ async private Task ExecuteTasks(CancellationToken token)
         // 队列最后一项提前出队时仍在执行；作用域持续到实际任务返回和清理结束。
         using var sleepScope = TaskQueue.Count > 0 && !token.IsCancellationRequested
             ? await SystemSleepHelper.BeginTaskExecutionAsync(token) : null;
+        using var releaseScope = TaskQueue.Count > 0 && !token.IsCancellationRequested
+            ? MaaPjskReleaseUpdate.BeginExecution() : null;
 '@
 [IO.File]::WriteAllText($processorPath, [regex]::Replace($processor, $executionPattern, $executionScope), [Text.UTF8Encoding]::new($false))
 
@@ -116,9 +136,9 @@ $guard = @'
 public void StartTask()
     {
         // 维护期间所有实例都暂停新任务启动，避免下载和演出同时进行。
-        if (MFAAvalonia.ViewModels.UsersControls.Settings.ChartCatalogMaintenance.IsBusy)
+        if (MFAAvalonia.ViewModels.UsersControls.Settings.ChartCatalogMaintenance.IsBusy || MaaPjskReleaseUpdate.IsBusy)
         {
-            ToastHelper.Warn("谱面同步中", "请等待同步结束或取消同步后，再开始演出任务。");
+            ToastHelper.Warn("资源维护中", "请等待谱面同步或发行更新结束后，再开始演出任务。");
             return;
         }
 '@
@@ -133,3 +153,25 @@ Copy-Item -LiteralPath (Join-Path $buildRoot 'MFAAvalonia.Core.dll') -Destinatio
     stock_sha256 = (Get-FileHash -LiteralPath $stockLibrary -Algorithm SHA256).Hash
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputRoot 'compatibility.json') -Encoding UTF8
 Write-Host '谱面管理设置页已生成，下次部署 MaaPJSK 时自动应用。'
+if ($ReleasePackage) {
+    if (-not $PublishOutput) { $PublishOutput = Join-Path $projectRoot '.local\release-v0.8.0\mfa-self-contained' }
+    $desktopProject = Join-Path $sourceRoot 'MFAAvalonia.Desktop\MFAAvalonia.Desktop.csproj'
+    $desktop = [IO.File]::ReadAllText($desktopProject)
+    $branding = @'
+    <PropertyGroup Condition="'$(MaaPjskPackageBuild)' == 'true'">
+        <AssemblyName>MaaPJSK</AssemblyName>
+        <OutputName>MaaPJSK</OutputName>
+    </PropertyGroup>
+'@
+    [IO.File]::WriteAllText($desktopProject, $desktop.Replace('</Project>', $branding + "`n</Project>"), [Text.UTF8Encoding]::new($false))
+    dotnet publish $desktopProject -c Release -r win-x64 --self-contained true -p:MaaPjskPackageBuild=true -o $PublishOutput --nologo -v quiet
+    if ($LASTEXITCODE -ne 0) { throw 'MaaPJSK 自包含发行主程序构建失败。' }
+    New-Item -ItemType Directory -Force -Path (Join-Path $PublishOutput 'packaging') | Out-Null
+    @{
+        schema = 1
+        mfa_ref = 'v2.12.0'
+        mfa_commit = (git -C $MfaSource rev-parse v2.12.0).Trim()
+        overlay_sha256 = (Get-FileHash -LiteralPath (Join-Path $projectRoot 'mfa-chart-ui\MaaPjskReleaseUpdate.cs') -Algorithm SHA256).Hash.ToLowerInvariant()
+        core_sha256 = (Get-FileHash -LiteralPath (Join-Path $PublishOutput 'libs\MFAAvalonia.Core.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PublishOutput 'packaging\overlay-build.json') -Encoding UTF8
+}
