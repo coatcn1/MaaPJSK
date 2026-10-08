@@ -9,6 +9,7 @@ from maa.agent.agent_server import AgentServer
 from maa.custom_action import CustomAction
 
 from project_sekai.maa_device import MaaDevice
+from project_sekai.game_login import login_at_task_start
 from project_sekai.solo_live import SoloLive
 from project_sekai.performance_settings import PerformanceSettings
 from project_sekai.calibration import CalibrationProfiles, CalibrationRunner, environment_signature
@@ -34,10 +35,12 @@ def load_performance(root: Path):
 def create_workflow(context, root: Path):
     config = Path(os.environ.get("MAAPJSK_TEMPLATE_CONFIG", root / "config/maapjsk-templates.json"))
     chart_config = json.loads((root / "config/chart-sync.json").read_text(encoding="utf-8-sig"))
-    return SoloLive(MaaDevice(context.tasker.controller), config, Path(chart_config["output_root"]),
+    workflow = SoloLive(MaaDevice(context.tasker.controller), config, Path(chart_config["output_root"]),
                     root / "resource/models/song_title_ocr", root / "debug/solo-chart-runs",
                     stop_requested=lambda: bool(context.tasker.stopping),
                     log_message=lambda message: visible_log(context, message))
+    login_at_task_start(context, root, lambda message: visible_log(context, message))
+    return workflow
 
 
 def task_id(argv) -> int:
@@ -165,10 +168,10 @@ class ProjectSekaiNativeCalibration(CustomAction):
                 raise ValueError("Native 校准任务配置不完整")
             root = Path(__file__).resolve().parents[1]
             performance = load_performance(root)
-            workflow = create_workflow(context, root)
             recovery = json.loads(os.environ.get("MAAPJSK_TEST_RECOVERY_JSON", '{"mode":"off","count":1}'))
             if recovery.get("mode", "off") != "off" and os.environ.get("MAAPJSK_TEST_ALLOW_ITEMS") != "1":
                 raise ValueError("校准验收用药未获授权")
+            workflow = create_workflow(context, root)
             runner = CalibrationRunner(workflow, CalibrationProfiles(root / "config/calibration-profiles"),
                                        environment_signature(workflow.device), performance, root / "debug/calibration-runs",
                                        test_bonus_consumption=performance.bonus_consumption,

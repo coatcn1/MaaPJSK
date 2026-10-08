@@ -1482,6 +1482,30 @@ class CooperativeTests(unittest.TestCase):
             self.execute(workflow)
             self.assertEqual(workflow.prepare_bonus.call_count, 2)
 
+    def test_agent_login_connection_failure_enters_real_run_recovery_before_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context, argv = self.configuration()
+            workflow = self.run_workflow(Path(directory))
+            ui, clock, _ = self.ui_workflow(['home'] * 6)
+            workflow.navigator, workflow.pause = ui.navigator, ui.pause
+            workflow.device.screenshot.side_effect = ui.screenshot
+            workflow.startup_login = Mock(side_effect=[OSError('登录截图连接中断'), {'completed': True}])
+            workflow.recover_runtime_failure = lambda *args: CooperativeLive.recover_runtime_failure(workflow, *args)
+            performance = SimpleNamespace(engine='legacy', use_calibration_profile=False, touch_offset_ms=-51,
+                                          bonus_consumption=5, cooperative_game_timing_feedback=False)
+            with patch.object(agent, 'create_workflow', return_value=workflow), \
+                    patch.object(agent, 'load_performance', return_value=performance), \
+                    patch.object(agent, 'visible_log'), \
+                    patch('project_sekai.cooperative_live.parse_sus', return_value=SimpleNamespace(duration=1)), \
+                    patch('project_sekai.cooperative_live.compile_touches', return_value=(1, 2)), \
+                    patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock.now):
+                self.assertTrue(agent.ProjectSekaiCooperativeLive().run(context, argv))
+            self.assertEqual(workflow.startup_login.call_count, 2)
+            self.assertEqual(workflow.performed_rounds, 1)
+            errors = [json.loads(path.read_text(encoding='utf-8')) for path in Path(directory).glob('*/report.json')]
+            self.assertTrue(any('登录截图连接中断' in report.get('error', '')
+                                and report['runtime_recovery']['state'] == 'ready' for report in errors))
+
     def test_runtime_matching_exit_reaches_room_and_consumes_only_one_rematch(self):
         workflow, clock, frames = self.ui_workflow(['matching_decided', 'matching_decided', 'matching_decided', 'room', 'room'])
         workflow.device.screenshot.side_effect = workflow.screenshot

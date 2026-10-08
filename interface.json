@@ -93,6 +93,14 @@
         "SoloChartCalibrationSongMode",
         "SoloChartCalibrationDifficulty"
       ]
+    },
+    {
+      "name": "AdRewards",
+      "label": "📺 广告奖励",
+      "entry": "AdRewards",
+      "default_check": false,
+      "description": "进入手机 CM 后固定点击左上位置，不读取次数；最多三次未弹出观看确认就结束循环。请求观看后等 10 秒，再用 Android BACK 返回；20 秒无效关闭并重启日服游戏，连续三次恢复后停止追加。本次最多开始七次，领取数量未确认。",
+      "option": []
     }
   ],
   "option": {

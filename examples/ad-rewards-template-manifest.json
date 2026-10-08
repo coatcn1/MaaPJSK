@@ -1,0 +1,15 @@
+{
+  "screen": [1280, 720],
+  "threshold": 0.9,
+  "regions": {
+    "ad_home": {"capture": "home-initial.png", "box": [25, 25, 61, 61]},
+    "ad_map": {"capture": "map.png", "box": [137, 426, 329, 449]},
+    "ad_map_return": {"capture": "map.png", "box": [18, 19, 65, 67]},
+    "ad_world_map": {"capture": "restarted-map.png", "box": [1116, 646, 1233, 679]},
+    "ad_street": {"capture": "scramble-start.png", "box": [375, 90, 509, 230]},
+    "ad_cm": {"capture": "scramble-right-1.png", "box": [1127, 169, 1177, 200]},
+    "ad_rewards": {"capture": "reward-list.png", "box": [139, 312, 358, 344]},
+    "ad_watch_question": {"capture": "watch-confirm.png", "box": [459, 242, 821, 270]},
+    "ad_watch_start": {"capture": "watch-confirm.png", "box": [714, 528, 808, 557]}
+  }
+}

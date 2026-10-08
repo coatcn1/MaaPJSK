@@ -57,7 +57,7 @@ internal static class Program
     private static void CheckFailedPerformanceTask()
     {
         // 本局日志已确认框架返回 Failed；检验这一状态穿过实际队列包装后不会被吞掉。
-        string[] entries = ["AutoLive", "SoloChartLive", "CooperativeChartLive", "OneShotChartLive", "SoloChartCalibration"];
+        string[] entries = ["AutoLive", "SoloChartLive", "CooperativeChartLive", "OneShotChartLive", "SoloChartCalibration", "AdRewards"];
         foreach (var entry in entries)
         {
             var queued = new MFATask { Name = entry, Type = MFATask.MFATaskType.MAAFW,

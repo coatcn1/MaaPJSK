@@ -10,6 +10,7 @@ from maa.context import Context
 from maa.custom_action import CustomAction
 
 from project_sekai.maa_device import MaaDevice
+from project_sekai.game_login import login_at_task_start
 from project_sekai.navigator import Navigator
 
 _SETTINGS: dict[int, dict[str, object]] = {}
@@ -109,6 +110,7 @@ class ProjectSekaiAutoLive(CustomAction):
                 stop_requested=lambda: bool(context.tasker.stopping),
                 log_message=lambda content: _visible_log(context, content),
             )
+            login_at_task_start(context, Path(__file__).resolve().parents[1], lambda content: _visible_log(context, content))
             navigator.auto_live_loop(count, song_mode=song_mode, recovery_mode=mode,
                                      recovery_count=recovery_count)
             return True

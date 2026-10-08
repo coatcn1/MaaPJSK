@@ -10,6 +10,7 @@ from maa.custom_action import CustomAction
 
 from project_sekai.cooperative_live import CooperativeLive
 from project_sekai.maa_device import MaaDevice
+from project_sekai.game_login import GameLogin
 from project_sekai.song_identity import COOPERATIVE_DIFFICULTIES
 from solo_live import load_performance, re_integer
 
@@ -50,10 +51,17 @@ def create_workflow(context, root):
     config = Path(os.environ.get("MAAPJSK_TEMPLATE_CONFIG", root / "config/maapjsk-templates.json"))
     cooperative = Path(os.environ.get("MAAPJSK_COOPERATIVE_TEMPLATE_CONFIG", root / "config/cooperative-templates.json"))
     catalog = json.loads((root / "config/chart-sync.json").read_text(encoding="utf-8-sig"))
-    return CooperativeLive(MaaDevice(context.tasker.controller), config, cooperative, Path(catalog["output_root"]),
+    workflow = CooperativeLive(MaaDevice(context.tasker.controller), config, cooperative, Path(catalog["output_root"]),
                            root / "resource/models/song_title_ocr", root / "debug/cooperative-chart-runs",
                            stop_requested=lambda: bool(context.tasker.stopping),
                            log_message=lambda content: visible_log(context, content))
+    login = GameLogin(workflow.device, workflow.navigator, root / "debug/game-login-runs",
+                      stop_requested=lambda: bool(context.tasker.stopping),
+                      log_message=lambda message: visible_log(context, message),
+                      ocr_root=root / "resource/models/song_title_ocr")
+    # 构造阶段只读取配置；设备与登录故障由本次 run 的普通恢复接管，请求预算不重建。
+    workflow.startup_login = lambda: login.run(resume=True)
+    return workflow
 
 
 @AgentServer.custom_action("ProjectSekaiCooperativeLiveConfig")

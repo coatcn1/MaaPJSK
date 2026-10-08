@@ -100,6 +100,7 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\auto_live.py') -Destinatio
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\solo_live.py') -Destination $agentTarget -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\cooperative_live.py') -Destination $agentTarget -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\one_shot_live.py') -Destination $agentTarget -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'agent\ad_rewards.py') -Destination $agentTarget -Force
 Get-ChildItem -LiteralPath (Join-Path $projectRoot 'project_sekai') -Filter '*.py' | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $packageTarget -Force
 }
@@ -136,6 +137,14 @@ if (Test-Path -LiteralPath $cooperativeConfig -PathType Leaf) {
     # 协力截图不公开；有本机模板时随部署复制，未采样的机器仍可运行原有任务。
     Copy-Item -LiteralPath $cooperativeConfig -Destination (Join-Path $targetRoot 'config\cooperative-templates.json') -Force
     Get-ChildItem -LiteralPath (Join-Path $projectRoot '.local\cooperative-templates\templates') -Filter '*.png' | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $templateTarget -Force
+    }
+}
+$adRewardsConfig = Join-Path $projectRoot '.local\ad-rewards-templates\config.json'
+if (Test-Path -LiteralPath $adRewardsConfig -PathType Leaf) {
+    # 广告模板只来自用户授权的本机页面，缺失时不影响原任务，广告入口自行拒绝运行。
+    Copy-Item -LiteralPath $adRewardsConfig -Destination (Join-Path $targetRoot 'config\ad-rewards-templates.json') -Force
+    Get-ChildItem -LiteralPath (Join-Path $projectRoot '.local\ad-rewards-templates\templates') -Filter '*.png' | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $templateTarget -Force
     }
 }
