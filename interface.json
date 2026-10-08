@@ -3,7 +3,9 @@
   "interface_version": 2,
   "name": "MaaPJSK",
   "label": "Project SEKAI 自动化（MaaFramework）",
-  "version": "0.1.0",
+  "version": "0.8.0",
+  "mfa_min_version": "2.12.0",
+  "mfa_max_version": "2.12.0",
   "github": "https://github.com/coatcn1/MaaPJSK",
   "controller": [
     {

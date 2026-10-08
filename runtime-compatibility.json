@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "platform": "win-x64",
+  "python": "3.12.13",
+  "maafw": "5.10.2",
+  "native": "1.2.0",
+  "mfa": "2.12.0",
+  "mfa_source_commit": "7cb1e404",
+  "dotnet": "10",
+  "numpy": "2.5.1",
+  "opencv-python": "4.13.0.92",
+  "onnxruntime": "1.29.0",
+  "PyYAML": "6.0.3"
+}

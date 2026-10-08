@@ -114,6 +114,8 @@ git diff --check
 
 ## Git 与公开内容
 
+- Windows 发行采用 `scripts/build-windows-release.ps1`，完整包和更新包各附 SHA256；正式资产要求干净工作树，`AllowDirty` 只作本地探测。便携 MFA 更新入口必须经过项目整包校验，不允许退回上游清空资源或单独覆盖 Core。运行任务／谱面同步时拒绝更新，GUI 和 Agent 退出后才写入 DLL／pyd，用户 config／profiles／runtime／resource/charts 保留，版本清单最后写入，失败回退。首启和目录改名、真实更新保留与演出验收分别报告，详见 [发行说明](docs/release-package.md)。
+
 - 默认在 `codex/<主题>` 独立分支工作，不直接向 `main` / `master` 提交；既有工作分支继续沿用。保持提交目的完整且单一，不夹带其他项目修复或无关实验。
 - 提交前检查 staged diff、未跟踪文件和敏感数据。禁止提交设备序列号、私有绝对路径、账号凭据、日志、截图、运行配置、校准 Profile、缓存、下载谱面及本机编译产物。
 - `.local/`、`resource/charts/`、OCR 模型、`bin/`、`obj/`、`.pyd`、Native `.lib` / `.pdb` 保持忽略。固定第三方运行依赖仅在保留许可与来源的情况下版本化。

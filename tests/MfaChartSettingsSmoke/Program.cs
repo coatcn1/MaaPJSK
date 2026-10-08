@@ -8,6 +8,7 @@ using MaaFramework.Binding;
 using MFAAvalonia;
 using MFAAvalonia.Extensions.MaaFW;
 using MFAAvalonia.Helper.ValueType;
+using MFAAvalonia.Helper;
 using MFAAvalonia.ViewModels.Other;
 using MFAAvalonia.ViewModels.Pages;
 using MFAAvalonia.ViewModels.UsersControls.Settings;
@@ -96,6 +97,15 @@ internal static class Program
         AppBuilder.Configure<SmokeApplication>().UseSkia()
             .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
             .SetupWithoutStarting();
+
+        // 队列末项已经出队时，更新仍必须等待真实执行作用域结束；重叠作用域独立释放。
+        var firstExecution = MaaPjskReleaseUpdate.BeginExecution();
+        var secondExecution = MaaPjskReleaseUpdate.BeginExecution();
+        Require(!MaaPjskReleaseUpdate.IsIdle, "实际任务尚在执行时不能更新");
+        firstExecution.Dispose();
+        firstExecution.Dispose();
+        Require(!MaaPjskReleaseUpdate.IsIdle, "重复释放一个作用域不能释放另一任务的更新门槛");
+        secondExecution.Dispose();
 
         // 测试中的实例集合不创建 Maa 控制器，所有窗口和输入都在离屏平台的内存里。
         var tabs = new ObservableCollection<InstanceTabViewModel>();
