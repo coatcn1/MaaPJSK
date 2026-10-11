@@ -14,7 +14,7 @@ from .sus_chart import Chart, Gesture, slide_x
 
 TOUCH_PLAN_VERSION = 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 5
-START_ANCHOR_VERSION = 14
+START_ANCHOR_VERSION = 15
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -241,10 +241,10 @@ def dense_first_note_context(chart) -> tuple[Gesture, ...]:
 
 
 class FirstHeadOutsideWindow(RuntimeError):
-    """完整首长条头已越过同步窗口，不能改用后继同色音启动。"""
+    """完整首头已越过同步窗口，不能改用后继同色音启动。"""
 
 
-def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | None = None, *, simultaneous_gestures=(), dense_following_gestures=(), reject_passed_slide=False) -> float | None:
+def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | None = None, *, simultaneous_gestures=(), dense_following_gestures=(), reject_passed_slide=False, gold_tap_head_guard=False) -> float | None:
     """只追踪谱面第一音的开场锚点；演奏开始后不再识别音符。"""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     if gesture.critical or gesture.points[0].kind in {2, 6}:
@@ -258,8 +258,12 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         mask = cv2.inRange(hsv, (95, 55, 135), (135, 255, 255))
     blue_tap = (gesture.kind == "tap" and not gesture.flick and not gesture.critical
                 and len(gesture.points) == 1 and gesture.points[0].kind == 1)
+    simultaneous = validated_simultaneous(gesture, simultaneous_gestures)
+    gold_head = (gold_tap_head_guard and gesture.kind == "tap" and not gesture.flick
+                 and len(gesture.points) == 1 and gesture.points[0].kind == 2 and not simultaneous)
     # 基线差分会把同一外框拆成碎片；蓝框归属用原颜色分量，横芯自身仍必须通过差分。
     blue_source_mask = mask.copy() if blue_tap else None
+    gold_source_mask = mask.copy() if gold_head else None
     if baseline is not None:
         original = cv2.cvtColor(baseline, cv2.COLOR_BGR2HSV).astype(np.int16)
         current = hsv.astype(np.int16)
@@ -271,10 +275,9 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         mask[~changed] = 0
     gold_tap = gesture.kind == "tap" and first_note_color(gesture) == "gold"
     gold_slide = gesture.kind == "slide" and first_note_color(gesture) == "gold"
-    full_mask = (blue_source_mask if blue_tap else
+    full_mask = (gold_source_mask if gold_head else blue_source_mask if blue_tap else
                  mask.copy() if gesture.kind == "tap" and (gesture.flick or gold_tap) or gold_slide or simultaneous_gestures else None)
     component_labels, component_stats = None, None
-    simultaneous = validated_simultaneous(gesture, simultaneous_gestures)
     mask[:40] = 0
     mask[540:] = 0
     point = gesture.points[0]
@@ -306,6 +309,46 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
     def consider(x, y, width, height, target=candidates):
         if eligible(x, y, width, height):
             target.append(y + height / 2)
+
+    if gold_head:
+        core = cv2.inRange(hsv, (15, 0, 235), (45, 110, 255))
+        _, core_labels, core_stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+        _, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(full_mask, connectivity=8)
+        for label, stats in enumerate(core_stats[1:], start=1):
+            x, y, width, height, area = stats
+            if y <= 40 or area < width * height * .75 or not eligible(x, y, width, height):
+                continue
+            actual = core_labels[y:y + height, x:x + width] == label
+            # 完整亮芯先测量再验证变化，不能用差分后的半芯替代真实横条。
+            if baseline is not None and np.count_nonzero(changed[y:y + height, x:x + width][actual]) < area * .75:
+                continue
+            padding = max(2, math.ceil(height / 2))
+            strip = component_labels[max(0, y - padding):min(frame.shape[0], y + height + padding),
+                                     max(0, x - padding):min(frame.shape[1], x + width + padding)]
+            sources = strip[strip != 0]
+            labels = np.unique(sources)
+            # 金色芯低饱和时几乎不在外框掩膜里；用周围完整外框和同高两侧确认足量、唯一来源。
+            if len(labels) != 1 or len(sources) < width:
+                continue
+            source = labels[0]
+            left = component_labels[y:y + height, max(0, x - padding):x + 2]
+            right = component_labels[y:y + height, x + width - 2:min(frame.shape[1], x + width + padding)]
+            if np.count_nonzero(left == source) < height or np.count_nonzero(right == source) < height:
+                continue
+            fx, fy, fw, fh = component_stats[source][:4]
+            bottom = fy + fh
+            # 当前完整首芯及来源已下越界的证据优先于前沿门槛，整帧不得由后继芯接管。
+            if y + height >= 540 or bottom > 540:
+                if reject_passed_slide:
+                    raise FirstHeadOutsideWindow("首金色 TAP 头已越过同步窗口，拒绝从后继音或歌曲中途启动")
+                return None
+            # 后继轨迹向上延伸不改变首 TAP 前沿；未越界但仍向下伸出一个芯高时不是首头。
+            if not y + height <= bottom <= y + 2 * height:
+                continue
+            candidates.append(y + height / 2)
+        # 单个首 TAP 必须只有一个完整横芯；不能从碎裂半芯或多个来源中按高低任选一个。
+        # 不回退到背景横条或后继 TRACE，也不扩展异时序上下文。
+        return candidates[0] if len(candidates) == 1 else None
 
     for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
         x, y, width, height = cv2.boundingRect(contour)
@@ -423,6 +466,8 @@ class StartAnchor:
         self.baseline: np.ndarray | None = None
         self.fit: dict | None = None
         self.failure_reason: str | None = None
+        # 首头保护默认开启并冻结到本局；仅明确 0 回退，非普通金色 TAP 仍走原识别路径。
+        self.gold_tap_head_guard = os.environ.get("MAAPJSK_GOLD_TAP_HEAD_GUARD") != "0"
         # 本局创建时冻结保护设置；明确主开关优先，兼容旧试验开关，空值不关闭默认保护。
         guard_setting = os.environ.get("MAAPJSK_START_ANCHOR_AMBIGUITY_GUARD")
         if guard_setting not in {"0", "1"}:
@@ -442,7 +487,8 @@ class StartAnchor:
             raise RuntimeError("首音轨迹未通过同步门槛且等待超时，拒绝从歌曲中途开始")
         try:
             y = first_note_y(frame, self.gesture, self.baseline, simultaneous_gestures=self.simultaneous_gestures,
-                            dense_following_gestures=self.dense_following_gestures, reject_passed_slide=True)
+                            dense_following_gestures=self.dense_following_gestures, reject_passed_slide=True,
+                            gold_tap_head_guard=self.gold_tap_head_guard)
         except FirstHeadOutsideWindow:
             self.failure_reason = "first_head_outside_window"
             raise
@@ -490,6 +536,8 @@ class StartAnchor:
             if not (.06 <= elapsed <= .5 and 1 <= rate <= 10 and .35 <= first_hit - captured_at <= .8):
                 return None
             self.fit = {"model": "calibrated_perspective", "residual_pixels": None, "first_hit": first_hit}
+            if self.gold_tap_head_guard:
+                self.fit["gold_tap_head_guard"] = True
             return first_hit - self.gesture.start
         if y < 230:
             return None
@@ -567,6 +615,8 @@ class StartAnchor:
             if self.ambiguity_defer is not None:
                 self.ambiguity_defer.update(status="resolved", new_sample_count=len(self.samples) - self.ambiguity_defer["first_sample_count"])
                 self.fit["ambiguity_guard"].update(self.ambiguity_defer)
+        if self.gold_tap_head_guard:
+            self.fit["gold_tap_head_guard"] = True
         return first_hit - self.gesture.start
 
 
