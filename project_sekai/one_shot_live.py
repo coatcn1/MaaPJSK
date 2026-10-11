@@ -4,7 +4,7 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import compile_touches
 from .life_monitor import LifeDepleted, LifeGuard
 from .live_end import LiveEndGuard, blank_transition
@@ -22,6 +22,8 @@ class MissingOneShotChart(ValueError):
 
 
 def append_one_shot_result_index(root, directory, report):
+    if not enabled():
+        return
     identity = report.get("final_identity", {})
     playback = report.get("playback", {})
     row = {"run": directory.name, "started_at": report["started_at"], "song_id": identity.get("song_id"),
@@ -43,6 +45,10 @@ class OneShotLive(SoloLive):
         # 等待入口不导航，也不因其他游戏页面而提前结束；只检查取消与截图连接。
         self.navigator._check_stop()
         return self.device.screenshot()
+
+    def check_observation_frame(self, frame):
+        self.navigator._check_stop()
+        return frame
 
     @staticmethod
     def verify_playback(report):
@@ -97,6 +103,7 @@ class OneShotLive(SoloLive):
         raise TimeoutError("一键演出输入已结束，但生命栏消失或演出结束仍未确认")
 
     def save_evidence(self, report, directory):
+        self.save_playback_evidence(report, directory)
         self.finish_performance_trace(report, directory)
         for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
                                 ("identity_problem_frame", "identity-unconfirmed.png")):
@@ -120,15 +127,16 @@ class OneShotLive(SoloLive):
                 or type(offset_ms) is not int or not -300 <= offset_ms <= 300):
             raise ValueError("一键演出选项无效")
         directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
-        directory.mkdir(parents=True)
+        make_directory(directory, parents=True)
         report = {"schema_version": 1, "mode": "one_shot", "started_at": datetime.now().astimezone().isoformat(),
                   "requested_difficulty": difficulty, "difficulty_source": "task_setting", "engine": engine,
                   "timing_offset_ms": offset_ms, "opening_timeout_seconds": OPENING_WAIT_SECONDS,
                   "completed": False, "phase": "waiting_opening", "result_status": "not_collected",
-                  "report_path": str(directory / "report.json")}
+                  "report_path": str(directory / "report.json") if enabled() else None}
         self.last_report = report
         self.begin_performance_trace()
         self.life_guard, self.life_frames, self.anchor_frames = LifeGuard(), [], []
+        self.playback_evidence_frames = {}
         events, native_player = None, None
 
         def prepare_chart(identity):
@@ -146,7 +154,8 @@ class OneShotLive(SoloLive):
             if engine == "native":
                 from .native_player import NativePlayer
                 native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
-                                             idle_observer=lambda: self.observe_play_state(directory))
+                                             idle_observer=lambda: self.observe_play_state(directory),
+                                             **self.native_observation_options(directory))
                 report["playback"] = native_player.report
                 native_player.prepare()
             return chart

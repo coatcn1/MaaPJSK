@@ -76,8 +76,11 @@ def main():
             raise RuntimeError("独立验收前请关闭 MFA，避免同时控制设备")
     instance = json.loads((runtime / "config/instances/default.json").read_text(encoding="utf-8-sig"))["AdbDevice"]
     debug = ROOT / ".local/solo-acceptance"
-    debug.mkdir(parents=True, exist_ok=True)
-    Toolkit.init_option(str(debug))
+    from project_sekai.diagnostics import load_policy, make_directory
+    saved = load_policy(runtime)
+    make_directory(debug, parents=True, exist_ok=True)
+    if not saved.disable_logging:
+        Toolkit.init_option(str(debug))
     controller = AdbController(instance["AdbPath"], instance["AdbSerial"], **controller_options(instance, runtime))
     if not controller.post_connection().wait().succeeded:
         raise RuntimeError("MaaFramework 无法连接 MFA 保存的设备")
@@ -106,11 +109,13 @@ def main():
     from project_sekai.performance_settings import PerformanceSettings
     performance = PerformanceSettings(engine=arguments.engine, touch_offset_ms=arguments.offset_ms or 0,
                                       bonus_consumption=int(arguments.bonus_consumption),
-                                      use_calibration_profile=arguments.use_calibration_profile)
+                                      use_calibration_profile=arguments.use_calibration_profile,
+                                      disable_logging=saved.disable_logging)
     if arguments.calibrate:
         saved = PerformanceSettings.load(runtime / "config/performance-settings.json")
         performance = PerformanceSettings(engine="native", touch_offset_ms=saved.touch_offset_ms,
-                                          bonus_consumption=int(arguments.bonus_consumption), use_calibration_profile=False)
+                                          bonus_consumption=int(arguments.bonus_consumption), use_calibration_profile=False,
+                                          disable_logging=saved.disable_logging)
     environment = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
                        MAAPJSK_TEST_PERFORMANCE_JSON=json.dumps(asdict(performance)))
     if arguments.allow_stamina_spend:

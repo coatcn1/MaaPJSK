@@ -16,6 +16,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
     [ObservableProperty] private int _bonusIndex;
     [ObservableProperty] private bool _useCalibrationProfile = true;
     [ObservableProperty] private bool _cooperativeGameTimingFeedback;
+    [ObservableProperty] private bool _disableLogging;
     [ObservableProperty] private string _statusText = "保存后在下一次启动任务时生效。";
     [ObservableProperty] private string _calibrationText = "尚未生成已通过验证的校准配置。";
 
@@ -45,6 +46,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 if (feedback is not null && feedback.Type != JTokenType.Boolean)
                     throw new InvalidDataException("协力 FAST / LATE 微调开关必须为布尔值");
                 CooperativeGameTimingFeedback = feedback?.Value<bool>() ?? false;
+                var logging = value["disable_logging"];
+                if (logging is not null && logging.Type != JTokenType.Boolean)
+                    throw new InvalidDataException("禁用日志开关必须为布尔值");
+                DisableLogging = logging?.Value<bool>() ?? false;
                 if (TouchOffsetMs is < -300 or > 300 || BonusIndex is < 0 or > 11)
                     throw new InvalidDataException("触控偏移或体力数量越界");
             }
@@ -68,16 +73,19 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
     [RelayCommand]
     private void Save()
     {
-        if (Instances.InstanceTabBarViewModel.Tabs.Any(tab => tab.IsRunning))
+        if (!MaaPjskMaintenance.TryBegin())
         {
             StatusText = "请先停止演出任务，再保存演奏设置。";
             return;
         }
+        try
+        {
         if (EngineIndex is < 0 or > 1 || TouchOffsetMs is < -300 or > 300 || BonusIndex is < 0 or > 11)
         {
             StatusText = "触控偏移须为 -300 到 300 ms，每局体力须沿用游戏设置或为 0 到 10。";
             return;
         }
+        var previousLogging = MaaPjskDiagnostics.Disabled;
         try
         {
             var value = new JObject
@@ -86,8 +94,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 ["touch_offset_ms"] = TouchOffsetMs,
                 ["bonus_consumption"] = BonusIndex == 0 ? new JValue("current") : new JValue(BonusIndex - 1),
                 ["use_calibration_profile"] = UseCalibrationProfile,
-                ["cooperative_game_timing_feedback"] = CooperativeGameTimingFeedback
+                ["cooperative_game_timing_feedback"] = CooperativeGameTimingFeedback,
+                ["disable_logging"] = DisableLogging
             };
+            MaaPjskDiagnostics.Apply(DisableLogging);
             Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath)!);
             // 与任务启动读取并行时只会得到完整旧值或完整新值，不暴露写到一半的 JSON。
             var temporary = ConfigPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
@@ -104,7 +114,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
         }
         catch (Exception error)
         {
+            try { MaaPjskDiagnostics.Apply(previousLogging); } catch { }
             StatusText = $"保存演奏设置失败：{error.Message}";
         }
+        }
+        finally { MaaPjskMaintenance.End(); }
     }
 }

@@ -24,6 +24,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.serial:
         raise ValueError("设备控制需要显式指定 --serial，防止误触其他模拟器")
+    from pathlib import Path
+    from project_sekai.diagnostics import load_policy
+    load_policy(Path(__file__).resolve().parent)
     device = AdbDevice(args.adb, args.serial)
     navigator = Navigator(device, args.config, dry_run=getattr(args, "dry_run", False))
     if args.command == "inspect":

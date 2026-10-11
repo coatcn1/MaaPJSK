@@ -16,10 +16,9 @@ namespace MFAAvalonia.ViewModels.UsersControls.Settings;
 public static class ChartCatalogMaintenance
 {
     // 所有实例共用一个本地谱面库；维护时阻止新任务进入，停止任务仍可照常使用。
-    private static int _busy;
-    public static bool IsBusy => Volatile.Read(ref _busy) != 0;
-    internal static bool TryBegin() => Interlocked.CompareExchange(ref _busy, 1, 0) == 0;
-    internal static void End() => Interlocked.Exchange(ref _busy, 0);
+    public static bool IsBusy => MaaPjskMaintenance.IsBusy;
+    internal static bool TryBegin() => MaaPjskMaintenance.TryBegin();
+    internal static void End() => MaaPjskMaintenance.End();
 }
 
 public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase

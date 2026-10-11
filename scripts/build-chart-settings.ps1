@@ -19,6 +19,13 @@ $archive = Join-Path $outputRoot 'source.zip'
 git -C $MfaSource archive --format=zip "--output=$archive" v2.12.0
 if ($LASTEXITCODE -ne 0) { throw '无法导出 MFA v2.12.0 源码' }
 $sourceRoot = Join-Path $outputRoot 'source'
+$sourceResolved = [IO.Path]::GetFullPath($sourceRoot)
+$expectedSource = [IO.Path]::GetFullPath((Join-Path $projectRoot '.local\chart-settings\source'))
+if ($sourceResolved -ne $expectedSource) { throw '拒绝清理项目导出目录之外的路径' }
+if (Test-Path -LiteralPath $sourceResolved) {
+    if ((Get-Item -LiteralPath $sourceResolved).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '导出源码目录是重解析点' }
+    Remove-Item -LiteralPath $sourceResolved -Recurse -Force
+}
 Expand-Archive -LiteralPath $archive -DestinationPath $sourceRoot -Force
 $modelTarget = Join-Path $sourceRoot 'MFAAvalonia\ViewModels\UsersControls\Settings'
 $viewTarget = Join-Path $sourceRoot 'MFAAvalonia\Views\UserControls\Settings'
@@ -68,8 +75,6 @@ async private Task ExecuteTasks(CancellationToken token)
         // 队列最后一项提前出队时仍在执行；作用域持续到实际任务返回和清理结束。
         using var sleepScope = TaskQueue.Count > 0 && !token.IsCancellationRequested
             ? await SystemSleepHelper.BeginTaskExecutionAsync(token) : null;
-        using var releaseScope = TaskQueue.Count > 0 && !token.IsCancellationRequested
-            ? MaaPjskReleaseUpdate.BeginExecution() : null;
 '@
 [IO.File]::WriteAllText($processorPath, [regex]::Replace($processor, $executionPattern, $executionScope), [Text.UTF8Encoding]::new($false))
 
@@ -135,14 +140,18 @@ if ([regex]::Matches($taskSource, $pattern).Count -ne 1) { throw '上游任务�
 $guard = @'
 public void StartTask()
     {
+        using var startGate = MaaPjskMaintenance.EnterTaskStart();
         // 维护期间所有实例都暂停新任务启动，避免下载和演出同时进行。
-        if (MFAAvalonia.ViewModels.UsersControls.Settings.ChartCatalogMaintenance.IsBusy || MaaPjskReleaseUpdate.IsBusy)
+        if (MaaPjskMaintenance.IsBusy || MaaPjskReleaseUpdate.IsBusy)
         {
             ToastHelper.Warn("资源维护中", "请等待谱面同步或发行更新结束后，再开始演出任务。");
             return;
         }
+        MaaPjskDiagnostics.ApplyFramework();
 '@
 [IO.File]::WriteAllText($taskPath, [regex]::Replace($taskSource, $pattern, $guard), [Text.UTF8Encoding]::new($false))
+
+& (Join-Path $PSScriptRoot 'patch-mfa-diagnostics.ps1') -SourceRoot $sourceRoot -ProjectRoot $projectRoot
 
 $buildRoot = Join-Path $outputRoot 'build'
 dotnet build (Join-Path $sourceRoot 'MFAAvalonia\MFAAvalonia.csproj') -c Release -r win-x64 -o $buildRoot --nologo -v quiet

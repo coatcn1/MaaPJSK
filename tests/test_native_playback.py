@@ -12,7 +12,7 @@ from project_sekai.sus_chart import Chart, Gesture, Point
 from project_sekai.native_player import NativePlayer
 from project_sekai.calibration import CalibrationProfiles, CalibrationRunner, adjusted_offset, validation_passed, verify_profile_anchor
 from project_sekai.performance_settings import PerformanceSettings, migrate_settings
-from project_sekai.life_monitor import LifeDepleted
+from project_sekai.life_monitor import LifeDepleted, LifeGuard
 
 
 class Clock:
@@ -74,6 +74,101 @@ class ScriptDevice:
 
 @unittest.skipUnless(native_engine.available(), '先运行 scripts/build-native.ps1 才能验证 Native')
 class NativeTests(unittest.TestCase):
+    def test_async_fresh_life_zero_reaches_release_before_deferred_png(self):
+        clock = Clock(); device = ScriptDevice(clock); guard = LifeGuard(); requests = []
+        class Job:
+            succeeded = True
+            def __init__(self): self.at = clock()
+            @property
+            def done(self): return clock() - self.at >= .05
+            def get(self): return __import__('numpy').zeros((720,1280,3), dtype='uint8')
+        def request():
+            requests.append(clock()); return Job()
+        def observe(frame, requested_at):
+            if guard.observe(frame, lambda _: True): raise LifeDepleted('生命零')
+        player = NativePlayer(None, (Touch(.1,2,0,'down',500),Touch(8,0,0,'up')), Path('.'),
+            lambda: False, device=device, clock=clock, sleeper=clock.sleep, async_observation=True,
+            observation_request=request, captured_frame_observer=observe)
+        player.prepare()
+        with self.assertRaises(LifeDepleted): player.play(1000, -51)
+        self.assertEqual(guard.samples, 2)
+        self.assertTrue(guard.zero_confirmed)
+        self.assertLess(player.report['sent_actions'], 2)
+        player.close()
+        self.assertTrue(player.report['release_confirmed'])
+        self.assertFalse(device.active)
+        self.assertEqual(player.report['queue_underflows'], 0)
+        self.assertEqual(player.report['frozen_timing_offset_ms'], -51)
+
+    def test_async_stop_with_pending_capture_never_waits_and_does_not_request_again(self):
+        clock=Clock(); device=ScriptDevice(clock); requests=[]
+        class Job:
+            done=False
+            def wait(self): raise AssertionError('停止不能等截图')
+        def request(): requests.append(clock()); return Job()
+        player=NativePlayer(None, (Touch(.1,2,0,'down',500),Touch(8,0,0,'up')), Path('.'),
+            lambda:clock()>1000.35, device=device, clock=clock, sleeper=clock.sleep,
+            async_observation=True, observation_request=request, captured_frame_observer=Mock())
+        player.prepare()
+        with self.assertRaises(InterruptedError): player.play(1000,0)
+        count=len(device.commands); player.close()
+        self.assertEqual(len(requests),1)
+        self.assertEqual(len(device.commands),count)
+        self.assertTrue(player.report['release_confirmed'])
+        self.assertEqual(player.report['observation']['discarded_pending'],1)
+
+    def test_jlog_disk_error_is_reported_without_changing_release_proof(self):
+        for release_ok in (True,False):
+            with self.subTest(release_ok=release_ok):
+                clock=Clock(); device=ScriptDevice(clock); device.release_ok=release_ok
+                device.jlog_io_diagnostics={'enabled':True,'complete':False,'error':'OSError: flush',
+                                            'warnings':['disk-error']}
+                player=NativePlayer(None,(Touch(.1,2,0,'down',500),Touch(.2,0,0,'up')),Path('.'),
+                    lambda:False,device=device,clock=clock,sleeper=clock.sleep)
+                if release_ok: player.close()
+                else:
+                    with self.assertRaisesRegex(RuntimeError,'释放未确认'): player.close()
+                self.assertEqual(player.report['release_confirmed'],release_ok)
+                self.assertEqual(player.report['jlog_io']['error'],'OSError: flush')
+                self.assertIn('disk-error',player.report['warnings'][0])
+
+    def test_synchronous_1917ms_capture_reproduces_queue_underflow(self):
+        clock = Clock(); device = ScriptDevice(clock)
+        events = (Touch(.1,2,0,'down',500), Touch(8,0,0,'up'))
+        player = NativePlayer(None, events, Path('.'), lambda: False, device=device,
+                              clock=clock, sleeper=clock.sleep, idle_observer=lambda: clock.sleep(1.917))
+        player.prepare()
+        with self.assertRaisesRegex(RuntimeError, '180'):
+            player.play(1000, 0)
+        player.close()
+
+    def test_async_1917ms_capture_preserves_publication_and_release(self):
+        clock = Clock(); device = ScriptDevice(clock)
+        requests, samples = [], []
+        class Job:
+            def __init__(self): self.at = clock()
+            @property
+            def done(self): return clock() - self.at >= 1.917
+            @property
+            def succeeded(self): return True
+            def get(self): return __import__('numpy').zeros((720,1280,3), dtype='uint8')
+            def wait(self): raise AssertionError('输入 owner 不得等待截图')
+        def request():
+            requests.append(clock())
+            return Job()
+        events = (Touch(.1,2,0,'down',500), Touch(8,0,0,'up'))
+        player = NativePlayer(None, events, Path('.'), lambda: False, device=device,
+            clock=clock, sleeper=clock.sleep, idle_observer=lambda: self.fail('不可调用同步观察'),
+            async_observation=True, observation_request=request,
+            captured_frame_observer=lambda frame, requested_at: samples.append(requested_at))
+        player.prepare(); player.play(1000,0); player.close()
+        self.assertEqual(player.report['queue_underflows'], 0)
+        self.assertEqual(player.report['executed_actions'], 2)
+        self.assertTrue(player.report['release_confirmed'])
+        self.assertFalse(samples)
+        self.assertGreater(player.report['observation']['skipped_stale'], 0)
+        self.assertGreaterEqual(len(requests), 3)
+
     def test_whole_song_receipts_cover_chords_slides_flick_coordinates_and_release(self):
         events = (Touch(.6,2,0,'down',190),Touch(.6,2,1,'down',1000),
                   Touch(.624,0,1,'up'),Touch(.8,1,0,'move',640),Touch(.9,1,0,'move',700,486),Touch(1,0,0,'up'))
@@ -89,6 +184,11 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(device.active)
         self.assertGreater(report['calibration_chunks'],0)
         self.assertLess(report['execution_drift_ms_max_abs'],10)
+        self.assertEqual(len(report['device_clock_samples']),report['chunks'])
+        for sample in report['device_clock_samples']:
+            self.assertAlmostEqual(sample['receive_minus_mapped_end_ms'],
+                (sample['received_s'] - sample['mapped_end_s']) * 1000)
+            self.assertEqual(sample['fixed_clock_offset_s'],report['device_clock_offset_s'])
 
     def test_mismatched_current_run_receipt_fails_and_can_be_released(self):
         clock = Clock(); device = ScriptDevice(clock)

@@ -29,6 +29,8 @@ def load_performance(root: Path):
         settings = PerformanceSettings(**temporary)
         if settings.engine not in {"legacy", "native"} or not -300 <= settings.touch_offset_ms <= 300:
             raise ValueError("独立验收演奏设置无效")
+    from project_sekai.diagnostics import configure
+    configure(settings.disable_logging)
     return settings
 
 

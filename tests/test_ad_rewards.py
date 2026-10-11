@@ -242,6 +242,8 @@ class AdRewardsTests(unittest.TestCase):
                  ROOT / '.local/ad-rewards-20261007/watch-confirm.png']
         for path in paths:
             with self.subTest(path=path.name):
+                if not path.is_file():
+                    self.skipTest(f"可选本机历史截图已清理：{path.name}")
                 expected = 'watch_confirm' if path.name == 'watch-confirm.png' else 'rewards'
                 self.assertEqual(pages.observe(read_image(path)), {'state': expected})
         pages.ocr.read.assert_not_called()

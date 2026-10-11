@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import compile_touches
 from .game_timing import GameTimingGuard, GameTimingTemplates
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
@@ -71,6 +71,8 @@ class MissingCooperativeChart(ValueError):
 
 
 def append_cooperative_result_index(root, directory, report):
+    if not enabled():
+        return
     identity = report.get("resolved_identity") or report.get("preparation_identity", {})
     values = report.get("judgements", report.get("partial_judgements", {}))
     playback = (report.get("playback") or {})
@@ -690,7 +692,7 @@ class CooperativeLive(SoloLive):
         while True:
             self.check_runtime_stop()
             try:
-                directory.mkdir(parents=True, exist_ok=True)
+                make_directory(directory, parents=True, exist_ok=True)
                 return
             except OSError:
                 # 日志目录不可写时保留同一目录重试，不开始任何设备或页面操作。
@@ -789,6 +791,11 @@ class CooperativeLive(SoloLive):
             report["recovery_observation"]["samples"] = [sample for sample, _ in frames]
 
     def persist_runtime_report(self, report, directory):
+        if not enabled():
+            report["persistence_confirmed"] = False
+            report["task_state"] = "completed_in_memory" if report.get("completed") else "observed_in_memory"
+            report["diagnostics_disabled"] = True
+            return
         evidence_saved = False
         completion_candidate = report.get("completed", False)
         while True:
@@ -1056,13 +1063,13 @@ class CooperativeLive(SoloLive):
                              identity_phase="cooperative_final", on_final_identity=on_final_identity,
                              opening_timeout=ROOM_WAIT_SECONDS, opening_deadline_provider=opening_deadline)
 
-    def observe_play_state(self, directory):
-        requested_at = time.perf_counter()
+    def observe_play_state(self, directory, *, frame=None, requested_at=None):
+        requested_at = time.perf_counter() if requested_at is None else requested_at
         guard = self.life_guard
         if requested_at - guard.last_sample_at < PLAY_OBSERVATION_INTERVAL:
             return
         guard.last_sample_at = requested_at
-        frame = self.screenshot()
+        frame = self.screenshot() if frame is None else self.check_observation_frame(frame)
         elapsed = requested_at - self.life_epoch
         if elapsed < 8:
             self.life_frames.append((elapsed, frame))
@@ -1431,7 +1438,7 @@ class CooperativeLive(SoloLive):
             self.recovery_observation_count = 0
             self.life_guard, self.life_frames, self.anchor_frames = LifeGuard(bar_area=COOPERATIVE_LIFE_BAR), [], []
             self.life_recent_frames, self.life_sample_images = deque(maxlen=8), deque(maxlen=240)
-            report["report_path"] = str(directory / "report.json")
+            report["report_path"] = str(directory / "report.json") if enabled() else None
             native_player = None
             runtime_error = None
             try:
@@ -1451,7 +1458,7 @@ class CooperativeLive(SoloLive):
                     self.life_recent_frames, self.life_sample_images = deque(maxlen=8), deque(maxlen=240)
                     self.anchor_frames = []
                     attempt_dir = directory / f"attempt-{attempt + 1}"
-                    attempt_dir.mkdir()
+                    make_directory(attempt_dir, )
                     self.current_directory = attempt_dir
                     self.begin_performance_trace()
                     self.prepare_game_timing_feedback(report, game_timing_feedback, engine)
@@ -1490,6 +1497,7 @@ class CooperativeLive(SoloLive):
                                                              idle_observer=lambda: self.observe_play_state(attempt_dir),
                                                              observation_interval=PLAY_OBSERVATION_INTERVAL,
                                                              observation_budget=.30,
+                                                             **self.native_observation_options(attempt_dir),
                                                              **feedback_options)
                                 report["playback"] = native_player.report
                                 native_player.prepare()
@@ -1623,7 +1631,7 @@ class CooperativeLive(SoloLive):
                 self.join_deadline = None
                 self.join_request_count = 0
                 self.room_progress = {}
-            self.safe_log(f"协力谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")
+            self.safe_log(f"协力谱面演出：已完成 {self.completed_rounds} / 总数 {count}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
             if report.get("settlement_warning"):
                 self.safe_log(f"{report['settlement_warning']}；已演出 {round_index}/{count}，完整记录 {self.completed_rounds}")
             if report.get("judgements"):

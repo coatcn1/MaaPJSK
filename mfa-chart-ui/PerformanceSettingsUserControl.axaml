@@ -35,6 +35,8 @@
                        TextWrapping="Wrap" />
             <TextBlock Text="Native 校准按上方体力数量完成一局排练和一局正式验证，校准期间关闭用药。以实际 FAST 与 LATE（SLOW）接近平衡为目标，不因 MISS 等其他判定单独拒绝；仍要求 LIVE CLEAR、音数匹配、完整输入与释放。通过后保存当前设备和难度的配置。"
                        TextWrapping="Wrap" />
+            <CheckBox Content="不写入任何日志" IsChecked="{Binding DisableLogging, Mode=TwoWay}" />
+            <TextBlock Text="关闭截图、成绩、演奏与框架文件日志。界面进度继续显示；设置、校准配置、谱面及用药状态仍会保存。停止所有任务与维护后才能保存。" TextWrapping="Wrap" />
             <TextBlock Text="{Binding CalibrationText}" TextWrapping="Wrap" />
             <WrapPanel>
                 <Button Content="保存演奏设置" Command="{Binding SaveCommand}" Margin="0,0,12,8" />

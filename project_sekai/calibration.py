@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .chart_catalog import _write_json
+from .diagnostics import write_json, make_directory
 from . import native_engine
 from .chart_player import START_ANCHOR_VERSION, TOUCH_PLAN_VERSION
 
@@ -169,7 +170,7 @@ class CalibrationRunner:
 
     def run(self, difficulty: str, song_mode: str):
         directory = self.session_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
-        directory.mkdir(parents=True)
+        make_directory(directory, parents=True)
         session = {"schema_version": 1, "environment": self.environment, "difficulty": difficulty,
                    "started_at": datetime.now().astimezone().isoformat(), "status": "running", "rounds": [],
                    "settings_snapshot": asdict(self.settings), "bonus_consumption": self.test_bonus_consumption}
@@ -199,7 +200,7 @@ class CalibrationRunner:
         pending_profile = None
         bonus_snapshot = {}
         try:
-            _write_json(directory / "session.json", session)
+            write_json(directory / "session.json", session)
             for index, stage in enumerate(("rehearsal", "formal-validation"), 1):
                 bonus_label = "沿用游戏体力设置" if self.test_bonus_consumption == "current" else f"{self.test_bonus_consumption} 体力"
                 self.workflow.log(f"Native 校准：{stage}，第 {index} / 2 局，{bonus_label}，触控偏移 {offset} ms")
@@ -219,7 +220,7 @@ class CalibrationRunner:
                     offset = adjusted_offset(offset, report["judgements"])
                     session["suggested_offset_ms"] = offset
                     session["rehearsal_feedback"] = timing_feedback(report["judgements"])
-                    _write_json(directory / "session.json", session)
+                    write_json(directory / "session.json", session)
                 else:
                     if not validation_passed(report):
                         session["status"] = "rejected"
@@ -269,6 +270,6 @@ class CalibrationRunner:
                     feedback = pending_profile["validation_feedback"]
                     self.workflow.log(f"Native 校准已通过并保存：实际偏移 {offset} ms；FAST {feedback['fast']} / LATE {feedback['late']}，允许差值 {feedback['tolerance']}")
             session["finished_at"] = datetime.now().astimezone().isoformat()
-            _write_json(directory / "session.json", session)
+            write_json(directory / "session.json", session)
             if restoration_error is not None and not self.workflow.stop_requested():
                 raise RuntimeError("校准后的原体力消耗恢复未确认；本次候选未启用") from restoration_error

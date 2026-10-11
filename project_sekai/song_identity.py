@@ -20,6 +20,9 @@ def read_image(path: Path) -> np.ndarray:
 
 
 def write_image(path: Path, image: np.ndarray) -> None:
+    from .diagnostics import enabled
+    if not enabled():
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     success, data = cv2.imencode(".png", image)
     if not success:

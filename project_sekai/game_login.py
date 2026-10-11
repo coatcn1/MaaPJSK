@@ -8,7 +8,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .maa_device import MaaDevice
 from .navigator import Navigator
 from .ocr import LineOcr
@@ -81,7 +81,7 @@ class GameLogin:
             directory, report = self._session
         else:
             directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
-            directory.mkdir(parents=True)
+            make_directory(directory, parents=True)
             report = {"schema_version": 1, "task": "game_login", "completed": False,
                       "started_at": datetime.now().astimezone().isoformat(), "launch_requests": 0,
                       "title_requests": 0, "notice_requests": 0}
