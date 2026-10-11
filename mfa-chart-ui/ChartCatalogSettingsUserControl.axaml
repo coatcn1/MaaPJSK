@@ -9,7 +9,7 @@
             <TextBlock Text="日服谱面管理" FontSize="18" FontWeight="SemiBold" />
             <TextBlock Text="同步已公开歌曲的 SUS 谱面与封面，包含实际存在的 Easy / Normal / Hard / Expert / Master / Append。"
                        TextWrapping="Wrap" />
-            <TextBlock Text="默认增量更新，复用本地完整资源。近三个月的资源每七天复查；更早的未变资源不再联网检查，缺失或损坏仍会补齐。" TextWrapping="Wrap" />
+            <TextBlock Text="默认增量更新，仅处理新增、变化、缺失或损坏的资源。未变资源轻量复用；检查近期资源可手动联网复查近三个月。" TextWrapping="Wrap" />
             <TextBlock Text="{Binding CatalogText}" TextWrapping="Wrap" />
             <WrapPanel>
                 <Button Content="增量更新谱面" Command="{Binding SyncCommand}" IsEnabled="{Binding NotSyncing}" Margin="0,0,12,8" />

@@ -64,6 +64,9 @@ class PerformanceTrace:
             temporary.unlink(missing_ok=True)
 
     def save(self, directory: Path, report):
+        from .diagnostics import enabled
+        if not enabled():
+            return {"status": "disabled", "samples": len(self.samples)}
         if not self.samples and not self.events:
             return {"status": "not_started", "samples": 0}
         header = {"kind": "session", "schema_version": 1, "recording_mode": "trace-only",

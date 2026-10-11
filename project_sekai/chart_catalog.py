@@ -29,7 +29,6 @@ GIT_REFS_URL = "https://github.com/Sekai-World/sekai-master-db-diff.git/info/ref
 MASTER_ROOT = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff"
 ASSET_ROOT = "https://storage.sekai.best/sekai-jp-assets"
 SCHEMA_VERSION = 1
-REMOTE_RECHECK_DAYS = 7
 REMOTE_RECHECK_MONTHS = 3
 Progress = Callable[[str], None]
 
@@ -50,7 +49,15 @@ def _write_atomic(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # Windows 杀毒扫描或不共享删除的短暂句柄可能阻止替换；始终保留同一临时文件及旧目标。
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except OSError as error:
+                if os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33} or attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -204,19 +211,43 @@ def _safe_local_path(root: Path, relative: Any) -> Path:
     return path
 
 
+def _asset_integrity(path: Path, entry: dict[str, Any]) -> dict[str, Any]:
+    stat = path.stat()
+    return {"version": 1, "path": entry["path"], "source_url": entry["source_url"],
+            "sha256": entry["sha256"], "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns, "inode": stat.st_ino, "device": stat.st_dev}
+
+
+def _remote_attempt(entry: dict[str, Any]) -> int:
+    value = entry.get("remote_attempt_ns", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 def _verified_asset(root: Path, cached: Any, url: str,
-                    validate: Callable[[bytes], dict[str, Any]]) -> dict[str, Any] | None:
+                    validate: Callable[[bytes], dict[str, Any]], expected_prefix: str) -> dict[str, Any] | None:
     try:
         if not isinstance(cached, dict) or cached.get("source_url") != url:
             return None
-        path = _safe_local_path(root, cached["path"])
-        if path.stat().st_size > 16 * 1024 * 1024:
+        digest = cached["sha256"]
+        extension = "sus" if validate is validate_sus else "png"
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             return None
+        if cached["path"] != f"{expected_prefix}-{digest}.{extension}":
+            return None
+        path = _safe_local_path(root, cached["path"])
+        integrity = _asset_integrity(path, cached)
+        if not 0 < integrity["size"] <= 16 * 1024 * 1024 or integrity["size"] != cached["size"]:
+            return None
+        # 签名只代表之前完整校验的同一文件；身份、路径、大小或时间变化即重新读取并严格验证。
+        if cached.get("local_integrity") == integrity:
+            return cached
         body = path.read_bytes()
         if _sha256(body) != cached["sha256"] or len(body) != cached["size"]:
             return None
-        validate(body)
-        return cached
+        details = validate(body)
+        if _asset_integrity(path, cached) != integrity:
+            return None
+        return dict(cached, **details, local_integrity=integrity)
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -225,17 +256,6 @@ def _asset_fingerprint(music: dict[str, Any], metadata: dict[str, Any] | None = 
     # 谱面保守比较完整歌曲及难度元数据；封面只受资源名影响。版本前缀便于以后升级比较规则。
     value = {"music": music, "chart": metadata} if metadata is not None else {"jacket": music.get("assetbundleName")}
     return "v1:" + _sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-
-
-def _recently_checked(entry: dict[str, Any]) -> bool:
-    try:
-        checked_at = datetime.fromisoformat(entry["checked_at"])
-        if checked_at.utcoffset() is None:
-            return False
-        age = (datetime.now(timezone.utc) - checked_at).total_seconds()
-        return 0 <= age < REMOTE_RECHECK_DAYS * 86400
-    except (KeyError, ValueError, TypeError):
-        return False
 
 
 def _is_archived(music: dict[str, Any], *, now: datetime | None = None) -> bool:
@@ -261,6 +281,9 @@ def _previous_catalog(root: Path, asset_root: str) -> tuple[dict[int, dict[str, 
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return {}, {}
     fingerprints = {}
+    if all(isinstance(asset, dict) and asset.get("metadata_fingerprint") for song in songs.values()
+           for asset in [*song["charts"].values(), *([song["jacket"]] if song.get("jacket") else [])]):
+        return songs, fingerprints
     try:
         # 旧索引没有指纹时，从已校验的同版 master 快照迁移，避免首次增量更新重新请求全库。
         indices = []
@@ -293,25 +316,49 @@ def _sync_asset(root: Path, relative_directory: Path, stem: str, extension: str,
                 check_recent: bool, archived: bool, fingerprint: str, previous: dict[str, Any] | None,
                 previous_fingerprint: str | None) -> tuple[dict[str, Any] | None, str | None]:
     receipt = root / ".cache" / f"{_sha256(url.encode('utf-8'))}.json"
+    expected_prefix = (relative_directory / stem).as_posix()
+    previous = previous if isinstance(previous, dict) else None
+    original_receipt = None
     try:
-        cached = _verified_asset(root, _read_json(receipt), url, validate)
+        original_receipt = _read_json(receipt)
     except (OSError, ValueError):
-        cached = None
-    if cached is None:
-        cached = _verified_asset(root, previous, url, validate)
+        pass
+    candidates = [value for value in (original_receipt, previous) if isinstance(value, dict)]
+    # 优先本次元数据及较新远端尝试；兼顾取消后尚未发布的资源与缓存写失败后的完整索引。
+    candidates.sort(key=lambda value: (value.get("metadata_fingerprint") == fingerprint,
+                                      _remote_attempt(value)), reverse=True)
+    cached = None
+    needs_receipt = False
+    for candidate in candidates:
+        candidate = dict(candidate)
+        for other in candidates:
+            if (candidate.get("local_integrity") is None and other.get("local_integrity") is not None
+                    and all(candidate.get(key) == other.get(key) for key in ("path", "sha256", "source_url", "size"))):
+                candidate["local_integrity"] = other["local_integrity"]
+        cached = _verified_asset(root, candidate, url, validate, expected_prefix)
+        if cached is not None:
+            needs_receipt = cached.get("local_integrity") != candidate.get("local_integrity")
+            break
     if cached is not None:
         cached = dict(cached)
+        if (previous is not None and previous.get("status") == "stale"
+                and cached["sha256"] == previous.get("sha256")
+                and cached.get("metadata_fingerprint") == previous.get("metadata_fingerprint")
+                and _remote_attempt(cached) <= _remote_attempt(previous)):
+            # 失败回执可能因占用未写入；完整索引中的较新失败必须阻止旧成功缓存掩盖待重试状态。
+            cached["status"] = "stale"
         if (not cached.get("metadata_fingerprint") and previous is not None
                 and cached["sha256"] == previous.get("sha256")):
             cached["metadata_fingerprint"] = previous.get("metadata_fingerprint") or previous_fingerprint
             if previous.get("status") == "stale":
                 cached["status"] = "stale"
         if (not force and cached.get("status") != "stale" and cached.get("metadata_fingerprint") == fingerprint
-                and (archived or (not check_recent and _recently_checked(cached)))):
-            # 三个月以前的未变资源不联网复查；本地复用也不刷新近期资源的远端确认时间。
+                and (archived or not check_recent)):
+            # 默认增量只处理新增、变化或失效资源；手动近期检查保留三个月范围。
             entry = dict(cached, status="reused", downloaded_bytes=0)
             entry.pop("update_error", None)
-            _write_json(receipt, entry)
+            if needs_receipt:
+                _save_receipt(receipt, cached)
             return entry, None
     try:
         response = client.get(url, etag=cached.get("etag", "") if cached and not force else "",
@@ -339,19 +386,30 @@ def _sync_asset(root: Path, relative_directory: Path, stem: str, extension: str,
         else:
             raise ValueError(f"在线资源返回意外状态 {response.status}")
         entry["metadata_fingerprint"] = fingerprint
+        entry["remote_attempt_ns"] = time.time_ns()
+        entry["local_integrity"] = _asset_integrity(_safe_local_path(root, entry["path"]), entry)
         entry.pop("update_error", None)
-        _write_json(receipt, entry)
+        _save_receipt(receipt, entry)
         return entry, None
     except InterruptedError:
         raise
     except (OSError, ValueError) as error:
         if cached is not None:
             # 失败时保留可用旧版，但明确标记为未确认最新，不能把它算作本次更新成功。
-            entry = dict(cached, status="stale", update_error=str(error), downloaded_bytes=0)
+            entry = dict(cached, status="stale", update_error=str(error), downloaded_bytes=0,
+                         remote_attempt_ns=time.time_ns())
             # 将失败状态保存到续传记录；下次增量必须重试，不能把旧成功回执当成本次已确认。
-            _write_json(receipt, entry)
+            _save_receipt(receipt, entry)
             return entry, str(error)
         return None, str(error)
+
+
+def _save_receipt(path: Path, entry: dict[str, Any]) -> None:
+    # 缓存仅用于加速和续传，完整索引才是使用入口；缓存写入失败不能推翻已校验的资源。
+    try:
+        _write_json(path, entry)
+    except OSError:
+        pass
 
 
 def _positive_integer(value: Any, name: str) -> int:
@@ -499,9 +557,10 @@ def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers
                     song = future.result()
                     songs.append(song)
                     assets = [*song["charts"].values(), *([song["jacket"]] if song["jacket"] else [])]
-                    report(f"[{len(songs)}/{len(entries)}] {song['id']} {song['title']} · "
-                           f"谱面 {len(song['charts'])}，封面 {int(song['jacket'] is not None)}，"
-                           f"复用 {sum(asset['status'] == 'reused' for asset in assets)}，错误 {len(song['errors'])}")
+                    if song["errors"] or any(asset["status"] != "reused" for asset in assets):
+                        report(f"[{len(songs)}/{len(entries)}] {song['id']} {song['title']} · "
+                               f"谱面 {len(song['charts'])}，封面 {int(song['jacket'] is not None)}，"
+                               f"复用 {sum(asset['status'] == 'reused' for asset in assets)}，错误 {len(song['errors'])}")
                     for error in song["errors"]:
                         report(f"  失败 {song['id']} {error.get('difficulty', error['kind'])}：{error['message']}")
             except BaseException:
@@ -514,7 +573,7 @@ def sync_catalog(output_root: Path, *, client: HttpClient | None = None, workers
                     "generated_at": _utc_now(), "source": {"repository": "Sekai-World/sekai-master-db-diff",
                     "revision": revision, "asset_root": asset_root, "runtime_network_access": False},
                     "scope": {"difficulties": list(difficulties), "song_ids": list(song_ids) if song_ids is not None else None},
-                    "sync": {"mode": mode, "remote_recheck_days": REMOTE_RECHECK_DAYS,
+                    "sync": {"mode": mode, "automatic_remote_recheck": False,
                              "remote_recheck_months": REMOTE_RECHECK_MONTHS},
                     "master": master, "summary": _summarize(songs, indexed=len(musics), unpublished=unpublished),
                     "songs": songs}

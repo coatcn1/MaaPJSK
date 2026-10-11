@@ -100,7 +100,8 @@ class Navigator:
 
     def _save_failure(self, frame: np.ndarray, name: str) -> None:
         destination = self.config_path.parent / f"failure-{name}.png"
-        cv2.imwrite(str(destination), frame)
+        from .song_identity import write_image
+        write_image(destination, frame)
 
     def tap(self, x: int, y: int, reason: str) -> None:
         self._check_stop()

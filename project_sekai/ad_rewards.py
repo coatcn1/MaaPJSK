@@ -11,7 +11,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .ocr import LineOcr
 from .song_identity import read_image, write_image
 
@@ -378,7 +378,7 @@ class AdRewards:
 
     def run(self):
         self.directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
-        self.directory.mkdir(parents=True)
+        make_directory(self.directory, parents=True)
         self.report = {"schema_version": 2, "task": "ad_rewards", "completed": False,
                        "started_at": datetime.now().astimezone().isoformat(), "navigation": [],
                        "ads": [], "started_ads": 0, "normal_returns": 0, "restart_requests": 0,

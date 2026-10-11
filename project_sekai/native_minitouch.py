@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import random
+import os
+import queue
 import socket
 import string
 import subprocess
@@ -18,13 +20,16 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from . import native_engine
 
 
 _DEVICE_BINARY = "/data/local/tmp/minitouch_maapjsk"
 _VENDOR_ROOT = Path(__file__).resolve().parent / "native" / "vendor" / "minitouch"
+# 日志隔离参考 MaaBanGDream 42b90f1；来源和许可证见 third_party/maabangdream。
+_JLOG_WRITER_LOCK = threading.Lock()
+_JLOG_WRITERS: dict[object, "_JlogWriter"] = {}
 
 
 def _parse_surface_rotation(dumpsys_input: str) -> int:
@@ -45,6 +50,158 @@ def _parse_surface_rotation(dumpsys_input: str) -> int:
 
 class MinitouchStartError(RuntimeError):
     """minitouch 无法在设备上启动或握手失败。"""
+
+
+class _JlogWriter:
+    """单 generation 的诊断 IO；状态锁从不覆盖文件系统操作。"""
+
+    def __init__(self, path, generation, *, stream=None, capacity=4096, key=None):
+        self.path = path
+        self.key = key
+        self.generation = generation
+        self._stream = stream
+        self._queue = queue.Queue(maxsize=capacity)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self._drain_deadline = None
+        self._accepted = self._written = self._dropped = 0
+        self._slow_batches = 0
+        self._max_batch_ms = 0.0
+        self._error = None
+        self._io_operation = None
+        self._io_started_at = None
+        self._max_io_ms = 0.
+        self._error_operation = None
+        self.thread = threading.Thread(target=self._run, name="native-jlog-writer", daemon=True)
+
+    def enqueue(self, line):
+        with self._lock:
+            self._accepted += 1
+            if self._stop.is_set() or self._error is not None:
+                self._dropped += 1
+                return
+            try:
+                self._queue.put_nowait(line)
+            except queue.Full:
+                self._dropped += 1
+
+    def stop(self):
+        # 停止不等待磁盘；健康 writer 自行排空，超时后不再开始新的批写。
+        with self._lock:
+            if not self._stop.is_set():
+                self._drain_deadline = time.perf_counter() + .020
+                self._stop.set()
+
+    def snapshot(self):
+        with self._lock:
+            pending = self._accepted - self._written - self._dropped
+            done = self._done.is_set()
+            timed_out = bool(self._stop.is_set() and not done
+                             and time.perf_counter() >= self._drain_deadline)
+            warnings = []
+            io_cost = (time.perf_counter() - self._io_started_at) * 1000 if self._io_started_at is not None else 0.
+            if self._error:
+                warnings.append("disk-error")
+            if self._dropped:
+                warnings.append("diagnostic-lines-dropped")
+            if timed_out:
+                warnings.append("drain-timeout")
+            if self._slow_batches or io_cost > 20 or self._max_io_ms > 20:
+                warnings.append("slow-disk")
+            return {"enabled": True, "generation": self.generation,
+                    "accepted_lines": self._accepted, "written_lines": self._written,
+                    "dropped_lines": self._dropped, "pending_lines": pending,
+                    "missing_lines": self._accepted - self._written,
+                    "complete": bool(done and not self._error and not self._dropped and not pending),
+                    "drain_status": "closed" if done else ("timeout" if timed_out else
+                                    "draining" if self._stop.is_set() else "running"),
+                    "writer_alive": self.thread.is_alive(), "error": self._error,
+                    "slow_batches": self._slow_batches, "max_batch_ms": self._max_batch_ms,
+                    "io_operation": self._io_operation, "current_io_cost_ms": io_cost,
+                    "max_io_cost_ms": max(self._max_io_ms, io_cost), "error_operation": self._error_operation,
+                    "warnings": warnings}
+
+    def _begin_io(self, operation):
+        with self._lock:
+            self._io_operation, self._io_started_at = operation, time.perf_counter()
+
+    def _end_io(self):
+        with self._lock:
+            if self._io_started_at is not None:
+                self._max_io_ms = max(self._max_io_ms, (time.perf_counter() - self._io_started_at) * 1000)
+            self._io_operation = self._io_started_at = None
+
+    def _discard_pending(self):
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        with self._lock:
+            self._dropped += dropped
+
+    def _run(self):
+        stream = self._stream
+        batch = []
+        try:
+            if stream is None:
+                self._begin_io("open")
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                stream = self.path.open("a", encoding="utf-8", newline="\n")
+                self._end_io()
+            while True:
+                if self._stop.is_set() and (self._queue.empty()
+                        or time.perf_counter() >= self._drain_deadline):
+                    break
+                try:
+                    batch = [self._queue.get(timeout=.010)]
+                except queue.Empty:
+                    continue
+                for _ in range(63):
+                    try:
+                        batch.append(self._queue.get_nowait())
+                    except queue.Empty:
+                        break
+                started = time.perf_counter()
+                # 文件句柄仅归此线程；异常、慢盘和阻塞均不触及输入与回执锁。
+                self._begin_io("write")
+                stream.write("".join(line + "\n" for line in batch))
+                self._end_io()
+                self._begin_io("flush")
+                stream.flush()
+                self._end_io()
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                with self._lock:
+                    self._written += len(batch)
+                    self._max_batch_ms = max(self._max_batch_ms, elapsed_ms)
+                    self._slow_batches += int(elapsed_ms > 20)
+                batch = []
+        except Exception as exc:  # noqa: BLE001 - 诊断失败不能杀死 socket reader
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"
+                self._error_operation = self._io_operation
+                self._dropped += len(batch)
+        finally:
+            # 不可中断的系统 IO 可能仍阻塞。线程只保留旧私有状态，不能修改新局。
+            self._discard_pending()
+            self._end_io()
+            if stream is not None:
+                try:
+                    self._begin_io("close")
+                    stream.close()
+                except Exception as exc:  # noqa: BLE001
+                    with self._lock:
+                        self._error = self._error or f"{type(exc).__name__}: {exc}"
+                        self._error_operation = self._error_operation or "close"
+                finally:
+                    self._end_io()
+            self._done.set()
+            with _JLOG_WRITER_LOCK:
+                if _JLOG_WRITERS.get(self.key) is self:
+                    del _JLOG_WRITERS[self.key]
 
 
 class NativeMinitouchDevice:
@@ -77,8 +234,12 @@ class NativeMinitouchDevice:
         self._log_lines: deque[str] = deque(maxlen=4096)
         self._log_records: deque[tuple[int, str, float]] = deque(maxlen=4096)
         self._log_sequence = 0
-        self._jlog_path = Path(jlog_path) if jlog_path is not None else None
-        self._jlog_file: TextIO | None = None
+        from .diagnostics import enabled
+        self._jlog_path = Path(jlog_path) if jlog_path is not None and enabled() else None
+        self._jlog_writer: _JlogWriter | None = None
+        self._jlog_blocking_writer: _JlogWriter | None = None
+        self._jlog_disabled_reason: str | None = None
+        self._jlog_disabled_lines = 0
         self._log_lock = threading.Lock()
         self._closed = True
         self._spawned = False
@@ -176,6 +337,47 @@ class NativeMinitouchDevice:
             return dict(diagnostics)
         except (TypeError, ValueError):
             return None
+
+    @property
+    def jlog_io_diagnostics(self) -> dict[str, object]:
+        writer = self._jlog_writer
+        if self._jlog_disabled_reason is not None:
+            return {"enabled": False, "complete": False,
+                    "generation": self._reset_generation,
+                    "missing_lines": self._jlog_disabled_lines,
+                    "warnings": [self._jlog_disabled_reason],
+                    "previous_writer": self._jlog_blocking_writer.snapshot()
+                                       if self._jlog_blocking_writer else None}
+        return writer.snapshot() if writer else {"enabled": False, "complete": True, "warnings": []}
+
+    def _start_jlog_writer(self, *, stream=None, capacity=4096):
+        previous = self._jlog_writer
+        self._jlog_disabled_lines = 0
+        if previous is not None and previous.thread.is_alive():
+            previous.stop()
+            # 同一路径仍有旧 IO 时禁用本局诊断，不能跨 generation 交叉追加。
+            self._jlog_disabled_reason = "previous-generation-writer-pending"
+            self._jlog_blocking_writer = previous
+            self._jlog_writer = None
+            return None
+        self._jlog_disabled_reason = None
+        self._jlog_blocking_writer = None
+        if self._jlog_path is not None or stream is not None:
+            key = (("path", os.path.normcase(os.path.abspath(self._jlog_path)))
+                   if self._jlog_path is not None else ("stream", id(stream)))
+            with _JLOG_WRITER_LOCK:
+                previous = _JLOG_WRITERS.get(key)
+                if previous is not None and previous.thread.is_alive():
+                    # 预武装重建会换 Device，但同 run 路径仍不能与旧诊断 IO 重叠。
+                    self._jlog_writer = None
+                    self._jlog_blocking_writer = previous
+                    self._jlog_disabled_reason = "previous-generation-writer-pending"
+                    return None
+                self._jlog_writer = _JlogWriter(self._jlog_path, self._reset_generation,
+                                               stream=stream, capacity=capacity, key=key)
+                _JLOG_WRITERS[key] = self._jlog_writer
+                self._jlog_writer.thread.start()
+        return self._jlog_writer
 
     def logs_since(self, after_sequence: int) -> tuple[int, list[str]]:
         """按单调序号取出新日志，不用文本去重丢掉重复命令。"""
@@ -297,9 +499,10 @@ class NativeMinitouchDevice:
             if line:
                 self._stderr_lines.append(line)
 
-    def _read_logs(self, client: Any) -> None:
+    def _read_logs(self, client: Any, generation: int | None = None) -> None:
         # 持续排空 minitouch 的 jlog 输出；不读会导致设备端输出缓冲写满、
         # 命令执行被阻塞，进而拖慢整条时间线。
+        generation = self._reset_generation if generation is None else generation
         carry = ""
         while not self._closed and client.connected:
             try:
@@ -313,31 +516,40 @@ class NativeMinitouchDevice:
             for line in parts:
                 line = line.strip()
                 if line:
-                    self._record_log_line(line)
+                    self._record_log_line(line, source_generation=generation, source_client=client)
 
     def _record_log_line(
-        self, line: str, received_s: float | None = None
+        self, line: str, received_s: float | None = None, *, source_generation: int | None = None,
+        source_client: Any | None = None,
     ) -> None:
-        """内存保留诊断尾部，同时把原始 jlog 逐行刷到运行证据。"""
+        """先保存内存回执与本轮 reset；诊断写盘不得阻塞 reader。"""
         if received_s is None:
             received_s = time.perf_counter()
-        with self._log_lock:
-            self._log_sequence += 1
-            sequence = self._log_sequence
-            self._log_lines.append(line)
-            self._log_records.append(
-                (sequence, line, float(received_s))
-            )
-            if self._jlog_file is not None:
-                self._jlog_file.write(line + "\n")
-                self._jlog_file.flush()
-        self._observe_reset_execution(sequence, line, float(received_s))
+        # 与 request_reset 同序取锁；旧 reader 的迟到结果不能污染新 generation。
+        with self._reset_lock:
+            generation = self._reset_generation
+            if source_generation is not None and source_generation != generation:
+                return
+            if source_client is not None and self._client is not None and source_client is not self._client:
+                return
+            with self._log_lock:
+                self._log_sequence += 1
+                sequence = self._log_sequence
+                self._log_lines.append(line)
+                self._log_records.append((sequence, line, float(received_s)))
+                writer = self._jlog_writer
+                if self._jlog_disabled_reason is not None:
+                    self._jlog_disabled_lines += 1
+        self._observe_reset_execution(sequence, line, float(received_s), source_generation=generation)
+        if writer is not None and writer.generation == generation:
+            writer.enqueue(line)
 
     def _observe_reset_execution(
         self,
         sequence: int,
         line: str,
         received_s: float,
+        source_generation: int | None = None,
     ) -> None:
         """只接受本轮请求游标之后、精确 command=r 的设备执行证据。"""
         with self._reset_lock:
@@ -345,6 +557,7 @@ class NativeMinitouchDevice:
             requested_at_s = self._reset_requested_at_s
             if (
                 not self._reset_requested
+                or source_generation is not None and source_generation != self._reset_generation
                 or self._reset_executed
                 or request_cursor is None
                 or sequence <= request_cursor
@@ -361,6 +574,7 @@ class NativeMinitouchDevice:
         with self._reset_lock:
             if (
                 self._reset_executed
+                or source_generation is not None and source_generation != self._reset_generation
                 or self._reset_request_cursor != request_cursor
                 or sequence <= int(request_cursor)
             ):
@@ -396,11 +610,7 @@ class NativeMinitouchDevice:
             self._release_proof = "no-touch-possible"
             self._forced_kill_used = False
             self._touch_possible = False
-        if self._jlog_path is not None:
-            self._jlog_path.parent.mkdir(parents=True, exist_ok=True)
-            self._jlog_file = self._jlog_path.open(
-                "a", encoding="utf-8", newline="\n"
-            )
+        self._start_jlog_writer()
         self._raise_if_cancelled(cancel_event)
         if not native_engine.available():
             raise MinitouchStartError(
@@ -536,7 +746,7 @@ class NativeMinitouchDevice:
         # 握手完成后再启动日志排空线程，避免与握手读取抢同一套接字。
         self._log_thread = threading.Thread(
             target=self._read_logs,
-            args=(client,),
+            args=(client, self._reset_generation),
             daemon=True,
         )
         self._log_thread.start()
@@ -636,20 +846,9 @@ class NativeMinitouchDevice:
                             self._process = None
                     else:
                         self._process = None
-            if self._log_lock.acquire(timeout=remaining()):
-                try:
-                    if self._jlog_file is not None:
-                        try:
-                            self._jlog_file.flush()
-                            self._jlog_file.close()
-                        except Exception:  # noqa: BLE001
-                            success = False
-                        else:
-                            self._jlog_file = None
-                finally:
-                    self._log_lock.release()
-            else:
-                success = False
+            writer = self._jlog_writer
+            if writer is not None:
+                writer.stop()
             return success
         finally:
             self._local_stop_lock.release()

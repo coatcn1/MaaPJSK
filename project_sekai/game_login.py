@@ -8,7 +8,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .maa_device import MaaDevice
 from .navigator import Navigator
 from .ocr import LineOcr
@@ -81,7 +81,7 @@ class GameLogin:
             directory, report = self._session
         else:
             directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
-            directory.mkdir(parents=True)
+            make_directory(directory, parents=True)
             report = {"schema_version": 1, "task": "game_login", "completed": False,
                       "started_at": datetime.now().astimezone().isoformat(), "launch_requests": 0,
                       "title_requests": 0, "notice_requests": 0}
@@ -125,7 +125,8 @@ class GameLogin:
                 foreground = self.foreground()
                 if self.clock() >= deadline:
                     break
-                title = foreground and self.matches(frame, "title_screen")
+                title = (foreground and self.matches(frame, "title_screen")
+                         and not self.matches(frame, "playing") and not self.matches(frame, "life_hud"))
                 if title:
                     self._managed_login = True
                 if foreground and not self._managed_login:
@@ -173,6 +174,7 @@ class GameLogin:
                     fresh = self.device.screenshot()
                     self.check_stop()
                     if (not self.matches(fresh, "title_screen") or not title_menu_ready(fresh)
+                            or self.matches(fresh, "playing") or self.matches(fresh, "life_hud")
                             or not self.foreground()):
                         continue
                     report["title_requests"] += 1
@@ -191,9 +193,10 @@ class GameLogin:
             persist()
 
 
-def login_at_task_start(context, root, log_message=None):
+def login_at_task_start(context, root, log_message=None, *, device=None):
     root = Path(root)
-    device = MaaDevice(context.tasker.controller)
+    if device is None:
+        device = MaaDevice(context.tasker.controller)
     config = Path(os.environ.get("MAAPJSK_TEMPLATE_CONFIG", root / "config/maapjsk-templates.json"))
     navigator = Navigator(device, config, stop_requested=lambda: bool(context.tasker.stopping))
     return GameLogin(device, navigator, root / "debug/game-login-runs",

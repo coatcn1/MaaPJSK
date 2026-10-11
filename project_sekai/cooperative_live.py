@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import compile_touches
 from .game_timing import GameTimingGuard, GameTimingTemplates
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
@@ -71,6 +71,8 @@ class MissingCooperativeChart(ValueError):
 
 
 def append_cooperative_result_index(root, directory, report):
+    if not enabled():
+        return
     identity = report.get("resolved_identity") or report.get("preparation_identity", {})
     values = report.get("judgements", report.get("partial_judgements", {}))
     playback = (report.get("playback") or {})
@@ -480,6 +482,7 @@ class CooperativeLive(SoloLive):
         labels = {"waiting_release": "等待触点释放确认", "waiting_connection": "等待连接恢复",
                   "waiting_page": "等待安全页面", "waiting_room": "等待房间安全恢复",
                   "waiting_persistence": "等待结果文件可写", "waiting_resource": "等待用户补充体力或处理回复",
+                  "waiting_login": "等待结算后标题登录或用户返回主页",
                   "ready": "已恢复准备"}
         try:
             self.safe_log(f"协力恢复：{labels.get(state, '等待恢复')}；{detail or '保留当前状态'}；本局未增加完成次数")
@@ -536,12 +539,17 @@ class CooperativeLive(SoloLive):
             raise
 
     def wait_runtime_destination(self, report, directory, error):
+        # 诊断禁写时路径对外为空，恢复事件仍须独立存在；目录只作内存标识，不要求落盘。
+        run_id = report.get("run_id")
+        episode_key = ("run", str(run_id)) if run_id else ("directory", str(directory.absolute()))
         safe_backs = report.get("runtime_recovery", {}).get("safe_backs", 0)
         last_death_sample = float("-inf")
+        title_streak = 0
         while True:
             self.check_runtime_stop()
             if report.get("playback") is not None and not release_finished(report):
                 # 连接恢复、主页截图或新的 Native 进程都不能替代上一轮 reset 的释放证明。
+                title_streak = 0
                 self.recovery_state(report, directory, "waiting_release", error)
                 self.pause(1.)
                 continue
@@ -549,6 +557,7 @@ class CooperativeLive(SoloLive):
             try:
                 frame = self.device.screenshot()
             except Exception as connection_error:
+                title_streak = 0
                 self.recovery_state(report, directory, "waiting_connection", connection_error)
                 self.pause(1.)
                 continue
@@ -561,6 +570,47 @@ class CooperativeLive(SoloLive):
                     self.finish_death(report, directory)
                     self.persist_runtime_report(report, directory)
                     raise LifeDepleted("恢复等待中确认演出死亡，触点释放后结束协力整批")
+            eligible_login = (report.get("phase") == "settlement" and input_finished(report)
+                              and not report.get("death_confirmed"))
+            title_only = (not blank_transition(frame) and self.recovery_hud_absent(frame)
+                          and self.score(frame, "title_screen") >= self.navigator.threshold
+                          and all(self.score(frame, page) < self.navigator.threshold
+                                  for page in PAGE_AREAS if page != "title_screen"))
+            title_streak = title_streak + 1 if eligible_login and title_only else 0
+            login = getattr(self, "settlement_login", None)
+            login_active = login is not None and not getattr(self, "settlement_login_completed", False)
+            if eligible_login and (login_active or title_streak >= 2):
+                factory = getattr(self, "settlement_login_factory", None)
+                source_report = str(directory / "report.json") if enabled() else None
+                same_episode = episode_key in getattr(self, "settlement_login_episodes", set())
+                if factory is not None and (login_active or not same_episode):
+                    if not login_active:
+                        # 启动登录的期限已经结束；本次结算独立建服务，普通恢复沿袭同一实例。
+                        self.settlement_login = login = factory()
+                        self.settlement_login_source = source_report
+                        self.settlement_login_episodes = set()
+                        self.settlement_login_completed = False
+                    # 未完成服务跨报告沿袭预算；新报告也归入同一事件，完成后不能再开登录期限。
+                    self.settlement_login_episodes.add(episode_key)
+                    report["settlement_login"] = {"source_report": self.settlement_login_source,
+                                                  "status": "waiting"}
+                    self.recovery_state(report, directory, "waiting_login", error)
+                    self.check_runtime_stop()
+                    try:
+                        outcome = login.run(wait_for_home=True, resume=True)
+                    except InterruptedError:
+                        raise
+                    except Exception as login_error:
+                        report["settlement_login"].update(error=f"{type(login_error).__name__}: {login_error}",
+                                                          report=getattr(login, "report", {}))
+                        self.recovery_state(report, directory, "waiting_login", login_error)
+                        self.pause(PLAY_OBSERVATION_INTERVAL)
+                        continue
+                    self.settlement_login_completed = True
+                    report["settlement_login"].update(status="home_confirmed", report=outcome)
+                    # 回主页仍重新取帧通过原体力、入口和重匹配门禁；原失败局不补计。
+                    title_streak = 0
+                    continue
             if report.get("rematch_limit_reached"):
                 self.recovery_state(report, directory, "waiting_room", error)
                 self.pause(2.)
@@ -690,7 +740,7 @@ class CooperativeLive(SoloLive):
         while True:
             self.check_runtime_stop()
             try:
-                directory.mkdir(parents=True, exist_ok=True)
+                make_directory(directory, parents=True, exist_ok=True)
                 return
             except OSError:
                 # 日志目录不可写时保留同一目录重试，不开始任何设备或页面操作。
@@ -789,6 +839,11 @@ class CooperativeLive(SoloLive):
             report["recovery_observation"]["samples"] = [sample for sample, _ in frames]
 
     def persist_runtime_report(self, report, directory):
+        if not enabled():
+            report["persistence_confirmed"] = False
+            report["task_state"] = "completed_in_memory" if report.get("completed") else "observed_in_memory"
+            report["diagnostics_disabled"] = True
+            return
         evidence_saved = False
         completion_candidate = report.get("completed", False)
         while True:
@@ -1056,13 +1111,13 @@ class CooperativeLive(SoloLive):
                              identity_phase="cooperative_final", on_final_identity=on_final_identity,
                              opening_timeout=ROOM_WAIT_SECONDS, opening_deadline_provider=opening_deadline)
 
-    def observe_play_state(self, directory):
-        requested_at = time.perf_counter()
+    def observe_play_state(self, directory, *, frame=None, requested_at=None):
+        requested_at = time.perf_counter() if requested_at is None else requested_at
         guard = self.life_guard
         if requested_at - guard.last_sample_at < PLAY_OBSERVATION_INTERVAL:
             return
         guard.last_sample_at = requested_at
-        frame = self.screenshot()
+        frame = self.screenshot() if frame is None else self.check_observation_frame(frame)
         elapsed = requested_at - self.life_epoch
         if elapsed < 8:
             self.life_frames.append((elapsed, frame))
@@ -1431,7 +1486,7 @@ class CooperativeLive(SoloLive):
             self.recovery_observation_count = 0
             self.life_guard, self.life_frames, self.anchor_frames = LifeGuard(bar_area=COOPERATIVE_LIFE_BAR), [], []
             self.life_recent_frames, self.life_sample_images = deque(maxlen=8), deque(maxlen=240)
-            report["report_path"] = str(directory / "report.json")
+            report["report_path"] = str(directory / "report.json") if enabled() else None
             native_player = None
             runtime_error = None
             try:
@@ -1451,7 +1506,7 @@ class CooperativeLive(SoloLive):
                     self.life_recent_frames, self.life_sample_images = deque(maxlen=8), deque(maxlen=240)
                     self.anchor_frames = []
                     attempt_dir = directory / f"attempt-{attempt + 1}"
-                    attempt_dir.mkdir()
+                    make_directory(attempt_dir, )
                     self.current_directory = attempt_dir
                     self.begin_performance_trace()
                     self.prepare_game_timing_feedback(report, game_timing_feedback, engine)
@@ -1490,6 +1545,7 @@ class CooperativeLive(SoloLive):
                                                              idle_observer=lambda: self.observe_play_state(attempt_dir),
                                                              observation_interval=PLAY_OBSERVATION_INTERVAL,
                                                              observation_budget=.30,
+                                                             **self.native_observation_options(attempt_dir),
                                                              **feedback_options)
                                 report["playback"] = native_player.report
                                 native_player.prepare()
@@ -1623,7 +1679,7 @@ class CooperativeLive(SoloLive):
                 self.join_deadline = None
                 self.join_request_count = 0
                 self.room_progress = {}
-            self.safe_log(f"协力谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")
+            self.safe_log(f"协力谱面演出：已完成 {self.completed_rounds} / 总数 {count}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
             if report.get("settlement_warning"):
                 self.safe_log(f"{report['settlement_warning']}；已演出 {round_index}/{count}，完整记录 {self.completed_rounds}")
             if report.get("judgements"):

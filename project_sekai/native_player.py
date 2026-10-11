@@ -13,6 +13,7 @@ import numpy as np
 from . import native_engine
 from .chart_player import validate_touches
 from .native_minitouch import NativeMinitouchDevice
+from .native_observation import NativeObservation
 
 OFFSET_FIELDS = ("down_ms", "up_ms", "move_ms", "wait_ms", "interval_ms")
 GAME_PHASE_FEEDBACK_VERSION = 1
@@ -38,6 +39,8 @@ class NativePlayer:
     def __init__(self, controller, events, directory: Path, stop_requested, *, latency_offsets=None,
                  idle_observer=None, device=None, clock=time.perf_counter, sleeper=time.sleep,
                  observation_interval=.75, observation_budget=None,
+                 async_observation=False, observation_request=None, captured_frame_observer=None,
+                 observation_invalidated=None,
                  game_timing_correction: Callable[[], float] | None = None):
         validate_touches(events)
         if (not math.isfinite(observation_interval) or observation_interval <= 0
@@ -49,6 +52,13 @@ class NativePlayer:
         self.idle_observer, self.last_observation = idle_observer, -math.inf
         self.observation_interval = observation_interval
         self.observation_budget = observation_budget
+        self.async_observation = None
+        if async_observation:
+            if observation_request is None or captured_frame_observer is None:
+                raise ValueError("Native 异步观察缺少截图请求或已采集画面回调")
+            self.async_observation = NativeObservation(observation_request, captured_frame_observer,
+                interval=observation_interval, invalidate=observation_invalidated, clock=clock,
+                stop_requested=stop_requested)
         self.game_timing_correction = game_timing_correction
         self.game_phase_correction_ms = 0.0
         self.last_game_phase_request = None
@@ -85,6 +95,7 @@ class NativePlayer:
                        "game_phase_feedback_enabled": game_timing_correction is not None,
                        "game_phase_correction_ms": 0.0, "game_phase_applications": [],
                        "game_phase_rejections": []}
+        self.report["device_clock_samples"] = []
         if game_timing_correction is not None and not hasattr(self.timeline, "set_future_phase_correction"):
             raise RuntimeError("游戏判定反馈需要重新构建 Native 1.2.0")
         if game_timing_correction is not None:
@@ -96,6 +107,10 @@ class NativePlayer:
             self.report["observation"] = {"interval_s": observation_interval, "samples": 0, "max_cost_ms": 0,
                                           "minimum_headroom_ms": max(.42, (observation_budget or 0) + .15) * 1000,
                                           "deferred_windows": 0}
+        if self.async_observation is not None:
+            self.report["observation"] = self.async_observation.report
+            self.report["observation"].update(minimum_headroom_ms=max(.42, (observation_budget or 0) + .15) * 1000,
+                                              deferred_windows=0)
 
     def check_stop(self):
         if self.stop_requested():
@@ -139,7 +154,7 @@ class NativePlayer:
 
     def _observe(self):
         self.cursor, records = self.device.log_records_since(self.cursor)
-        for line, _ in records:
+        for line, received_s in records:
             event = native_engine.parse_minitouch_log(line)
             if event is None:
                 continue
@@ -181,6 +196,15 @@ class NativePlayer:
                     metadata["captured_actions"] = len(self.action_receipts)
                 self.pending_receipts.clear()
             if expected["last"]:
+                samples = self.report["device_clock_samples"]
+                if len(samples) < 4096:
+                    mapped_end = event["end_ms"] / 1000 + self.clock_offset
+                    samples.append({"chunk": self.report["calibration_chunks"], "guest_end_ms": event["end_ms"],
+                                    "fixed_clock_offset_s": self.clock_offset, "mapped_end_s": mapped_end,
+                                    "received_s": received_s, "processed_s": self.clock(),
+                                    "receive_minus_mapped_end_ms": (received_s - mapped_end) * 1000})
+                else:
+                    self.report["device_clock_samples_dropped"] = self.report.get("device_clock_samples_dropped", 0) + 1
                 used = expected["used"]
                 measured = self.calibrator.offsets
                 counts = self.calibrator.sample_counts
@@ -252,6 +276,8 @@ class NativePlayer:
         if not self.prepared:
             raise RuntimeError("Native 尚未在准备页完成连接")
         self.timeline.start(epoch, self.clock(), offset_ms)
+        if self.async_observation is not None:
+            self.async_observation.start()
         self.playback_epoch = epoch
         self.report.update(playback_epoch_s=epoch, frozen_timing_offset_ms=offset_ms)
         final_sent = False
@@ -284,7 +310,10 @@ class NativePlayer:
             sent = self.timeline.sent
             # 补足队列后才采样；保留至少 150 ms 供回执处理和下一窗口发布，耗时变大时推迟采样。
             headroom = max(.42, (self.observation_budget or 0) + .15)
-            if (self.idle_observer is not None and sent < len(self.events)
+            if self.async_observation is not None and sent < len(self.events):
+                self.check_stop()
+                self.async_observation.step(allow_callback=queued_until - self.clock() >= headroom)
+            elif (self.async_observation is None and self.idle_observer is not None and sent < len(self.events)
                     and self.clock() - self.last_observation >= self.observation_interval):
                 observation = self.report["observation"]
                 if queued_until - self.clock() >= headroom:
@@ -304,6 +333,8 @@ class NativePlayer:
             self.sleeper(.002)
         if self.report["executed_actions"] != len(self.events) or self.active:
             raise RuntimeError("Native 执行动作或触点收尾不完整")
+        if self.async_observation is not None:
+            self.async_observation.close()
         self.record_execution_metrics()
         return self.report
 
@@ -319,17 +350,28 @@ class NativePlayer:
                                 "planned_execution_drift_ms_max_abs": max(map(abs, self.planned_drift))})
 
     def close(self):
+        if self.async_observation is not None:
+            self.async_observation.close()
         # 生命保护和取消同样需要保留停止前的调度证据，不能只在完整结算时记录。
         self.record_execution_metrics()
         released = self.device.stop()
         self.report["release_confirmed"] = released
         self.report["release"] = self.device.release_diagnostics
+        diagnostics = getattr(self.device, "jlog_io_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            self.report["jlog_io"] = diagnostics
+            if diagnostics.get("warnings"):
+                self.report.setdefault("warnings", []).append("Native jlog 诊断写盘不完整：" + ", ".join(diagnostics["warnings"]))
         if not released:
             if self.game_timing_correction is not None:
                 self.report["native_touch_receipts"]["status"] = "release-unconfirmed"
             raise RuntimeError(f"Native 触点释放未确认：{self.device.last_release_error}")
         if self.game_timing_correction is not None:
             metadata = self.report["native_touch_receipts"]
+            from .diagnostics import enabled
+            if not enabled():
+                metadata["status"] = "disabled"
+                return
             try:
                 # 逐动作目标和真实回执只在本轮释放确认后落盘，不占用演奏队列的发布余量。
                 self.directory.mkdir(parents=True, exist_ok=True)

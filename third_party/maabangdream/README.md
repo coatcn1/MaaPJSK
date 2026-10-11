@@ -9,5 +9,10 @@
 `native/include/maabangdream/touch_script.hpp` 仅保留回读结构；PJSK 的 SUS 解析、
 十二轨触点、Native 时间窗编译及校准配置由本项目适配。
 
+诊断日志批写参考 MaaBanGDream `42b90f1`（2026-10-08，PR #80；
+主线 `f50b550` 保留同一实现）的 `agent/realtime/native_minitouch.py`。
+PJSK 仅适配有界异步 jlog 写入、诊断状态及跨代文件占用保护；
+不复制其完整播放引擎、掉血反馈或释放协议，不扩大本项目设备验收范围。
+
 `project_sekai/native/vendor/minitouch` 保留 EvATive7 的 Apache 2.0 许可证、
 来源说明与 SHA-256。构建、部署不下载或依赖另一项目的运行目录。

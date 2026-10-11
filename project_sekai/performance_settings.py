@@ -15,6 +15,7 @@ class PerformanceSettings:
     bonus_consumption: str | int = "current"
     use_calibration_profile: bool = True
     cooperative_game_timing_feedback: bool = False
+    disable_logging: bool = False
 
     @classmethod
     def load(cls, path: Path):
@@ -25,12 +26,15 @@ class PerformanceSettings:
             raise ValueError("演奏设置版本无效，请在 MFA 演奏设置中重新保存")
         # 旧版配置缺少试验开关时保持关闭，不能因新增字段而拒绝原有演奏设置。
         values.setdefault("cooperative_game_timing_feedback", False)
+        values.setdefault("disable_logging", False)
         result = cls(**{key: values[key] for key in cls.__dataclass_fields__})
         if (result.engine not in {"legacy", "native"} or type(result.touch_offset_ms) is not int
                 or not -300 <= result.touch_offset_ms <= 300 or type(result.use_calibration_profile) is not bool):
             raise ValueError("演奏引擎或谱面触控偏移无效")
         if type(result.cooperative_game_timing_feedback) is not bool:
             raise ValueError("协力 FAST / LATE 微调开关必须为布尔值")
+        if type(result.disable_logging) is not bool:
+            raise ValueError("禁用日志开关必须为布尔值")
         bonus = result.bonus_consumption
         if bonus != "current" and (type(bonus) is not int or not 0 <= bonus <= 10):
             raise ValueError("每局体力消耗必须沿用游戏设置或指定 0 到 10")

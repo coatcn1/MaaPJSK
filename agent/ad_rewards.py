@@ -42,6 +42,8 @@ class ProjectSekaiAdRewards(CustomAction):
         try:
             if context.tasker.stopping:
                 return False
+            from project_sekai.diagnostics import load_policy
+            load_policy(Path(__file__).resolve().parents[1])
             create_workflow(context, Path(__file__).resolve().parents[1]).run()
             return True
         except InterruptedError:

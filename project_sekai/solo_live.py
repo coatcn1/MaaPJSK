@@ -14,7 +14,8 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
-from .chart_catalog import ChartRepository, _write_json
+from .chart_catalog import ChartRepository
+from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
@@ -47,7 +48,7 @@ def is_light_mode(reading: Reading) -> bool:
 
 
 def append_result_index(root: Path, directory: Path, report: dict):
-    if "judgements" not in report:
+    if not enabled() or "judgements" not in report:
         return
     identity = report.get("preparation_identity", {})
     values = report["judgements"]
@@ -101,6 +102,10 @@ class SoloLive:
     def screenshot(self):
         self.navigator._check_stop()
         frame = self.device.screenshot()
+        return self.check_observation_frame(frame)
+
+    def check_observation_frame(self, frame):
+        self.navigator._check_stop()
         self.navigator._check_title_screen(frame)
         if (self.navigator.match(frame, "playing")[0] < self.navigator.threshold
                 and self.navigator.match(frame, "home")[0] < self.navigator.threshold):
@@ -109,6 +114,23 @@ class SoloLive:
             if title.confidence >= .8 and normalize_title(title.text) == "taptostart":
                 raise RuntimeError("游戏已返回 TAP TO START 标题页，停止结算返回")
         return frame
+
+    def native_observation_options(self, directory):
+        if os.environ.get("MAAPJSK_NATIVE_ASYNC_OBSERVATION") != "1":
+            return {}
+        return {"async_observation": True, "observation_request": self.device.controller.post_screencap,
+                "captured_frame_observer": lambda frame, requested_at: self.observe_play_state(
+                    directory, frame=frame, requested_at=requested_at),
+                "observation_invalidated": self.invalidate_play_observation}
+
+    def invalidate_play_observation(self, reason, requested_at):
+        # 丢弃帧打断连续证据；后续新鲜帧不能与迟到或重复结果拼成死亡/异常。
+        guard = self.life_guard
+        guard.zero_streak = guard.playfield_missing_frames = 0
+        guard.abnormal_page, guard.abnormal_frames = None, 0
+        feedback = getattr(self, "game_timing_guard", None)
+        if feedback is not None:
+            feedback.direction, feedback.streak, feedback.evidence = None, 0, []
 
     def pause(self, seconds: float):
         end = time.monotonic() + seconds
@@ -935,9 +957,29 @@ class SoloLive:
                                            "pause_fallback_frames": guard.pause_fallback_frames}
         # 暂停按钮会被特效干扰；生命标签仍在就继续，一张缺失帧不能中断已确认歌曲的输入。
         if guard.playfield_missing_frames >= 2:
-            write_image(directory / "playback-interrupted.png", frame)
+            self.defer_playback_evidence("playback-interrupted.png", frame)
             raise RuntimeError(interrupted_message)
         return visible
+
+    def defer_playback_evidence(self, name, frame):
+        # 演奏中的 PNG 压缩与写盘必须等当前输入释放，不能遮蔽原保护异常。
+        if not hasattr(self, "playback_evidence_frames"):
+            self.playback_evidence_frames = {}
+        self.playback_evidence_frames[name] = frame
+
+    def save_playback_evidence(self, report, directory):
+        frames = getattr(self, "playback_evidence_frames", {})
+        if not report.get("playback", {}).get("release_confirmed"):
+            if frames:
+                report["playback_evidence_status"] = "waiting-release"
+            return
+        self.playback_evidence_frames = {}
+        for name, frame in frames.items():
+            try:
+                write_image(directory / name, frame)
+            except Exception as error:
+                report.setdefault("playback_evidence_errors", []).append(
+                    {"path": name, "error": f"{type(error).__name__}: {error}"})
 
     def begin_performance_trace(self):
         self.performance_trace = PerformanceTrace()
@@ -978,9 +1020,9 @@ class SoloLive:
         report["performance_trace"] = summary
         report.setdefault("performance_traces", []).append(summary)
 
-    def observe_play_state(self, directory: Path):
-        requested_at = time.perf_counter()
-        frame = self.screenshot()
+    def observe_play_state(self, directory: Path, *, frame=None, requested_at=None):
+        requested_at = time.perf_counter() if requested_at is None else requested_at
+        frame = self.screenshot() if frame is None else self.check_observation_frame(frame)
         # 诊断仅保留已有采样，不增加截图或改变输入；整局保存也限定在 180 秒内。
         capture_limit = 180 if os.environ.get("MAAPJSK_DIAGNOSTIC_FULL_LIFE_FRAMES") == "1" else 8
         if requested_at - self.life_epoch < capture_limit:
@@ -989,7 +1031,7 @@ class SoloLive:
         try:
             if not self.observe_playfield(frame, directory, "演奏场提前消失，停止谱面输入"):
                 if self.navigator.match(frame, "live_failed")[0] >= self.navigator.threshold:
-                    write_image(directory / "playback-interrupted.png", frame)
+                    self.defer_playback_evidence("playback-interrupted.png", frame)
                     self.life_guard.zero_confirmed = True
                     raise LifeDepleted("游戏已确认 LIVE FAILED，停止输入并退出演出")
                 return
@@ -999,7 +1041,7 @@ class SoloLive:
                 except ValueError:
                     return False
             if self.life_guard.observe(frame, read_zero):
-                write_image(directory / "life-zero.png", frame)
+                self.defer_playback_evidence("life-zero.png", frame)
                 raise LifeDepleted("连续两帧确认生命归零，停止输入并退出演出")
         finally:
             self.record_performance_trace(requested_at - self.life_epoch, previous_samples)
@@ -1261,8 +1303,9 @@ class SoloLive:
             native_player = None
             self.life_guard = LifeGuard()
             self.life_frames = []
+            self.playback_evidence_frames = {}
             directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
-            directory.mkdir(parents=True)
+            make_directory(directory, parents=True)
             report = {"schema_version": 1, "started_at": datetime.now().astimezone().isoformat(),
                       "requested_difficulty": difficulty, "song_mode": song_mode, "round": round_index,
                       "total_rounds": count, "completed": False, "timing_offset_ms": offset_ms,
@@ -1273,7 +1316,7 @@ class SoloLive:
                 report.update(requested_song_name=song_name, expected_song_id=expected_song_id)
             self.last_report = report
             self.begin_performance_trace()
-            report["report_path"] = str(directory / "report.json")
+            report["report_path"] = str(directory / "report.json") if enabled() else None
             try:
                 identity, frame = self.select(difficulty, song_mode,
                                               **({"song_name": song_name} if song_mode == "specified" else {}))
@@ -1294,7 +1337,8 @@ class SoloLive:
                     from .native_player import NativePlayer
                     native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
                                                  latency_offsets=latency_offsets,
-                                                 idle_observer=lambda: self.observe_play_state(directory))
+                                                 idle_observer=lambda: self.observe_play_state(directory),
+                                                 **self.native_observation_options(directory))
                     # 开场死亡也须清理同一个已准备对象，并保留零派发的释放证明。
                     report["playback"] = native_player.report
                     native_player.prepare()
@@ -1380,6 +1424,7 @@ class SoloLive:
                     else:
                         report.setdefault("release_error", "开场死亡的当前触点释放未确认，禁止页面退出")
                 self.save_preplay_life_evidence(report, directory)
+                self.save_playback_evidence(report, directory)
                 self.finish_performance_trace(report, directory)
                 for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
                                         ("identity_problem_frame", "identity-unconfirmed.png")):
@@ -1410,7 +1455,7 @@ class SoloLive:
                     raise LifeDepleted(report["preplay_followup_death_reason"])
             if report.get("completed"):
                 self.completed_rounds += 1
-            self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；报告 {directory.name}")
+            self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
             if report.get("settlement_warning"):
                 self.log(f"{report['settlement_warning']}；已演出 {round_index}/{count}，完整记录 {self.completed_rounds}")
             if report.get("judgements"):

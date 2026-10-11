@@ -110,6 +110,8 @@ class ProjectSekaiAutoLive(CustomAction):
                 stop_requested=lambda: bool(context.tasker.stopping),
                 log_message=lambda content: _visible_log(context, content),
             )
+            from project_sekai.diagnostics import load_policy
+            load_policy(Path(__file__).resolve().parents[1])
             login_at_task_start(context, Path(__file__).resolve().parents[1], lambda content: _visible_log(context, content))
             navigator.auto_live_loop(count, song_mode=song_mode, recovery_mode=mode,
                                      recovery_count=recovery_count)

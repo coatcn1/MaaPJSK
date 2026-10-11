@@ -29,17 +29,21 @@ def load_performance(root: Path):
         settings = PerformanceSettings(**temporary)
         if settings.engine not in {"legacy", "native"} or not -300 <= settings.touch_offset_ms <= 300:
             raise ValueError("独立验收演奏设置无效")
+    from project_sekai.diagnostics import configure
+    configure(settings.disable_logging)
     return settings
 
 
 def create_workflow(context, root: Path):
     config = Path(os.environ.get("MAAPJSK_TEMPLATE_CONFIG", root / "config/maapjsk-templates.json"))
     chart_config = json.loads((root / "config/chart-sync.json").read_text(encoding="utf-8-sig"))
-    workflow = SoloLive(MaaDevice(context.tasker.controller), config, Path(chart_config["output_root"]),
+    device = MaaDevice(context.tasker.controller)
+    workflow = SoloLive(device, config, Path(chart_config["output_root"]),
                     root / "resource/models/song_title_ocr", root / "debug/solo-chart-runs",
                     stop_requested=lambda: bool(context.tasker.stopping),
                     log_message=lambda message: visible_log(context, message))
-    login_at_task_start(context, root, lambda message: visible_log(context, message))
+    # MaaFramework 5.10.2 再取远程 controller 会替换旧代理；登录与演奏必须共用同一设备句柄。
+    login_at_task_start(context, root, lambda message: visible_log(context, message), device=device)
     return workflow
 
 

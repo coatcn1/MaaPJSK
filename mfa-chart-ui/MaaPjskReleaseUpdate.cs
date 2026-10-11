@@ -14,28 +14,16 @@ namespace MFAAvalonia.Helper;
 public static class MaaPjskReleaseUpdate
 {
     private static int _busy;
-    private static int _executing;
     public static bool IsBusy => Volatile.Read(ref _busy) != 0;
     public static bool IsPortable => File.Exists(Path.Combine(AppContext.BaseDirectory, "package-manifest.json"));
 
     // 队列最后一项已经出队，实际任务／清理仍可能执行；保持整个执行作用域。
     public static IDisposable BeginExecution()
     {
-        Interlocked.Increment(ref _executing);
-        return new ExecutionScope();
+        return MaaPjskMaintenance.BeginExecution();
     }
-    private sealed class ExecutionScope : IDisposable
-    {
-        private int _disposed;
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                Interlocked.Decrement(ref _executing);
-        }
-    }
+    public static bool IsIdle => !MaaPjskMaintenance.HasExecuting
 
-    public static bool IsIdle => Volatile.Read(ref _executing) == 0
-        && !ChartCatalogMaintenance.IsBusy
         && !Instances.RootViewModel.IsRunning
         && !MaaProcessor.Processors.Any(p => p.TaskQueue.Count > 0 || p.IsConnecting
             || p.MaaTasker?.IsRunning == true || p.MaaTasker?.IsStopping == true);
@@ -80,7 +68,8 @@ public static class MaaPjskReleaseUpdate
 
     public static async Task UpdateAsync(string? localPackagePath = null)
     {
-        if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0) return;
+        if (!MaaPjskMaintenance.TryBegin()) return;
+        Interlocked.Exchange(ref _busy, 1);
         var handedOff = false;
         try {
             if (!await Dispatcher.UIThread.InvokeAsync(() => IsIdle))
@@ -107,6 +96,6 @@ public static class MaaPjskReleaseUpdate
             });
         } catch (Exception error) {
             ToastHelper.Error("MaaPJSK 更新失败", error.Message);
-        } finally { if (!handedOff) Interlocked.Exchange(ref _busy, 0); }
+        } finally { if (!handedOff) { Interlocked.Exchange(ref _busy, 0); MaaPjskMaintenance.End(); } }
     }
 }

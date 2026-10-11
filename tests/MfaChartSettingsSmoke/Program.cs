@@ -1,5 +1,7 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Notifications;
+using Avalonia.Interactivity;
 using Avalonia.Headless;
 using Avalonia.Themes.Fluent;
 using Avalonia.Threading;
@@ -16,10 +18,13 @@ using MFAAvalonia.Views.UserControls.Settings;
 using Microsoft.Extensions.DependencyInjection;
 using Newtonsoft.Json.Linq;
 using SukiUI;
+using SukiUI.Controls;
+using SukiUI.Dialogs;
 using SukiUI.Toasts;
 using System.Collections.ObjectModel;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 public sealed class SmokeApplication : Application
 {
@@ -33,6 +38,32 @@ public sealed class SmokeApplication : Application
 internal static class Program
 {
     private static int _checks;
+    [DllImport("MaaFramework", CallingConvention = CallingConvention.Cdecl)]
+    private static extern nint MaaTaskerGetResource(nint handle);
+
+    private static int LoggingProbe(string mode, string directory)
+    {
+        Directory.CreateDirectory(directory);
+        Environment.CurrentDirectory = directory;
+        bool disabled = mode == "disabled";
+        typeof(MaaPjskDiagnostics).GetField("_disabled", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, disabled);
+        typeof(AppPaths).GetField("_logsDirectory", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, Path.Combine(directory, "logs"));
+        typeof(AppPaths).GetField("_initialized", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, true);
+        // 初次静态初始化先设置全局日志，再初始化 Toolkit；不连接或控制设备。
+        var global = MaaProcessor.Global;
+        _ = MaaProcessor.Toolkit;
+        if (!disabled) global.SetOption_LogDir(Path.Combine(directory, "debug"));
+        LoggerHelper.Info("startup buffered fixture");
+        LoggerHelper.InitializeLogger();
+        LoggerHelper.Error("startup error fixture");
+        MaaTaskerGetResource(0);
+        LoggerHelper.DisposeLogger();
+        var files = Directory.GetFiles(directory, "*", SearchOption.AllDirectories);
+        Require(disabled ? files.Length == 0 : files.Any(path => path.EndsWith("maafw.log")) && files.Any(path => path.EndsWith(".log")),
+            "禁日志启动须零文件，启用对照须生成实际框架和 GUI 日志。");
+        Console.WriteLine($"GUI startup logging probe {mode}: {files.Length} files");
+        return 0;
+    }
 
     private static void Require(bool condition, string message)
     {
@@ -92,6 +123,7 @@ internal static class Program
 
     public static int Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--logging-probe") return LoggingProbe(args[1], Path.GetFullPath(args[2]));
         if (args.Length != 2)
             throw new ArgumentException("参数：python.exe 和离屏截图输出路径");
         AppBuilder.Configure<SmokeApplication>().UseSkia()
@@ -112,8 +144,85 @@ internal static class Program
         var tabBar = (InstanceTabBarViewModel)RuntimeHelpers.GetUninitializedObject(typeof(InstanceTabBarViewModel));
         typeof(InstanceTabBarViewModel).GetField("<Tabs>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(tabBar, tabs);
+        var smokeRoot = (MFAAvalonia.ViewModels.Windows.RootViewModel)RuntimeHelpers.GetUninitializedObject(typeof(MFAAvalonia.ViewModels.Windows.RootViewModel));
+        typeof(MFAAvalonia.ViewModels.Windows.RootViewModel).GetField("_idle", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(smokeRoot, true);
         typeof(App).GetProperty(nameof(App.Services))!.SetValue(null,
-            new ServiceCollection().AddSingleton(tabBar).AddSingleton<ISukiToastManager, SukiToastManager>().BuildServiceProvider());
+            new ServiceCollection().AddSingleton(tabBar).AddSingleton(smokeRoot).AddSingleton<ISukiToastManager, SukiToastManager>()
+                .AddSingleton<ISukiDialogManager, SukiDialogManager>().BuildServiceProvider());
+
+        var reservation = (MaaProcessor)RuntimeHelpers.GetUninitializedObject(typeof(MaaProcessor));
+        var reserve = typeof(MaaProcessor).GetMethod("ReserveProjectExecution", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var release = typeof(MaaProcessor).GetMethod("ReleaseProjectExecution", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Require((bool)reserve.Invoke(reservation, null)!, "尚未排入 worker 的启动请求也须预留任务生命周期");
+        Require(!MaaPjskMaintenance.TryBegin(), "pending 启动窗口不能开始缓存或谱面维护");
+        release.Invoke(reservation, null);
+        Require(MaaPjskMaintenance.TryBegin(), "完整释放后才能维护");
+        try { Require(!(bool)reserve.Invoke(reservation, null)!, "维护期间 worker 启动须拒绝且不初始化任务"); }
+        finally { MaaPjskMaintenance.End(); }
+
+        var cacheFixture = Path.Combine(AppContext.BaseDirectory, "cache-fixture-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(cacheFixture, "debug", "runs"));
+        Directory.CreateDirectory(Path.Combine(cacheFixture, "logs"));
+        Directory.CreateDirectory(Path.Combine(cacheFixture, "config"));
+        File.WriteAllText(Path.Combine(cacheFixture, "debug", "runs", "image.png"), "fixture image");
+        File.WriteAllText(Path.Combine(cacheFixture, "debug", "results.csv"), "preserved score");
+        File.WriteAllText(Path.Combine(cacheFixture, "logs", "runtime.log"), "fixture log");
+        File.WriteAllText(Path.Combine(cacheFixture, "config", "profile.json"), "preserved config");
+        File.WriteAllText(Path.Combine(cacheFixture, "config", "failure-timeout.png"), "old failure");
+        var cacheResult = MaaPjskCacheMaintenance.Clear(cacheFixture);
+        Require(cacheResult.Files == 3 && cacheResult.Bytes > 0 && cacheResult.Errors.Count == 0,
+            "清理须返回实际文件数与空间");
+        Require(File.Exists(Path.Combine(cacheFixture, "debug", "results.csv"))
+                && File.Exists(Path.Combine(cacheFixture, "config", "profile.json")), "成绩 CSV 和配置须保留");
+        Directory.CreateDirectory(Path.Combine(cacheFixture, "logs"));
+        var lockedPath = Path.Combine(cacheFixture, "logs", "locked.log");
+        using (var locked = File.Open(lockedPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+        {
+            var partial = MaaPjskCacheMaintenance.Clear(cacheFixture);
+            Require(partial.Errors.Count > 0 && File.Exists(lockedPath), "占用文件须报告部分失败并保留");
+        }
+        var outside = cacheFixture + "-outside";
+        Directory.CreateDirectory(outside);
+        File.WriteAllText(Path.Combine(outside, "protected.txt"), "outside fixture");
+        var link = Path.Combine(cacheFixture, "logs", "escape");
+        using (var junction = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                ArgumentList = { "/c", "mklink", "/J", link, outside } })!)
+        {
+            junction.WaitForExit();
+            Require(junction.ExitCode == 0, "重解析点 fixture 必须成功创建");
+        }
+        var unsafeResult = MaaPjskCacheMaintenance.Clear(cacheFixture);
+        Require(unsafeResult.Errors.Count > 0 && File.Exists(Path.Combine(outside, "protected.txt")), "重解析点须拒绝且不得越界删除");
+        Directory.Delete(link);
+        Directory.Delete(outside, true);
+        File.WriteAllText(Path.Combine(cacheFixture, "config", "failure-timeout.png"), "button failure fixture");
+        var rootField = typeof(Instances).GetField("_rootViewModel", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var previousRoot = rootField.GetValue(null);
+        var fakeRoot = (MFAAvalonia.ViewModels.Windows.RootViewModel)RuntimeHelpers.GetUninitializedObject(typeof(MFAAvalonia.ViewModels.Windows.RootViewModel));
+        typeof(MFAAvalonia.ViewModels.Windows.RootViewModel).GetField("_idle", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(fakeRoot, true);
+        rootField.SetValue(null, fakeRoot);
+        var previousDataRoot = AppPaths.DataRoot;
+        typeof(AppPaths).GetProperty(nameof(AppPaths.DataRoot))!.SetValue(null, cacheFixture);
+        try
+        {
+            Application.Current!.Resources["MdXamlPlugin"] = new Markdown.Avalonia.MdAvPlugins();
+            var about = new AboutUserControl();
+            var clear = typeof(AboutUserControl).GetMethod("ClearCache_Click", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            Require(MaaPjskMaintenance.TryBegin(), "缓存按钮 fixture 可开始维护");
+            try { clear.Invoke(about, [null, new RoutedEventArgs()]); }
+            finally { MaaPjskMaintenance.End(); }
+            Require(File.Exists(Path.Combine(cacheFixture, "config", "failure-timeout.png")), "维护期间实际缓存按钮必须拒绝");
+            clear.Invoke(about, [null, new RoutedEventArgs()]);
+            Require(!File.Exists(Path.Combine(cacheFixture, "config", "failure-timeout.png")), "实际关于我们缓存按钮须清理故障 PNG");
+            Require(File.Exists(Path.Combine(cacheFixture, "config", "profile.json")), "缓存按钮不能删除配置");
+        }
+        finally
+        {
+            typeof(AppPaths).GetProperty(nameof(AppPaths.DataRoot))!.SetValue(null, previousDataRoot);
+            rootField.SetValue(null, previousRoot);
+        }
+        Directory.Delete(cacheFixture, true);
 
         var fixture = Path.Combine(AppContext.BaseDirectory, "fixture");
         Directory.CreateDirectory(fixture);
@@ -130,8 +239,17 @@ if mode == 'slow':
     time.sleep(30)
 if mode == 'partial':
     print('测试镜像缺失', file=sys.stderr, flush=True)
-    sys.exit(2)
+if mode == 'fatal':
+    print('测试致命错误', file=sys.stderr, flush=True)
+    sys.exit(1)
+if mode == 'cancelled':
+    sys.exit(130)
 (root / 'manifest.json').write_text(json.dumps({'schema_version':1,'game':'project-sekai','server':'jp','generated_at':'2026-10-03T05:00:00+00:00','summary':{'songs_with_charts':2,'charts':3,'jackets':2,'recoverable_errors':0,'stale':0,'added':1,'updated':0,'reused':4,'unchanged':0,'downloaded_bytes':1048576}}), encoding='utf-8')
+token = sys.argv[sys.argv.index('--result-token') + 1]
+summary = {'added':7,'updated':3,'reused':41,'unchanged':2,'recoverable_errors':1 if mode == 'partial' else 0,'stale':1 if mode == 'partial' else 0,'downloaded_bytes':2097152}
+if mode != 'noresult':
+    print('MAAPJSK_SYNC_RESULT=' + json.dumps({'token':'wrong' if mode == 'wrongtoken' else token,'exit_code':2 if mode == 'partial' else 0,'summary':summary}), flush=True)
+sys.exit(2 if mode == 'partial' else 0)
 """);
         var configDirectory = Path.Combine(AppContext.BaseDirectory, "config");
         Directory.CreateDirectory(configDirectory);
@@ -144,22 +262,91 @@ if mode == 'partial':
         File.Delete(manifestPath);
 
         var control = new ChartCatalogSettingsUserControl();
-        var window = new Window { Width = 960, Height = 650, Content = control, Padding = new Thickness(20) };
+        var manager = Instances.DialogManager;
+        var dialogs = new List<ISukiDialog>();
+        manager.OnDialogShown += (_, e) =>
+        {
+            Require(!ChartCatalogMaintenance.IsBusy, "完成弹窗必须在解除维护保护后显示");
+            Require(typeof(ChartCatalogSettingsUserControlModel).GetField("_process", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(control.DataContext) is null, "完成弹窗前子进程必须已退出并清理");
+            dialogs.Add(e.Dialog);
+        };
+        var host = new SukiDialogHost { Manager = manager };
+        var grid = new Grid();
+        grid.Children.Add(control);
+        grid.Children.Add(host);
+        var window = new Window { Width = 960, Height = 650, Content = grid, Padding = new Thickness(20) };
         window.Show();
         Dispatcher.UIThread.RunJobs();
         var model = (ChartCatalogSettingsUserControlModel)control.DataContext!;
         var buttons = control.GetVisualDescendants().OfType<Button>().ToArray();
         Require(buttons.Length == 4 && buttons.All(button => button.Command is not null), "增量更新、近期检查、取消和刷新按钮必须真实绑定命令");
         Require(!buttons.Single(button => Equals(button.Content, "取消同步")).IsEnabled, "空闲时取消按钮应禁用");
+        void CheckCompletion(string title, NotificationType type, string expected, bool capture = false)
+        {
+            Require(dialogs.Count == 1, "每次已启动同步只能显示一次完成弹窗");
+            var dialog = dialogs.Single();
+            Require(dialog.Title == title && dialog.Content?.ToString()?.Contains(expected) == true,
+                "弹窗标题及内容必须来自本次运行结果");
+            var expectedDialog = manager.CreateDialog().OfType(type).Dialog;
+            Require(Equals(dialog.IconColor, expectedDialog.IconColor), "完成弹窗必须使用正确的成功、警告、错误或信息类型");
+            AvaloniaHeadlessPlatform.ForceRenderTimerTick();
+            Dispatcher.UIThread.RunJobs();
+            Require(window.GetVisualDescendants().OfType<TextBlock>().Any(text => text.Text == title),
+                "真实Suki弹窗必须显示标题");
+            var closeButton = dialog.ActionButtons.OfType<Button>().Single(button => Equals(button.Content, "确定"));
+            Require(window.GetVisualDescendants().Contains(closeButton), "确认关闭按钮必须在真实弹窗里渲染");
+            Require(closeButton.IsEnabled && closeButton.IsVisible, "确定按钮必须可见且可操作");
+            if (capture)
+            {
+                // 固定 Suki 主题有入场动画，待最终透明度再保存可读的视觉证据。
+                var renderDeadline = DateTime.UtcNow.AddMilliseconds(650);
+                while (DateTime.UtcNow < renderDeadline)
+                {
+                    Dispatcher.UIThread.RunJobs();
+                    AvaloniaHeadlessPlatform.ForceRenderTimerTick();
+                    Thread.Sleep(10);
+                }
+                using var frame = window.CaptureRenderedFrame()!;
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(args[1]))!);
+                frame.Save(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[1]))!, "chart-sync-completion.png"));
+            }
+            var dismissed = false;
+            dialog.OnDismissed += _ => dismissed = true;
+            closeButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Dispatcher.UIThread.RunJobs();
+            Require(dismissed, "确定按钮必须实际关闭弹窗");
+            dialogs.Clear();
+        }
         Wait(model.SyncCommand.ExecuteAsync(null));
         Require(model.StatusText == "增量更新完成。" && model.ProgressText.Contains("中文字符"), "同步子进程必须正确处理退出码和 UTF8 进度");
         Require(!File.ReadAllText(Path.Combine(fixture, "arguments.json")).Contains("--check-recent"), "默认按钮必须执行增量更新");
         Require(model.CatalogText.Contains("2 首 / 3 张谱面 / 2 个封面"), "更新后必须刷新本地数量");
         Require(model.CatalogText.Contains("本地复用 4") && model.CatalogText.Contains("1.00 MiB"), "更新后必须显示复用及实际下载量");
+        CheckCompletion("谱面同步完成", NotificationType.Success, "新增 7 / 更新 3 / 本地复用 41", capture: true);
         Wait(model.CheckRecentCommand.ExecuteAsync(null));
         Require(model.StatusText == "近期资源检查完成。"
                 && File.ReadAllText(Path.Combine(fixture, "arguments.json")).Contains("--check-recent"),
             "近期检查按钮必须将模式传给同步子进程");
+        CheckCompletion("谱面同步完成", NotificationType.Success, "近期资源检查完成。");
+
+        // 完成时若有其他提示，不能吞掉本次弹窗；关闭已有提示后仅补显示一次。
+        var existingDialog = manager.CreateDialog().WithTitle("已有提示").WithContent("等待读取")
+            .WithActionButton("确定", _ => { }, true);
+        existingDialog.TryShow();
+        dialogs.Clear();
+        var queuedSync = model.SyncCommand.ExecuteAsync(null);
+        var queueDeadline = DateTime.UtcNow.AddSeconds(10);
+        while ((model.IsSyncing || model.StatusText != "增量更新完成。") && DateTime.UtcNow < queueDeadline)
+        {
+            Dispatcher.UIThread.RunJobs();
+            Thread.Sleep(10);
+        }
+        Require(!queuedSync.IsCompleted && dialogs.Count == 0 && !ChartCatalogMaintenance.IsBusy,
+            "已有提示应保留，完成通知等待关闭且维护保护已释放");
+        existingDialog.Dialog.ActionButtons.OfType<Button>().Single().RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Wait(queuedSync);
+        CheckCompletion("谱面同步完成", NotificationType.Success, "新增 7 / 更新 3 / 本地复用 41");
 
         var runningTab = (InstanceTabViewModel)RuntimeHelpers.GetUninitializedObject(typeof(InstanceTabViewModel));
         typeof(InstanceTabViewModel).GetField("_isRunning", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(runningTab, true);
@@ -168,11 +355,26 @@ if mode == 'partial':
         Require(model.StatusText.Contains("先停止所有演出任务"), "演出任务运行时不应启动同步");
         Wait(model.CheckRecentCommand.ExecuteAsync(null));
         Require(model.StatusText.Contains("先停止所有演出任务"), "演出任务运行时不应启动近期检查");
+        Require(dialogs.Count == 0, "未启动同步不能显示完成弹窗");
         tabs.Clear();
 
         File.WriteAllText(modePath, "partial");
         Wait(model.SyncCommand.ExecuteAsync(null));
         Require(model.StatusText.Contains("部分资源更新失败") && model.ProgressText.Contains("测试镜像缺失"), "部分错误须显示详情并保留本地库");
+        CheckCompletion("谱面同步部分失败", NotificationType.Warning, "失败 1 / 未确认最新 1");
+        File.WriteAllText(modePath, "fatal");
+        Wait(model.SyncCommand.ExecuteAsync(null));
+        CheckCompletion("谱面同步失败", NotificationType.Error, "本次新增、更新、复用及失败数量未取得");
+        foreach (var invalidMode in new[] { "noresult", "wrongtoken" })
+        {
+            File.WriteAllText(modePath, invalidMode);
+            Wait(model.SyncCommand.ExecuteAsync(null));
+            Require(!model.StatusText.Contains("增量更新完成"), "缺失或其他运行统计不能冒充本次成功");
+            CheckCompletion("谱面同步失败", NotificationType.Error, "未返回可核对的本次统计");
+        }
+        File.WriteAllText(modePath, "cancelled");
+        Wait(model.SyncCommand.ExecuteAsync(null));
+        CheckCompletion("谱面同步已取消", NotificationType.Information, "已取消");
 
         File.WriteAllText(modePath, "slow");
         var previousManifest = File.ReadAllBytes(manifestPath);
@@ -195,6 +397,7 @@ if mode == 'partial':
         Require(model.StatusText.Contains("已取消") && !ChartCatalogMaintenance.IsBusy && model.NotSyncing,
             "取消后必须结束子进程并解除维护保护");
         Require(previousManifest.SequenceEqual(File.ReadAllBytes(manifestPath)), "取消不得替换原有 manifest");
+        CheckCompletion("谱面同步已取消", NotificationType.Information, "已取消");
         Require(buttons.Single(button => Equals(button.Content, "增量更新谱面")).IsEnabled
                 && buttons.Single(button => Equals(button.Content, "检查近期资源")).IsEnabled
                 && buttons.Single(button => Equals(button.Content, "刷新本地状态")).IsEnabled
@@ -280,6 +483,28 @@ if mode == 'partial':
             "关闭试验微调也须持久化，不能改写手动偏移");
         performance.CooperativeGameTimingFeedback = true;
         performance.SaveCommand.Execute(null);
+        var loggingCheckBox = performanceControl.GetVisualDescendants().OfType<CheckBox>().Single(checkBox =>
+            Equals(checkBox.Content, "不写入任何日志"));
+        loggingCheckBox.IsChecked = true;
+        Dispatcher.UIThread.RunJobs();
+        Require(performance.DisableLogging, "不写日志复选框须双向绑定");
+        performance.SaveCommand.Execute(null);
+        Require(JObject.Parse(File.ReadAllText(savedPerformance)).Value<bool>("disable_logging") && MaaPjskDiagnostics.Disabled,
+            "禁日志设置须持久化并动态应用到 GUI");
+        var loggingReloaded = new PerformanceSettingsUserControlModel();
+        loggingReloaded.RefreshCommand.Execute(null);
+        Require(loggingReloaded.DisableLogging, "禁日志开关重新打开须恢复");
+        Parallel.For(0, 40, index => LoggerHelper.Info("disabled backlog fixture " + index));
+        var cache = (System.Collections.ICollection)typeof(LoggerHelper).GetField("_logCache", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+        Require(cache.Count == 0, "禁日志期间不可积累重新开启后补写的 backlog");
+        var savedWhileDisabled = File.ReadAllBytes(savedPerformance);
+        Require(MaaPjskMaintenance.TryBegin(), "设置互斥 fixture 进入维护");
+        try { performance.DisableLogging = false; performance.SaveCommand.Execute(null); }
+        finally { MaaPjskMaintenance.End(); }
+        Require(savedWhileDisabled.SequenceEqual(File.ReadAllBytes(savedPerformance)), "维护时禁止保存新开关");
+        performance.DisableLogging = false;
+        performance.SaveCommand.Execute(null);
+        Require(!MaaPjskDiagnostics.Disabled, "重新允许日志须立即应用");
         var savedBefore = File.ReadAllBytes(savedPerformance);
         tabs.Add(runningTab);
         performance.TouchOffsetMs = 10; performance.SaveCommand.Execute(null);

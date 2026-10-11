@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import io
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -16,7 +18,7 @@ import numpy as np
 
 from project_sekai.chart_catalog import (
     ASSET_ROOT, GIT_REFS_URL, MASTER_ROOT, ChartRepository, HttpClient, HttpResult,
-    catalog_lock, sync_catalog, validate_sus,
+    _write_atomic, catalog_lock, sync_catalog, validate_sus,
 )
 
 
@@ -118,6 +120,174 @@ class ChartCatalogTests(unittest.TestCase):
         self.assertEqual((self.root / old_path).read_bytes(), SUS)
         self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), CHANGED_SUS.decode())
         self.assertEqual(second["summary"]["updated"], 1)
+
+    def test_warm_incremental_does_not_read_bodies_or_rewrite_receipts(self) -> None:
+        self.sync()
+        self.client.requests.clear()
+        original_read = Path.read_bytes
+        original_replace = os.replace
+        counts = {"bodies": 0, "receipts": 0}
+
+        def read(path):
+            if path.suffix in {".sus", ".png"}:
+                counts["bodies"] += 1
+            return original_read(path)
+
+        def replace(source, target):
+            if Path(target).parent.name == ".cache":
+                counts["receipts"] += 1
+            return original_replace(source, target)
+
+        progress = []
+        with patch.object(Path, "read_bytes", read), patch("project_sekai.chart_catalog.os.replace", replace):
+            second = self.sync(progress=progress.append)
+        self.assertEqual(counts, {"bodies": 0, "receipts": 0})
+        self.assertFalse(any(url.startswith(ASSET_ROOT) for url, _ in self.client.requests))
+        self.assertEqual(second["summary"]["reused"], 5)
+        self.assertFalse(any(line.startswith("[") for line in progress))
+
+    @unittest.skipUnless(os.name == "nt", "真实 Windows 文件共享锁")
+    def test_locked_reused_receipt_does_not_fail_incremental(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        self.sync()
+        receipt = next((self.root / ".cache").glob("*.json"))
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.CreateFileW(str(receipt), 0x80000000, 3, None, 3, 0x80, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        try:
+            self.assertEqual(self.sync()["summary"]["recoverable_errors"], 0)
+        finally:
+            kernel.CloseHandle(handle)
+
+    @unittest.skipUnless(os.name == "nt", "真实 Windows 文件共享锁")
+    def test_atomic_replace_retries_same_temp_until_real_lock_released(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        target = self.root / "manifest.json"
+        target.write_bytes(b"old-complete")
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.CreateFileW(str(target), 0x80000000, 3, None, 3, 0x80, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        timer = threading.Timer(0.12, lambda: kernel.CloseHandle(handle))
+        attempts = []
+        replace = os.replace
+
+        def observed(source, destination):
+            attempts.append(str(source))
+            self.assertEqual(target.read_bytes(), b"old-complete")
+            return replace(source, destination)
+
+        timer.start()
+        try:
+            with patch("project_sekai.chart_catalog.os.replace", observed):
+                _write_atomic(target, b"new-complete")
+        finally:
+            timer.join()
+        self.assertGreater(len(attempts), 1)
+        self.assertEqual(len(set(attempts)), 1)
+        self.assertEqual(target.read_bytes(), b"new-complete")
+
+    def test_atomic_replace_permanent_rejection_preserves_old_manifest(self) -> None:
+        target = self.root / "manifest.json"
+        target.write_bytes(b"old-complete")
+        error = PermissionError("permanent rejection")
+        error.winerror = 5
+        with patch("project_sekai.chart_catalog.os.replace", side_effect=error) as replace, \
+                patch("project_sekai.chart_catalog.time.sleep"):
+            with self.assertRaises(PermissionError):
+                _write_atomic(target, b"new-complete")
+        self.assertEqual(replace.call_count, 5 if os.name == "nt" else 1)
+        self.assertEqual(len({str(call.args[0]) for call in replace.call_args_list}), 1)
+        self.assertEqual(target.read_bytes(), b"old-complete")
+        self.assertFalse(list(self.root.glob("*.tmp")))
+
+    def test_cache_write_failure_does_not_discard_verified_download(self) -> None:
+        from project_sekai.chart_catalog import _write_json
+
+        def write(path, value):
+            if path.parent.name == ".cache":
+                raise PermissionError("cache locked")
+            return _write_json(path, value)
+
+        with patch("project_sekai.chart_catalog._write_json", write):
+            first = self.sync()
+        self.assertEqual(first["summary"]["recoverable_errors"], 0)
+        self.client.requests.clear()
+        self.assertEqual(self.sync()["summary"]["reused"], 5)
+        self.assertFalse(any(url.startswith(ASSET_ROOT) for url, _ in self.client.requests))
+
+    def test_same_size_changed_file_is_revalidated_and_offline_loader_stays_strict(self) -> None:
+        first = self.sync()
+        path = self.root / first["songs"][0]["charts"]["master"]["path"]
+        path.write_bytes(CHANGED_SUS)
+        self.assertEqual(len(CHANGED_SUS), len(SUS))
+        self.client.requests.clear()
+        self.sync()
+        self.assertIn((self.client.chart_url(1), ""), self.client.requests)
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), SUS.decode())
+
+    def test_stale_manifest_retries_when_failed_receipt_cannot_be_saved(self) -> None:
+        self.sync()
+        url = self.client.chart_url(1)
+        self.client.resources[url] = HTTPError(url, 404, "missing", {}, None)
+        with patch("project_sekai.chart_catalog._save_receipt"):
+            failed = self.sync(check_recent=True)
+        self.assertEqual(failed["summary"]["stale"], 1)
+        self.client.requests.clear()
+        retry = self.sync()
+        self.assertIn((url, "sus-v1"), self.client.requests)
+        self.assertEqual(retry["summary"]["stale"], 1)
+
+    def test_new_manifest_wins_over_old_receipt_after_cache_write_failure(self) -> None:
+        self.sync()
+        self.client.resources[self.client.chart_url(1)] = (CHANGED_SUS, "text/plain", "sus-v2")
+        with patch("project_sekai.chart_catalog._save_receipt"):
+            self.sync(check_recent=True)
+        self.client.requests.clear()
+        original_read = Path.read_bytes
+
+        def read(path):
+            self.assertNotIn(path.suffix, {".sus", ".png"}, "完整索引的签名应直接复用")
+            return original_read(path)
+
+        with patch.object(Path, "read_bytes", read):
+            result = self.sync()
+        self.assertEqual(result["summary"]["reused"], 5)
+        self.assertFalse(any(url.startswith(ASSET_ROOT) for url, _ in self.client.requests))
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), CHANGED_SUS.decode())
+
+    def test_manifest_signature_covers_receipt_migration_that_cannot_be_saved(self) -> None:
+        self.sync()
+        for receipt in (self.root / ".cache").glob("*.json"):
+            data = json.loads(receipt.read_text())
+            data.pop("local_integrity")
+            receipt.write_text(json.dumps(data))
+        original_read = Path.read_bytes
+
+        def read(path):
+            self.assertNotIn(path.suffix, {".sus", ".png"}, "应沿用完整索引的同文件签名")
+            return original_read(path)
+
+        with patch.object(Path, "read_bytes", read), \
+                patch("project_sekai.chart_catalog._save_receipt", side_effect=AssertionError("不重写旧缓存")):
+            self.assertEqual(self.sync()["summary"]["reused"], 5)
+
+    def test_invalid_receipt_attempt_timestamp_does_not_block_manifest_recovery(self) -> None:
+        self.sync()
+        for receipt in (self.root / ".cache").glob("*.json"):
+            data = json.loads(receipt.read_text())
+            data["remote_attempt_ns"] = "invalid"
+            receipt.write_text(json.dumps(data))
+        self.assertEqual(self.sync()["summary"]["reused"], 5)
 
     def test_corrupt_cached_file_is_downloaded_without_conditional_header(self) -> None:
         manifest = self.sync()
@@ -227,6 +397,7 @@ class ChartCatalogTests(unittest.TestCase):
         for song in manifest["songs"]:
             for asset in [*song["charts"].values(), song["jacket"]]:
                 asset.pop("metadata_fingerprint")
+                asset.pop("local_integrity")
                 asset["status"] = "updated"
         (self.root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         for receipt in (self.root / ".cache").glob("*.json"):
@@ -237,7 +408,7 @@ class ChartCatalogTests(unittest.TestCase):
         self.assertEqual(migrated["summary"]["reused"], 5)
         self.assertEqual(len(list((self.root / ".cache").glob("*.json"))), 5)
 
-    def test_recent_resources_rechecked_after_seven_days_but_older_than_three_months_are_reused(self) -> None:
+    def test_default_ignores_seven_day_age_and_manual_check_only_rechecks_recent(self) -> None:
         musics = self.client.index("musics")
         musics[0]["publishedAt"] = int((datetime.now(timezone.utc) - timedelta(days=130)).timestamp() * 1000)
         self.client.set_index("musics", musics)
@@ -252,8 +423,10 @@ class ChartCatalogTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.client.requests.clear()
                 manifest = self.sync(**mode)
-                self.assertEqual({url for url, _ in self.client.requests if url.startswith(ASSET_ROOT)}, recent_urls)
-                self.assertEqual((manifest["summary"]["reused"], manifest["summary"]["unchanged"]), (3, 2))
+                self.assertEqual({url for url, _ in self.client.requests if url.startswith(ASSET_ROOT)},
+                                 recent_urls if mode else set())
+                self.assertEqual((manifest["summary"]["reused"], manifest["summary"]["unchanged"]),
+                                 (3, 2) if mode else (5, 0))
                 self.assertEqual(manifest["songs"][0]["charts"]["master"]["checked_at"], old_checked_at)
         (self.root / manifest["songs"][0]["charts"]["master"]["path"]).write_bytes(b"broken")
         self.client.requests.clear()
@@ -317,6 +490,28 @@ class ChartCatalogTests(unittest.TestCase):
         for body in [SUS.replace(b"120", b"-1"), SUS.replace(b"11110000", b"111"), b"{}"]:
             with self.subTest(body=body), self.assertRaises(ValueError):
                 validate_sus(body)
+
+
+class ChartSyncCliTests(unittest.TestCase):
+    def test_completion_summary_is_bound_to_this_run_and_exit_code(self) -> None:
+        from scripts import sync_sekai_catalog as script
+        for error_count, expected in [(0, 0), (12, 2)]:
+            with self.subTest(errors=error_count), patch("sys.argv", ["sync", "--result-token", "run-token"]), \
+                    patch.object(script, "sync_catalog", return_value={"summary": {"recoverable_errors": error_count}}), \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(script.main(), expected)
+                result = json.loads(output.getvalue().split("MAAPJSK_SYNC_RESULT=")[1])
+                self.assertEqual(result, {"token": "run-token", "exit_code": expected,
+                                          "summary": {"recoverable_errors": error_count}})
+
+    def test_fatal_or_cancelled_run_never_prints_old_manifest_summary(self) -> None:
+        from scripts import sync_sekai_catalog as script
+        for error, expected in [(ValueError("fatal"), 1), (InterruptedError("cancelled"), 130)]:
+            with self.subTest(expected=expected), patch("sys.argv", ["sync", "--result-token", "run-token"]), \
+                    patch.object(script, "sync_catalog", side_effect=error), \
+                    patch("sys.stdout", new_callable=io.StringIO) as output, patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(script.main(), expected)
+                self.assertNotIn("MAAPJSK_SYNC_RESULT=", output.getvalue())
 
 
 class HttpClientTests(unittest.TestCase):
