@@ -14,7 +14,7 @@ from .sus_chart import Chart, Gesture, slide_x
 
 TOUCH_PLAN_VERSION = 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 5
-START_ANCHOR_VERSION = 15
+START_ANCHOR_VERSION = 16
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -135,18 +135,52 @@ def first_note_color(gesture: Gesture) -> str:
     return "pink" if gesture.flick else "blue"
 
 
-def validated_simultaneous(gesture: Gesture, gestures) -> tuple[Gesture, ...]:
+def validated_simultaneous(gesture: Gesture, gestures, *, gold_slide_pair_guard=False) -> tuple[Gesture, ...]:
     try:
         group = tuple(sorted(gestures, key=lambda value: value.points[0].lane))
         if len(group) < 2 or gesture not in group:
             return ()
         if any(value.kind != "tap" or not value.flick or first_note_color(value) != "gold" for value in group):
+            if gold_slide_pair_guard:
+                pair = validated_gold_slide_pair(gesture, group)
+                if pair:
+                    return pair
             return validated_mixed_simultaneous(gesture, group)
         if any(not math.isfinite(value.start) or abs(value.start - gesture.start) > 1e-9 or first_note_color(value) != first_note_color(gesture) for value in group):
             return ()
         if any(left.points[0].lane + left.points[0].width != right.points[0].lane for left, right in zip(group, group[1:])):
             return ()
         return group
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return ()
+
+
+def validated_gold_slide_pair(gesture: Gesture, group) -> tuple[Gesture, ...]:
+    # 只接纳真实同刻、轨道相接的两条 critical SLIDE；尾 flick 不改变普通类型首头。
+    try:
+        values = tuple(group)
+        if len(values) != 2 or gesture not in values:
+            return ()
+        for value in (*values, gesture):
+            if (not isinstance(value, Gesture) or value.kind != "slide" or value.critical is not True
+                    or type(value.flick) is not int or value.flick not in range(7) or len(value.points) < 2
+                    or not math.isfinite(value.start) or abs(value.start - gesture.start) > 1e-9
+                    or value.points[0].kind != 1 or value.points[-1].kind != 2 or value.end <= value.start):
+                return ()
+            previous_time = float("-inf")
+            for index, point in enumerate(value.points):
+                kinds = {1} if index == 0 else {2} if index == len(value.points) - 1 else {3, 4, 5}
+                if (not math.isfinite(point.time) or point.time < previous_time
+                        or type(point.kind) is not int or point.kind not in kinds
+                        or type(point.lane) is not int or type(point.width) is not int
+                        or not 2 <= point.lane < point.lane + point.width <= 14
+                        or type(point.direction) is not int or point.direction not in range(7)):
+                    return ()
+                previous_time = point.time
+        ordered = tuple(sorted(values, key=lambda value: value.points[0].lane))
+        if ordered[0].points[0].lane + ordered[0].points[0].width != ordered[1].points[0].lane:
+            return ()
+        return ordered
     except (AttributeError, TypeError, ValueError, IndexError):
         return ()
 
@@ -190,7 +224,8 @@ def first_note_context(chart) -> tuple[Gesture, ...]:
     group = [value for value in chart.gestures
              if abs(value.start - first.start) <= 1e-9
              and (first.kind == "slide" or first_note_color(value) == first_note_color(first))]
-    return validated_simultaneous(first, group)
+    # 这里只提取纯谱面元数据；双长条候选是否启用由同步器冻结后在两处重新验证。
+    return validated_simultaneous(first, group, gold_slide_pair_guard=True)
 
 
 def validated_dense_followers(gesture: Gesture, followers) -> tuple[Gesture, ...]:
@@ -244,7 +279,7 @@ class FirstHeadOutsideWindow(RuntimeError):
     """完整首头已越过同步窗口，不能改用后继同色音启动。"""
 
 
-def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | None = None, *, simultaneous_gestures=(), dense_following_gestures=(), reject_passed_slide=False, gold_tap_head_guard=False) -> float | None:
+def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | None = None, *, simultaneous_gestures=(), dense_following_gestures=(), reject_passed_slide=False, gold_tap_head_guard=False, gold_slide_pair_guard=False) -> float | None:
     """只追踪谱面第一音的开场锚点；演奏开始后不再识别音符。"""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     if gesture.critical or gesture.points[0].kind in {2, 6}:
@@ -258,7 +293,8 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         mask = cv2.inRange(hsv, (95, 55, 135), (135, 255, 255))
     blue_tap = (gesture.kind == "tap" and not gesture.flick and not gesture.critical
                 and len(gesture.points) == 1 and gesture.points[0].kind == 1)
-    simultaneous = validated_simultaneous(gesture, simultaneous_gestures)
+    simultaneous = validated_simultaneous(gesture, simultaneous_gestures, gold_slide_pair_guard=gold_slide_pair_guard)
+    gold_slide_pair = bool(simultaneous and all(value.kind == "slide" for value in simultaneous))
     gold_head = (gold_tap_head_guard and gesture.kind == "tap" and not gesture.flick
                  and len(gesture.points) == 1 and gesture.points[0].kind == 2 and not simultaneous)
     # 基线差分会把同一外框拆成碎片；蓝框归属用原颜色分量，横芯自身仍必须通过差分。
@@ -310,6 +346,22 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         if eligible(x, y, width, height):
             target.append(y + height / 2)
 
+    def eligible_group(x, y, width, height, *, minimum_height=2):
+        if not simultaneous:
+            return False
+        center_y = y + height / 2
+        expected_width = point.width * (1000 / 12) * center_y / 570
+        if not (width >= expected_width * 1.5 + 12
+                and minimum_height <= height <= max(36, center_y * height_ratio) and width > height * aspect_ratio):
+            return False
+        first_lane = simultaneous[0].points[0].lane
+        span = simultaneous[-1].points[0].lane + simultaneous[-1].points[0].width - first_lane
+        span_x = 140 + (first_lane - 2 + span / 2) * (1000 / 12)
+        span_center = 640 + (span_x - 640) * center_y / 570
+        span_width = span * (1000 / 12) * center_y / 570
+        return (.5 * span_width < width < 1.5 * span_width + 12
+                and abs(x + width / 2 - span_center) < max(25, span_width * .35))
+
     if gold_head:
         core = cv2.inRange(hsv, (15, 0, 235), (45, 110, 255))
         _, core_labels, core_stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
@@ -357,7 +409,10 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
             fx, fy, fw, fh = stats[:4]
             # 金色长条头越过下边界后不能把残留薄片当首音；上延长条带仍是正常路径，不检查上裁边。
             if fy + fh > 540:
-                passed_slide_head |= eligible(x, y, width, height)
+                # 合并首头本来就超出单头宽度，不能因此丢掉真实整组下越界的证据。
+                # 来源已证明下越界时，一行残留只用于拒绝后继；正常首头仍要求至少两行。
+                passed_slide_head |= (eligible(x, y, width, height)
+                                      or gold_slide_pair and eligible_group(x, y, width, height, minimum_height=1))
                 continue
         if gesture.kind == "tap" and (gesture.flick or gold_tap) and (y == 40 or y + height == 540):
             _, stats = component_at(contour)
@@ -369,16 +424,7 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         projected_x = 640 + (point.x - 640) * center_y / 570
         expected_width = point.width * (1000 / 12) * center_y / 570
         consider(x, y, width, height)
-        if not (simultaneous and width >= expected_width * 1.5 + 12
-                and 2 <= height <= max(36, center_y * height_ratio) and width > height * aspect_ratio):
-            continue
-        first_lane = simultaneous[0].points[0].lane
-        span = simultaneous[-1].points[0].lane + simultaneous[-1].points[0].width - first_lane
-        span_x = 140 + (first_lane - 2 + span / 2) * (1000 / 12)
-        span_center = 640 + (span_x - 640) * center_y / 570
-        span_width = span * (1000 / 12) * center_y / 570
-        if not (.5 * span_width < width < 1.5 * span_width + 12
-                and abs(x + width / 2 - span_center) < max(25, span_width * .35)):
+        if not eligible_group(x, y, width, height):
             continue
         label, _ = component_at(contour)
         left, right = max(x, round(projected_x - expected_width / 2)), min(x + width, round(projected_x + expected_width / 2))
@@ -388,10 +434,15 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         local = np.uint8(component_labels[y:y + height, left:right] == label) * 255
         for part in cv2.findContours(local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
             lx, ly, lw, lh = cv2.boundingRect(part)
+            if gold_slide_pair and np.count_nonzero(local[ly:ly + lh, lx:lx + lw]) < lw * lh * .25:
+                # 金框的浅色芯不在掩膜中，保留实际框线；稀疏连线不能借预期窗口虚构局部横头。
+                continue
             consider(left + lx, y + ly, lw, lh, mixed_candidates if gold_slide else candidates)
-    if passed_slide_head and reject_passed_slide:
+    if passed_slide_head and (reject_passed_slide or gold_slide_pair):
         # 同帧后继横条不能覆盖首头已越界的证据，否则会从歌曲中途建立 epoch。
-        raise FirstHeadOutsideWindow("首长条头已越过同步窗口，拒绝从后继音或歌曲中途启动")
+        if reject_passed_slide:
+            raise FirstHeadOutsideWindow("首长条头已越过同步窗口，拒绝从后继音或歌曲中途启动")
+        return None
     if blue_tap:
         # 蓝外框可能与底图纵向连通，原框因高度超限被拒后会误选后继音。
         # 浅亮横芯仅补充这种污染框的测量；位置、尺寸、亮度与后续轨迹门槛均保持原样。
@@ -460,7 +511,10 @@ class StartAnchor:
     def __init__(self, gesture: Gesture, *, minimum_samples: int = 2, simultaneous_gestures=(), dense_following_gestures=()) -> None:
         self.gesture = gesture
         self.minimum_samples = minimum_samples
-        self.simultaneous_gestures = validated_simultaneous(gesture, simultaneous_gestures)
+        # 双金色长条保护默认开启，仅明确 0 回退；本局初始化冻结，纯检测函数不读取环境。
+        self.gold_slide_pair_guard = os.environ.get("MAAPJSK_GOLD_SLIDE_PAIR_GUARD") != "0"
+        self.simultaneous_gestures = validated_simultaneous(gesture, simultaneous_gestures,
+                                                          gold_slide_pair_guard=self.gold_slide_pair_guard)
         self.dense_following_gestures = validated_dense_followers(gesture, dense_following_gestures)
         self.samples: list[tuple[float, float]] = []
         self.baseline: np.ndarray | None = None
@@ -488,7 +542,7 @@ class StartAnchor:
         try:
             y = first_note_y(frame, self.gesture, self.baseline, simultaneous_gestures=self.simultaneous_gestures,
                             dense_following_gestures=self.dense_following_gestures, reject_passed_slide=True,
-                            gold_tap_head_guard=self.gold_tap_head_guard)
+                            gold_tap_head_guard=self.gold_tap_head_guard, gold_slide_pair_guard=self.gold_slide_pair_guard)
         except FirstHeadOutsideWindow:
             self.failure_reason = "first_head_outside_window"
             raise
@@ -538,6 +592,8 @@ class StartAnchor:
             self.fit = {"model": "calibrated_perspective", "residual_pixels": None, "first_hit": first_hit}
             if self.gold_tap_head_guard:
                 self.fit["gold_tap_head_guard"] = True
+            if self.gold_slide_pair_guard:
+                self.fit["gold_slide_pair_guard"] = True
             return first_hit - self.gesture.start
         if y < 230:
             return None
@@ -617,6 +673,8 @@ class StartAnchor:
                 self.fit["ambiguity_guard"].update(self.ambiguity_defer)
         if self.gold_tap_head_guard:
             self.fit["gold_tap_head_guard"] = True
+        if self.gold_slide_pair_guard:
+            self.fit["gold_slide_pair_guard"] = True
         return first_hit - self.gesture.start
 
 
