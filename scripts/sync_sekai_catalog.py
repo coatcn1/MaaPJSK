@@ -26,6 +26,7 @@ def main() -> int:
     parser.add_argument("--song-ids", type=int, nargs="+", help="只验证指定歌曲，写入独立的 manifest-selection.json")
     parser.add_argument("--difficulties", choices=DIFFICULTIES, nargs="+", default=list(DIFFICULTIES))
     parser.add_argument("--status", action="store_true", help="只读本地 manifest，不访问网络")
+    parser.add_argument("--result-token", help="由设置页提供的本次运行标识，用于核对完成通知")
     args = parser.parse_args()
     if args.status:
         manifest_path = args.output_root / "manifest.json"
@@ -42,7 +43,10 @@ def main() -> int:
                                 difficulties=tuple(args.difficulties),
                                 song_ids=tuple(args.song_ids) if args.song_ids else None,
                                 progress=lambda message: print(message, flush=True))
-        return 2 if manifest["summary"]["recoverable_errors"] else 0
+        exit_code = 2 if manifest["summary"]["recoverable_errors"] else 0
+        print("MAAPJSK_SYNC_RESULT=" + json.dumps({"token": args.result_token, "exit_code": exit_code,
+              "summary": manifest["summary"]}, ensure_ascii=False), flush=True)
+        return exit_code
     except (KeyboardInterrupt, InterruptedError):
         print("已取消同步；原有 manifest 保持不变，已校验的下载可继续复用", file=sys.stderr, flush=True)
         return 130
