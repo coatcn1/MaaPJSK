@@ -125,7 +125,8 @@ class GameLogin:
                 foreground = self.foreground()
                 if self.clock() >= deadline:
                     break
-                title = foreground and self.matches(frame, "title_screen")
+                title = (foreground and self.matches(frame, "title_screen")
+                         and not self.matches(frame, "playing") and not self.matches(frame, "life_hud"))
                 if title:
                     self._managed_login = True
                 if foreground and not self._managed_login:
@@ -173,6 +174,7 @@ class GameLogin:
                     fresh = self.device.screenshot()
                     self.check_stop()
                     if (not self.matches(fresh, "title_screen") or not title_menu_ready(fresh)
+                            or self.matches(fresh, "playing") or self.matches(fresh, "life_hud")
                             or not self.foreground()):
                         continue
                     report["title_requests"] += 1

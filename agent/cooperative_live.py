@@ -61,6 +61,11 @@ def create_workflow(context, root):
                       ocr_root=root / "resource/models/song_title_ocr")
     # 构造阶段只读取配置；设备与登录故障由本次 run 的普通恢复接管，请求预算不重建。
     workflow.startup_login = lambda: login.run(resume=True)
+    workflow.settlement_login_factory = lambda: GameLogin(
+        workflow.device, workflow.navigator, root / "debug/game-login-runs",
+        stop_requested=lambda: bool(context.tasker.stopping),
+        log_message=lambda message: visible_log(context, message),
+        ocr_root=root / "resource/models/song_title_ocr")
     return workflow
 
 

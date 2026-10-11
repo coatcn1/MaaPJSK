@@ -482,6 +482,7 @@ class CooperativeLive(SoloLive):
         labels = {"waiting_release": "等待触点释放确认", "waiting_connection": "等待连接恢复",
                   "waiting_page": "等待安全页面", "waiting_room": "等待房间安全恢复",
                   "waiting_persistence": "等待结果文件可写", "waiting_resource": "等待用户补充体力或处理回复",
+                  "waiting_login": "等待结算后标题登录或用户返回主页",
                   "ready": "已恢复准备"}
         try:
             self.safe_log(f"协力恢复：{labels.get(state, '等待恢复')}；{detail or '保留当前状态'}；本局未增加完成次数")
@@ -538,12 +539,17 @@ class CooperativeLive(SoloLive):
             raise
 
     def wait_runtime_destination(self, report, directory, error):
+        # 诊断禁写时路径对外为空，恢复事件仍须独立存在；目录只作内存标识，不要求落盘。
+        run_id = report.get("run_id")
+        episode_key = ("run", str(run_id)) if run_id else ("directory", str(directory.absolute()))
         safe_backs = report.get("runtime_recovery", {}).get("safe_backs", 0)
         last_death_sample = float("-inf")
+        title_streak = 0
         while True:
             self.check_runtime_stop()
             if report.get("playback") is not None and not release_finished(report):
                 # 连接恢复、主页截图或新的 Native 进程都不能替代上一轮 reset 的释放证明。
+                title_streak = 0
                 self.recovery_state(report, directory, "waiting_release", error)
                 self.pause(1.)
                 continue
@@ -551,6 +557,7 @@ class CooperativeLive(SoloLive):
             try:
                 frame = self.device.screenshot()
             except Exception as connection_error:
+                title_streak = 0
                 self.recovery_state(report, directory, "waiting_connection", connection_error)
                 self.pause(1.)
                 continue
@@ -563,6 +570,47 @@ class CooperativeLive(SoloLive):
                     self.finish_death(report, directory)
                     self.persist_runtime_report(report, directory)
                     raise LifeDepleted("恢复等待中确认演出死亡，触点释放后结束协力整批")
+            eligible_login = (report.get("phase") == "settlement" and input_finished(report)
+                              and not report.get("death_confirmed"))
+            title_only = (not blank_transition(frame) and self.recovery_hud_absent(frame)
+                          and self.score(frame, "title_screen") >= self.navigator.threshold
+                          and all(self.score(frame, page) < self.navigator.threshold
+                                  for page in PAGE_AREAS if page != "title_screen"))
+            title_streak = title_streak + 1 if eligible_login and title_only else 0
+            login = getattr(self, "settlement_login", None)
+            login_active = login is not None and not getattr(self, "settlement_login_completed", False)
+            if eligible_login and (login_active or title_streak >= 2):
+                factory = getattr(self, "settlement_login_factory", None)
+                source_report = str(directory / "report.json") if enabled() else None
+                same_episode = episode_key in getattr(self, "settlement_login_episodes", set())
+                if factory is not None and (login_active or not same_episode):
+                    if not login_active:
+                        # 启动登录的期限已经结束；本次结算独立建服务，普通恢复沿袭同一实例。
+                        self.settlement_login = login = factory()
+                        self.settlement_login_source = source_report
+                        self.settlement_login_episodes = set()
+                        self.settlement_login_completed = False
+                    # 未完成服务跨报告沿袭预算；新报告也归入同一事件，完成后不能再开登录期限。
+                    self.settlement_login_episodes.add(episode_key)
+                    report["settlement_login"] = {"source_report": self.settlement_login_source,
+                                                  "status": "waiting"}
+                    self.recovery_state(report, directory, "waiting_login", error)
+                    self.check_runtime_stop()
+                    try:
+                        outcome = login.run(wait_for_home=True, resume=True)
+                    except InterruptedError:
+                        raise
+                    except Exception as login_error:
+                        report["settlement_login"].update(error=f"{type(login_error).__name__}: {login_error}",
+                                                          report=getattr(login, "report", {}))
+                        self.recovery_state(report, directory, "waiting_login", login_error)
+                        self.pause(PLAY_OBSERVATION_INTERVAL)
+                        continue
+                    self.settlement_login_completed = True
+                    report["settlement_login"].update(status="home_confirmed", report=outcome)
+                    # 回主页仍重新取帧通过原体力、入口和重匹配门禁；原失败局不补计。
+                    title_streak = 0
+                    continue
             if report.get("rematch_limit_reached"):
                 self.recovery_state(report, directory, "waiting_room", error)
                 self.pause(2.)

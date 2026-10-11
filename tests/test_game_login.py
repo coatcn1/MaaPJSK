@@ -71,6 +71,25 @@ class GameLoginTests(unittest.TestCase):
         self.assertEqual(report['title_requests'], 1)
         self.assertEqual(device.events, [('tap', (640, 620))])
 
+    def test_title_with_hud_on_initial_or_fresh_frame_never_taps(self):
+        for fresh_only in (False, True):
+            for hud in ('playing', 'life_hud'):
+                with self.subTest(fresh_only=fresh_only, hud=hud), tempfile.TemporaryDirectory() as directory:
+                    workflow, device, clock = self.workflow(Path(directory))
+                    original = workflow.navigator.match
+                    frames = [0]
+                    screenshot = device.screenshot
+                    def capture():
+                        frames[0] += 1
+                        return screenshot()
+                    device.screenshot = capture
+                    workflow.navigator.match = lambda frame, name: ((1., (0, 0))
+                        if name == hud and (not fresh_only or frames[0] >= 2) else original(frame, name))
+                    with self.assertRaises(TimeoutError):
+                        workflow.run(wait_for_home=True)
+                    self.assertEqual(device.events, [])
+                    self.assertEqual(workflow.report['title_requests'], 0)
+
     def test_existing_game_pages_including_playing_are_handed_back_without_login_input(self):
         for state in (0, 2, 3, 4):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
