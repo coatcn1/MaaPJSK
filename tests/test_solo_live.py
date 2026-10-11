@@ -1,5 +1,6 @@
 import json
 import csv
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -20,6 +21,395 @@ from scripts.test_solo_live import controller_options
 
 
 class SoloTests(unittest.TestCase):
+    def _startup_abort_workflow(self, failure="identity", *, engine="native", after_cleanup="playing", release="valid"):
+        workflow = SoloLive.__new__(SoloLive)
+        state = SimpleNamespace(page="playing", closed=False, stopped=False, now=10., order=[])
+        frames = {}
+        for name, value in (("playing", 50), ("paused", 70), ("confirm", 90), ("home", 110),
+                            ("unknown", 130), ("title_screen", 150), ("conflict", 170),
+                            ("missing_pause", 190), ("missing_life", 210), ("song_select", 230)):
+            image = np.full((720, 1280, 3), value, np.uint8)
+            if name in {"playing", "conflict"}:
+                image[40:48, 1008:1177] = (0, 255, 0)
+            frames[name] = image
+        frames["blank"] = np.zeros((720, 1280, 3), np.uint8)
+        workflow.device, workflow.log = Mock(), Mock()
+        workflow.stop_requested = lambda: state.stopped
+        def capture():
+            state.now += .01
+            return frames[state.page]
+        workflow.device.screenshot.side_effect = capture
+        templates = {name: frames["playing"] for name in ("playing", "life_hud", "home", "song_select", "prepare", "live_menu", "live_failed", "title_screen")}
+        workflow.navigator = Mock(threshold=.83, templates=templates)
+        def check_stop():
+            if state.stopped:
+                raise InterruptedError("用户已停止任务")
+        workflow.navigator._check_stop.side_effect = check_stop
+        def check_title(frame):
+            if frame is frames["title_screen"]:
+                raise RuntimeError("游戏已返回 TAP TO START 标题页")
+        workflow.navigator._check_title_screen.side_effect = check_title
+        def match(frame, name, *area):
+            visible = (any(frame is frames[page] for page in ("playing", "conflict", "paused", "confirm")) and name in {"playing", "life_hud"}
+                       or frame is frames["missing_pause"] and name == "life_hud"
+                       or frame is frames["missing_life"] and name == "playing"
+                       or frame is frames["song_select"] and name == "song_select"
+                       or frame is frames["home"] and name == "home"
+                       or frame is frames["conflict"] and name == "home")
+            return (1. if visible else 0., (0, 0))
+        workflow.navigator.match.side_effect = match
+        def tap(x, y, reason):
+            check_stop()
+            if (x, y) == (1013, 563):
+                state.order.append("start")
+            elif (x, y) == (1223, 44):
+                state.order.append("pause")
+                state.page = "paused"
+            elif (x, y) == (450, 450):
+                state.order.append("retire")
+                state.page = "confirm"
+            elif (x, y) == (760, 424):
+                state.order.append("confirm")
+                state.page = "home"
+        workflow.navigator.tap.side_effect = tap
+        workflow.pause = lambda duration: setattr(state, "now", state.now + duration)
+        workflow.dialog_action = Mock(side_effect=lambda frame, labels:
+            (450, 450) if frame is frames["paused"] and "リタイア" in labels else
+            (640, 450) if frame is frames["paused"] and "リトライ" in labels else
+            (870, 450) if frame is frames["paused"] and "ライブに戻る" in labels else
+            (520, 424) if frame is frames["confirm"] and "キャンセル" in labels else
+            (760, 424) if frame is frames["confirm"] and "リタイア" in labels else None)
+        workflow.ocr = Mock()
+        workflow.ocr.read.return_value = Reading("", 0.)
+        workflow.repository = Mock()
+        workflow.repository.songs = {74: {"charts": {"master": {"music_id": 74, "difficulty": "master",
+            "sha256": "synthetic", "path": "synthetic.sus", "total_note_count": 1}}}}
+        identity = SimpleNamespace(song_id=74, difficulty="master", title="合成调用链", to_dict=lambda: {"song_id": 74})
+        workflow.select = Mock(return_value=(identity, frames["playing"]))
+        workflow.matcher = Mock()
+        workflow.matcher.match.side_effect = ValueError("原最终封面识别失败") if failure == "identity" else None
+        workflow.matcher.match.return_value = identity
+        workflow.prepare_task_bonus, workflow.prepare_playback, workflow.ensure_bonus_available = Mock(), Mock(), Mock()
+        workflow.collect = Mock()
+        gesture = Gesture((Point(0., 8, 3),), "tap")
+        chart = SimpleNamespace(first=gesture, gestures=[], duration=1.)
+        player = Mock()
+        player.report = {"engine": "native", "planned_actions": 1, "sent_actions": 0, "executed_actions": 0, "release_confirmed": False}
+        def close():
+            state.order.append("release")
+            state.closed = True
+            state.page = after_cleanup
+            if release == "error":
+                raise RuntimeError("原清理失败")
+            player.report.update(release_confirmed=True, release={"release_proof": "no-touch-possible-and-cleanup"} if release == "valid" else {})
+            if release in {"stale_reset", "missing_cleanup"}:
+                player.report.update(sent_actions=1, release={"reset_executed": release == "missing_cleanup",
+                    "release_proof": "current-reset-jlog-and-cleanup" if release == "stale_reset" else "reset-jlog-without-cleanup"})
+        player.close.side_effect = close
+        return workflow, state, frames, chart, player
+
+    def _run_startup_abort_workflow(self, workflow, state, chart, player, directory, *, failure="identity", engine="native", expected_error=None, abort_guard="1"):
+        workflow.report_root = Path(directory)
+        with (patch.dict(os.environ, {}), patch("project_sekai.diagnostics._disabled", True),
+              patch("project_sekai.solo_live.time.perf_counter", side_effect=lambda: state.now),
+              patch("project_sekai.solo_live.time.monotonic", side_effect=lambda: state.now),
+              patch("project_sekai.solo_live.parse_sus", return_value=chart),
+              patch("project_sekai.solo_live.compile_touches", return_value=[]),
+              patch("project_sekai.native_player.NativePlayer", return_value=player),
+              patch("project_sekai.solo_live.StartAnchor.observe", side_effect=RuntimeError("原首音轨迹拒绝"))):
+            os.environ.pop("MAAPJSK_SOLO_STARTUP_ABORT_GUARD", None)
+            if abort_guard is not None:
+                os.environ["MAAPJSK_SOLO_STARTUP_ABORT_GUARD"] = abort_guard
+            with self.assertRaisesRegex(RuntimeError, expected_error or ("原最终封面识别失败" if failure == "identity" else "原首音轨迹拒绝")):
+                workflow.run(8, "master", "random", engine=engine)
+
+    def test_startup_abort_guard_defaults_on_and_only_explicit_zero_disables(self):
+        for value in (None, "", "0", "1", "true", "false", "other"):
+            with self.subTest(value=value):
+                workflow, state, frames, chart, player = self._startup_abort_workflow()
+                with tempfile.TemporaryDirectory() as directory:
+                    self._run_startup_abort_workflow(workflow, state, chart, player, directory, abort_guard=value)
+                if value == "0":
+                    self.assertEqual(state.order, ["start", "release"])
+                    self.assertFalse(workflow.last_report["startup_abort_enabled"])
+                    self.assertNotIn("startup_abort", workflow.last_report)
+                else:
+                    self.assertEqual(state.order, ["start", "release", "pause", "retire", "confirm"])
+                    self.assertTrue(workflow.last_report["startup_abort_enabled"])
+                    self.assertTrue(workflow.last_report["startup_abort"]["confirmed"])
+
+    def test_startup_abort_guard_freezes_at_task_start(self):
+        for initial, changed, enabled in ((None, "0", True), ("0", "1", False)):
+            with self.subTest(initial=initial, changed=changed):
+                workflow, state, frames, chart, player = self._startup_abort_workflow()
+                close = player.close.side_effect
+                def change_guard_after_cleanup():
+                    close()
+                    os.environ["MAAPJSK_SOLO_STARTUP_ABORT_GUARD"] = changed
+                player.close.side_effect = change_guard_after_cleanup
+                with tempfile.TemporaryDirectory() as directory:
+                    self._run_startup_abort_workflow(workflow, state, chart, player, directory, abort_guard=initial)
+                self.assertEqual(workflow.last_report["startup_abort_enabled"], enabled)
+                self.assertEqual(state.order, ["start", "release", "pause", "retire", "confirm"] if enabled else ["start", "release"])
+
+    def test_real_run_start_identity_failure_aborts_healthy_live_after_release_without_logs(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(state.order, ["start", "release", "pause", "retire", "confirm"])
+        self.assertTrue(workflow.last_report["startup_abort"]["confirmed"])
+        self.assertEqual(workflow.last_report["live_status"], "startup_aborted")
+        self.assertFalse(workflow.last_report.get("death_confirmed", False))
+        self.assertFalse(workflow.last_report["completed"])
+        self.assertIsNone(workflow.last_report["report_path"])
+        self.assertEqual(workflow.completed_rounds, 0)
+        self.assertEqual(workflow.select.call_count, 1)
+        player.play.assert_not_called()
+        workflow.collect.assert_not_called()
+        workflow.device.back.assert_not_called()
+
+    def test_real_run_start_anchor_failure_aborts_after_original_player_cleanup(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow("anchor")
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory, failure="anchor")
+        self.assertEqual(state.order, ["start", "release", "pause", "retire", "confirm"])
+        self.assertIn("原首音轨迹拒绝", workflow.last_report["error"])
+        self.assertTrue(workflow.last_report["startup_abort"]["confirmed"])
+        self.assertFalse(workflow.last_report.get("preplay_death_confirmed", False))
+        player.play.assert_not_called()
+        workflow.collect.assert_not_called()
+
+    def test_real_run_start_failure_rechecks_page_after_cleanup_and_blocks_unknown_conflicts(self):
+        for page in ("unknown", "blank", "title_screen", "conflict", "missing_pause", "missing_life", "song_select", "home"):
+            with self.subTest(page=page):
+                workflow, state, frames, chart, player = self._startup_abort_workflow(after_cleanup=page)
+                with tempfile.TemporaryDirectory() as directory:
+                    self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+                self.assertEqual(state.order, ["start", "release"])
+                self.assertFalse(workflow.last_report["startup_abort"]["confirmed"])
+                self.assertIn("原最终封面识别失败", workflow.last_report["error"])
+                player.play.assert_not_called()
+                workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_current_release_and_cleanup_error_never_allow_pause(self):
+        for release in ("missing", "error", "stale_reset", "missing_cleanup"):
+            with self.subTest(release=release):
+                workflow, state, frames, chart, player = self._startup_abort_workflow(release=release)
+                with tempfile.TemporaryDirectory() as directory:
+                    self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+                self.assertEqual(state.order, ["start", "release"])
+                self.assertEqual(workflow.last_report["startup_abort"]["status"], "release_unconfirmed")
+                self.assertIn("原最终封面识别失败", workflow.last_report["error"])
+                if release == "error":
+                    self.assertIn("原清理失败", workflow.last_report["release_error"])
+                workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_stop_after_cleanup_prevents_all_abort_inputs(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        close = player.close.side_effect
+        def stop_at_cleanup():
+            close()
+            state.stopped = True
+        player.close.side_effect = stop_at_cleanup
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release"])
+        self.assertNotIn("startup_abort", workflow.last_report)
+        self.assertTrue(workflow.last_report["cancelled"])
+        workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_stop_before_pause_keeps_original_error(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        capture = workflow.device.screenshot.side_effect
+        def stop_on_abort_frame():
+            frame = capture()
+            if state.closed:
+                state.stopped = True
+            return frame
+        workflow.device.screenshot.side_effect = stop_on_abort_frame
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release"])
+        self.assertTrue(workflow.last_report["cancelled"])
+        self.assertEqual(workflow.last_report["startup_abort"]["status"], "cancelled")
+        workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_pause_receipt_error_does_not_request_retire(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        tap = workflow.navigator.tap.side_effect
+        def fail_pause(x, y, reason):
+            if (x, y) == (1223, 44):
+                state.order.append("pause")
+                raise RuntimeError("暂停请求回执失败")
+            tap(x, y, reason)
+        workflow.navigator.tap.side_effect = fail_pause
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release", "pause"])
+        self.assertEqual(workflow.last_report["startup_abort"]["status"], "failed")
+        self.assertIn("暂停请求回执失败", workflow.last_report["startup_abort"]["error"])
+        self.assertIn("原最终封面识别失败", workflow.last_report["error"])
+        workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_unknown_pause_result_waits_bounded_without_retire(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        tap = workflow.navigator.tap.side_effect
+        def unknown_after_pause(x, y, reason):
+            tap(x, y, reason)
+            if (x, y) == (1223, 44):
+                state.page = "unknown"
+        workflow.navigator.tap.side_effect = unknown_after_pause
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release", "pause"])
+        self.assertEqual(workflow.last_report["startup_abort"]["status"], "exit_unconfirmed")
+        self.assertEqual(workflow.last_report["startup_abort"]["pause_requests"], 1)
+        self.assertLessEqual(state.now, 36.2)
+        workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_already_paused_never_toggles_pause_button(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow(after_cleanup="paused")
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release", "retire", "confirm"])
+        self.assertTrue(workflow.last_report["startup_abort"]["pause_already_visible"])
+        self.assertTrue(workflow.last_report["startup_abort"]["confirmed"])
+
+    def test_real_run_start_failure_legacy_zero_dispatch_uses_same_safe_abort(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow(engine="legacy")
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory, engine="legacy")
+        self.assertEqual(state.order, ["start", "pause", "retire", "confirm"])
+        self.assertTrue(workflow.last_report["startup_abort"]["confirmed"])
+        player.close.assert_not_called()
+
+    def test_native_prepare_failure_never_enters_startup_abort_or_sends_game_input(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        player.prepare.side_effect = RuntimeError("原 Native 准备失败")
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory, expected_error="原 Native 准备失败")
+        self.assertEqual(state.order, ["release"])
+        self.assertNotIn("startup_abort", workflow.last_report)
+        workflow.navigator.tap.assert_not_called()
+
+    def test_real_run_start_failure_page_changes_on_pause_recheck_prevent_pause(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        capture = workflow.device.screenshot.side_effect
+        observations = []
+        def change_fresh_frame():
+            frame = capture()
+            if state.closed:
+                observations.append(frame)
+                if len(observations) == 1:
+                    state.page = "conflict"
+            return frame
+        workflow.device.screenshot.side_effect = change_fresh_frame
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release"])
+        self.assertEqual(workflow.last_report["startup_abort"]["status"], "page_unconfirmed")
+
+    def test_real_run_start_failure_partial_pause_menu_never_toggles_or_retires(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow(after_cleanup="paused")
+        action = workflow.dialog_action.side_effect
+        workflow.dialog_action.side_effect = lambda frame, labels: None if "ライブに戻る" in labels else action(frame, labels)
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release"])
+        self.assertIn("暂停模态按钮未完整确认", workflow.last_report["startup_abort"]["error"])
+
+    def test_real_run_start_failure_stop_or_lost_release_after_pause_prevents_retire(self):
+        for stopped in (True, False):
+            with self.subTest(stopped=stopped):
+                workflow, state, frames, chart, player = self._startup_abort_workflow()
+                tap = workflow.navigator.tap.side_effect
+                def invalidate_after_pause(x, y, reason):
+                    tap(x, y, reason)
+                    if (x, y) == (1223, 44):
+                        if stopped:
+                            state.stopped = True
+                        else:
+                            player.report["release_confirmed"] = False
+                workflow.navigator.tap.side_effect = invalidate_after_pause
+                with tempfile.TemporaryDirectory() as directory:
+                    self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+                self.assertEqual(state.order, ["start", "release", "pause"])
+                self.assertFalse(workflow.last_report["startup_abort"]["confirmed"])
+                workflow.device.back.assert_not_called()
+
+    def test_real_run_start_failure_safe_menu_backs_use_fresh_page_and_remain_bounded(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        tap = workflow.navigator.tap.side_effect
+        def return_to_selection(x, y, reason):
+            tap(x, y, reason)
+            if (x, y) == (760, 424):
+                state.page = "song_select"
+        workflow.navigator.tap.side_effect = return_to_selection
+        def back():
+            state.order.append("back")
+            state.page = "home"
+        workflow.device.back.side_effect = back
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release", "pause", "retire", "confirm", "back"])
+        self.assertEqual(workflow.last_report["startup_abort"]["back_requests"], 1)
+        self.assertTrue(workflow.last_report["startup_abort"]["confirmed"])
+
+    def test_startup_confirmation_requires_real_cancel_retire_pair_and_not_old_pause_menu(self):
+        for mode in ("missing_cancel", "legacy_ok", "old_pause", "old_pause_with_cancel", "reversed", "different_row"):
+            with self.subTest(mode=mode):
+                workflow, state, frames, chart, player = self._startup_abort_workflow()
+                action = workflow.dialog_action.side_effect
+                tap = workflow.navigator.tap.side_effect
+                def page_after_retire(x, y, reason):
+                    tap(x, y, reason)
+                    if (x, y) == (450, 450) and mode.startswith("old_pause"):
+                        state.page = "paused"
+                workflow.navigator.tap.side_effect = page_after_retire
+                def changed_confirmation(frame, labels):
+                    if frame is frames["confirm"]:
+                        if mode == "missing_cancel" and "キャンセル" in labels:
+                            return None
+                        if mode == "legacy_ok":
+                            return (760, 424) if "はい" in labels or "ok" in labels else None
+                        if mode == "reversed" and "キャンセル" in labels:
+                            return (800, 424)
+                        if mode == "different_row" and "キャンセル" in labels:
+                            return (520, 460)
+                    if mode == "old_pause_with_cancel" and frame is frames["paused"] and "キャンセル" in labels:
+                        return (300, 450)
+                    return action(frame, labels)
+                workflow.dialog_action.side_effect = changed_confirmation
+                with tempfile.TemporaryDirectory() as directory:
+                    self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+                self.assertEqual(state.order, ["start", "release", "pause", "retire"])
+                abort = workflow.last_report["startup_abort"]
+                self.assertEqual(abort["retire_requests"], 1)
+                self.assertEqual(abort["confirm_requests"], 0)
+                self.assertEqual(abort["status"], "exit_unconfirmed")
+                workflow.device.back.assert_not_called()
+
+    def test_startup_confirmation_fresh_pair_must_match_even_if_right_retire_point_stays(self):
+        workflow, state, frames, chart, player = self._startup_abort_workflow()
+        capture = workflow.device.screenshot.side_effect
+        action = workflow.dialog_action.side_effect
+        phase = SimpleNamespace(counter=0)
+        def change_cancel_between_frames():
+            frame = capture()
+            if state.page == "confirm":
+                phase.counter += 1
+            return frame
+        workflow.device.screenshot.side_effect = change_cancel_between_frames
+        workflow.dialog_action.side_effect = lambda frame, labels: (
+            (520 + 10 * (phase.counter % 2), 424) if frame is frames["confirm"] and "キャンセル" in labels
+            else action(frame, labels))
+        with tempfile.TemporaryDirectory() as directory:
+            self._run_startup_abort_workflow(workflow, state, chart, player, directory)
+        self.assertEqual(state.order, ["start", "release", "pause", "retire"])
+        self.assertEqual(workflow.last_report["startup_abort"]["confirm_requests"], 0)
+        self.assertEqual(workflow.last_report["startup_abort"]["status"], "exit_unconfirmed")
+
     def test_date_update_notice_requires_modal_two_exact_lines_and_no_hud(self):
         workflow = SoloLive.__new__(SoloLive)
         workflow.navigator = SimpleNamespace(templates={'life_hud': None}, threshold=.83,
