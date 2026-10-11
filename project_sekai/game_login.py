@@ -193,9 +193,10 @@ class GameLogin:
             persist()
 
 
-def login_at_task_start(context, root, log_message=None):
+def login_at_task_start(context, root, log_message=None, *, device=None):
     root = Path(root)
-    device = MaaDevice(context.tasker.controller)
+    if device is None:
+        device = MaaDevice(context.tasker.controller)
     config = Path(os.environ.get("MAAPJSK_TEMPLATE_CONFIG", root / "config/maapjsk-templates.json"))
     navigator = Navigator(device, config, stop_requested=lambda: bool(context.tasker.stopping))
     return GameLogin(device, navigator, root / "debug/game-login-runs",

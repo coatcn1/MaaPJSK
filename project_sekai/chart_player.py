@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from bisect import bisect_left
 import math
+import os
 import time
 from typing import Callable
 
@@ -13,7 +14,7 @@ from .sus_chart import Chart, Gesture, slide_x
 
 TOUCH_PLAN_VERSION = 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 5
-START_ANCHOR_VERSION = 12
+START_ANCHOR_VERSION = 14
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -255,6 +256,10 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         mask = cv2.inRange(hsv, (140, 65, 135), (179, 255, 255))
     else:
         mask = cv2.inRange(hsv, (95, 55, 135), (135, 255, 255))
+    blue_tap = (gesture.kind == "tap" and not gesture.flick and not gesture.critical
+                and len(gesture.points) == 1 and gesture.points[0].kind == 1)
+    # 基线差分会把同一外框拆成碎片；蓝框归属用原颜色分量，横芯自身仍必须通过差分。
+    blue_source_mask = mask.copy() if blue_tap else None
     if baseline is not None:
         original = cv2.cvtColor(baseline, cv2.COLOR_BGR2HSV).astype(np.int16)
         current = hsv.astype(np.int16)
@@ -266,7 +271,8 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
         mask[~changed] = 0
     gold_tap = gesture.kind == "tap" and first_note_color(gesture) == "gold"
     gold_slide = gesture.kind == "slide" and first_note_color(gesture) == "gold"
-    full_mask = mask.copy() if gesture.kind == "tap" and (gesture.flick or gold_tap) or gold_slide or simultaneous_gestures else None
+    full_mask = (blue_source_mask if blue_tap else
+                 mask.copy() if gesture.kind == "tap" and (gesture.flick or gold_tap) or gold_slide or simultaneous_gestures else None)
     component_labels, component_stats = None, None
     simultaneous = validated_simultaneous(gesture, simultaneous_gestures)
     mask[:40] = 0
@@ -343,6 +349,39 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
     if passed_slide_head and reject_passed_slide:
         # 同帧后继横条不能覆盖首头已越界的证据，否则会从歌曲中途建立 epoch。
         raise FirstHeadOutsideWindow("首长条头已越过同步窗口，拒绝从后继音或歌曲中途启动")
+    if blue_tap:
+        # 蓝外框可能与底图纵向连通，原框因高度超限被拒后会误选后继音。
+        # 浅亮横芯仅补充这种污染框的测量；位置、尺寸、亮度与后续轨迹门槛均保持原样。
+        core = cv2.inRange(hsv, (95, 0, 235), (135, 110, 255))
+        _, core_labels, core_stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+        if component_labels is None:
+            _, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(full_mask, connectivity=8)
+        for core_label, stats in enumerate(core_stats[1:], start=1):
+            x, y, width, height, area = stats
+            if y <= 40 or y + height >= 540 or area < width * height * .75:
+                continue
+            if not eligible(x, y, width, height):
+                continue
+            actual = core_labels[y:y + height, x:x + width] == core_label
+            # 必须先测完整横芯再验证变化；差分残片不能伪装完整首头或改变其中心。
+            if baseline is not None and np.count_nonzero(changed[y:y + height, x:x + width][actual]) < area * .75:
+                continue
+            overlaps = component_labels[y:y + height, x:x + width][actual]
+            sources = overlaps[overlaps != 0]
+            original_labels = np.unique(sources)
+            # 低饱和横芯不全在蓝掩膜中，但必须有足量、唯一且横芯两侧均可见的真实蓝框来源。
+            if len(original_labels) != 1 or len(sources) < area * .10:
+                continue
+            source = original_labels[0]
+            fx, fy, fw, fh = component_stats[source][:4]
+            if fh <= max(36, (fy + fh / 2) * height_ratio):
+                continue
+            left = component_labels[y:y + height, max(0, x - 2):x + 2]
+            right = component_labels[y:y + height, x + width - 2:min(frame.shape[1], x + width + 2)]
+            if not (np.any(left == source) and np.any(right == source)):
+                continue
+            # 不在这里重置任何轨迹；首头已越界或候选倒退仍由原同步生命周期拒绝。
+            candidates.append(y + height / 2)
     if candidates:
         return max(candidates)
     if mixed_candidates:
@@ -384,6 +423,12 @@ class StartAnchor:
         self.baseline: np.ndarray | None = None
         self.fit: dict | None = None
         self.failure_reason: str | None = None
+        # 本局创建时冻结保护设置；明确主开关优先，兼容旧试验开关，空值不关闭默认保护。
+        guard_setting = os.environ.get("MAAPJSK_START_ANCHOR_AMBIGUITY_GUARD")
+        if guard_setting not in {"0", "1"}:
+            guard_setting = os.environ.get("MAAPJSK_START_ANCHOR_AMBIGUITY_TRIAL")
+        self.ambiguity_guard = guard_setting != "0"
+        self.ambiguity_defer: dict | None = None
 
     def observe(self, frame: np.ndarray, captured_at: float, *, capture_seconds: float = 0.0) -> float | None:
         if self.baseline is None:
@@ -425,7 +470,7 @@ class StartAnchor:
         # 快截图的五帧可能仅覆盖约 125 ms，局部斜率噪声会放大成整曲相位误差。
         # 已有足够轨迹时直接利用最近 1.25 秒、最多 32 点；不为凑宽窗口等待新帧。
         # 慢链路仍沿用原五帧与低样本门禁，宽窗口不合格时也不能退回噪声短窗口。
-        if len(self.samples) >= 8 and recent[-1][0] - recent[0][0] < .250:
+        if len(self.samples) >= 8 and (recent[-1][0] - recent[0][0] < .250 or self.ambiguity_defer is not None):
             wider = [sample for sample in self.samples[-32:] if captured_at - sample[0] <= 1.25]
             if len(wider) >= 8 and wider[-1][0] - wider[0][0] >= .250:
                 recent = wider
@@ -452,6 +497,7 @@ class StartAnchor:
         offsets = np.array([sample[0] - origin for sample in recent])
         heights = np.array([sample[1] for sample in recent])
         candidates = []
+        quality_candidates = []
         # 实际开场帧的下落带透视加速；比较模型残差，不能用直线外推强行同步。
         for name, shift in (("linear", 0), ("exponential", 0), ("perspective", 30)):
             transformed = heights if name == "linear" else np.log(heights + shift)
@@ -467,9 +513,32 @@ class StartAnchor:
                 first_hit = origin + (math.log(570 + shift) - intercept) / velocity
                 current_velocity = velocity * (heights[-1] + shift)
             residual = float(np.max(np.abs(heights - predicted)))
-            if (60 <= current_velocity <= 9000 and residual <= (4 if short_window else 12)
-                    and captured_at + .040 <= first_hit <= captured_at + .8):
-                candidates.append((residual, name, first_hit))
+            if 60 <= current_velocity <= 9000 and residual <= (4 if short_window else 12):
+                # 已进入歧义等待后，早模型不能仅因剩余时间不足就消失并放行迟模型。
+                if first_hit <= captured_at + .8:
+                    quality_candidates.append((residual, name, first_hit))
+                if captured_at + .040 <= first_hit <= captured_at + .8:
+                    candidates.append((residual, name, first_hit))
+        if self.ambiguity_guard and fit_window == "wide_trajectory" and len(quality_candidates) >= 2:
+            earliest = min(hit for _, _, hit in quality_candidates)
+            latest = max(hit for _, _, hit in quality_candidates)
+            disagreement = latest - earliest
+            # 4 像素沿用严格质量门槛，80 ms 沿用启动保护量；不改变模型偏好或一般容差。
+            if min(error for error, _, _ in quality_candidates) > 4 and disagreement > .080:
+                if self.ambiguity_defer is None:
+                    self.ambiguity_defer = {"defer_count": 0, "first_captured_at": captured_at,
+                                            "first_sample_count": len(self.samples), "max_disagreement_ms": 0.0}
+                self.ambiguity_defer.update(
+                    defer_count=self.ambiguity_defer["defer_count"] + 1,
+                    last_captured_at=captured_at, new_sample_count=len(self.samples) - self.ambiguity_defer["first_sample_count"],
+                    disagreement_ms=disagreement * 1000,
+                    max_disagreement_ms=max(self.ambiguity_defer["max_disagreement_ms"], disagreement * 1000),
+                    earliest_hit=earliest, latest_hit=latest, status="waiting")
+                if earliest - captured_at <= max(0.0, capture_seconds) + .080:
+                    self.ambiguity_defer["status"] = "rejected_margin"
+                    self.failure_reason = "trajectory_model_ambiguity_margin"
+                    raise RuntimeError("首音轨迹模型时刻仍有歧义且启动余量不足，拒绝从歌曲中途开始")
+                return None
         if not candidates:
             return None
         residual, name, first_hit = min(candidates)
@@ -493,6 +562,11 @@ class StartAnchor:
                     "fit_window": fit_window, "window_seconds": recent[-1][0] - recent[0][0],
                     "candidates": [{"model": model, "residual_pixels": error, "first_hit": hit}
                                    for error, model, hit in candidates]}
+        if self.ambiguity_guard:
+            self.fit["ambiguity_guard"] = {"enabled": True, "deferred": self.ambiguity_defer is not None}
+            if self.ambiguity_defer is not None:
+                self.ambiguity_defer.update(status="resolved", new_sample_count=len(self.samples) - self.ambiguity_defer["first_sample_count"])
+                self.fit["ambiguity_guard"].update(self.ambiguity_defer)
         return first_hit - self.gesture.start
 
 
