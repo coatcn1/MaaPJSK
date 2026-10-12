@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import ctypes
+import os
 from typing import Any
 
 import numpy as np
@@ -23,9 +24,14 @@ class MaaDevice:
 
     def __init__(self, controller: Any) -> None:
         self.controller = controller
+        # 默认检查作业成功且冻结到设备对象，仅明确 0 回退；失败作业不能借用上一张缓存。
+        self.screenshot_success_guard = os.environ.get("MAAPJSK_SCREENSHOT_SUCCESS_GUARD") != "0"
 
     def screenshot(self) -> np.ndarray:
-        frame = self.controller.post_screencap().wait().get()
+        job = self.controller.post_screencap().wait()
+        if self.screenshot_success_guard and not job.succeeded:
+            raise RuntimeError("MFA 截图作业失败，拒绝读取上一张缓存画面")
+        frame = job.get()
         if frame is None or frame.shape[:2] != (720, 1280):
             shape = getattr(frame, "shape", None)
             raise RuntimeError(f"MFA 截图不是 1280×720：{shape}")

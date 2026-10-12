@@ -74,14 +74,14 @@
         ]
       },
       "Node.Action.Succeeded": {
-        "content": "单人谱面演出完成，请查看本局判定报告",
+        "content": "单人谱面演出完成，结果见上方任务信息",
         "display": [
           "log",
           "toast"
         ]
       },
       "Node.Action.Failed": {
-        "content": "单人谱面演出中止，请查看本局报告",
+        "content": "单人谱面演出中止，原因见上方任务信息",
         "display": [
           "log",
           "toast"

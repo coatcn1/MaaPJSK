@@ -98,6 +98,8 @@ class SoloLive:
         self.matcher = SongMatcher(self.repository, self.ocr)
         self.report_root = report_root
         self.completed_rounds = 0
+        # 仅单人 Native 保护回调默认使用快路径；初始化冻结，仅明确 0 回退，不改变首音及导航观察。
+        self.native_hud_fastpath = os.environ.get("MAAPJSK_SOLO_NATIVE_HUD_FASTPATH") != "0"
 
     def screenshot(self):
         self.navigator._check_stop()
@@ -115,11 +117,12 @@ class SoloLive:
                 raise RuntimeError("游戏已返回 TAP TO START 标题页，停止结算返回")
         return frame
 
-    def native_observation_options(self, directory):
+    def native_observation_options(self, directory, *, observer=None):
         if os.environ.get("MAAPJSK_NATIVE_ASYNC_OBSERVATION") != "1":
             return {}
+        observer = self.observe_play_state if observer is None else observer
         return {"async_observation": True, "observation_request": self.device.controller.post_screencap,
-                "captured_frame_observer": lambda frame, requested_at: self.observe_play_state(
+                "captured_frame_observer": lambda frame, requested_at: observer(
                     directory, frame=frame, requested_at=requested_at),
                 "observation_invalidated": self.invalidate_play_observation}
 
@@ -1023,6 +1026,29 @@ class SoloLive:
     def observe_play_state(self, directory: Path, *, frame=None, requested_at=None):
         requested_at = time.perf_counter() if requested_at is None else requested_at
         frame = self.screenshot() if frame is None else self.check_observation_frame(frame)
+        self.observe_play_state_frame(directory, frame, requested_at)
+
+    def observe_native_play_state(self, directory: Path, *, frame=None, requested_at=None):
+        if not getattr(self, "native_hud_fastpath", False):
+            return self.observe_play_state(directory, frame=frame, requested_at=requested_at)
+        requested_at = time.perf_counter() if requested_at is None else requested_at
+        self.navigator._check_stop()
+        frame = self.device.screenshot() if frame is None else frame
+        self.navigator._check_stop()
+        # 同一帧的两个固定 HUD 都明确才省去全屏检查；未知、缺标签及转场沿原策略。
+        hud_confirmed = (not blank_transition(frame)
+                         and "life_hud" in self.navigator.templates
+                         and self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] >= self.navigator.threshold
+                         and self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0] >= self.navigator.threshold)
+        report = getattr(self, "last_report", None)
+        if isinstance(report, dict):
+            counters = report.setdefault("native_hud_fastpath", {"enabled": True, "accepted_frames": 0, "fallback_frames": 0})
+            counters["accepted_frames" if hud_confirmed else "fallback_frames"] += 1
+        if not hud_confirmed:
+            frame = self.check_observation_frame(frame)
+        self.observe_play_state_frame(directory, frame, requested_at)
+
+    def observe_play_state_frame(self, directory: Path, frame, requested_at):
         # 诊断仅保留已有采样，不增加截图或改变输入；整局保存也限定在 180 秒内。
         capture_limit = 180 if os.environ.get("MAAPJSK_DIAGNOSTIC_FULL_LIFE_FRAMES") == "1" else 8
         if requested_at - self.life_epoch < capture_limit:
@@ -1436,6 +1462,9 @@ class SoloLive:
                       "recovery_settings": {"mode": recovery_mode, "count": recovery_count}}
             report["engine"] = engine
             report["startup_abort_enabled"] = startup_abort_enabled
+            if engine == "native":
+                report["native_hud_fastpath"] = {"enabled": getattr(self, "native_hud_fastpath", False),
+                                                "accepted_frames": 0, "fallback_frames": 0}
             if expected_song_id is not None:
                 report.update(requested_song_name=song_name, expected_song_id=expected_song_id)
             self.last_report = report
@@ -1461,8 +1490,8 @@ class SoloLive:
                     from .native_player import NativePlayer
                     native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
                                                  latency_offsets=latency_offsets,
-                                                 idle_observer=lambda: self.observe_play_state(directory),
-                                                 **self.native_observation_options(directory))
+                                                 idle_observer=lambda: self.observe_native_play_state(directory),
+                                                 **self.native_observation_options(directory, observer=self.observe_native_play_state))
                     # 开场死亡也须清理同一个已准备对象，并保留零派发的释放证明。
                     report["playback"] = native_player.report
                     native_player.prepare()
@@ -1501,7 +1530,14 @@ class SoloLive:
                     raise playback_error
                 report["phase"] = "settlement"
                 _write_json(directory / "report.json", report)
-                self.collect(report, directory)
+                try:
+                    self.collect(report, directory)
+                except Exception as settlement_error:
+                    report["settlement_error"] = f"{type(settlement_error).__name__}: {settlement_error}"
+                    # 结算失败是后续证据，不能覆盖先发生的输入错误；用户停止仍优先。
+                    if playback_error is not None and not self.stop_requested() and not isinstance(settlement_error, InterruptedError):
+                        raise playback_error from settlement_error
+                    raise
                 if playback_error is not None:
                     report["completed"] = False
                     raise playback_error
