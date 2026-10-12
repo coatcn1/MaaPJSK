@@ -19,6 +19,10 @@ OFFSET_FIELDS = ("down_ms", "up_ms", "move_ms", "wait_ms", "interval_ms")
 GAME_PHASE_FEEDBACK_VERSION = 1
 
 
+class NativeStartupRejected(RuntimeError):
+    """Native 时间轴在零派发阶段拒绝启动；由任务在严格释放后决定安全退出。"""
+
+
 def offsets_from_dict(values: dict):
     offsets = native_engine.module().TouchLatencyOffsets()
     for field in OFFSET_FIELDS:
@@ -275,7 +279,15 @@ class NativePlayer:
     def play(self, epoch: float, offset_ms: int):
         if not self.prepared:
             raise RuntimeError("Native 尚未在准备页完成连接")
-        self.timeline.start(epoch, self.clock(), offset_ms)
+        started_at = self.clock()
+        try:
+            self.timeline.start(epoch, started_at, offset_ms)
+        except RuntimeError as error:
+            # 保留 Native 原拒绝与时刻，不放宽 20 ms 门槛，也不把零派发拒绝当作演奏中的故障。
+            self.report["startup_rejection"] = {"reason": str(error), "checked_at_s": started_at,
+                "first_target_s": float(epoch + self.events[0].time + offset_ms / 1000),
+                "sent_actions": self.report["sent_actions"], "executed_actions": self.report["executed_actions"]}
+            raise NativeStartupRejected(str(error)) from error
         if self.async_observation is not None:
             self.async_observation.start()
         self.playback_epoch = epoch

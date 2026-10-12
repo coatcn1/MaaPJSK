@@ -14,7 +14,7 @@ from .sus_chart import Chart, Gesture, slide_x
 
 TOUCH_PLAN_VERSION = 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 5
-START_ANCHOR_VERSION = 16
+START_ANCHOR_VERSION = 17
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:

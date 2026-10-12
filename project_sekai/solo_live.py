@@ -100,6 +100,8 @@ class SoloLive:
         self.completed_rounds = 0
         # 仅单人 Native 保护回调默认使用快路径；初始化冻结，仅明确 0 回退，不改变首音及导航观察。
         self.native_hud_fastpath = os.environ.get("MAAPJSK_SOLO_NATIVE_HUD_FASTPATH") != "0"
+        # 启动保护统一控制实际余量、同帧 HUD 快路径与零派发中止；默认开启，初始化冻结，仅明确 0 回退。
+        self.native_startup_guard = os.environ.get("MAAPJSK_SOLO_NATIVE_STARTUP_GUARD") != "0"
 
     def screenshot(self):
         self.navigator._check_stop()
@@ -715,8 +717,11 @@ class SoloLive:
 
     def start(self, chart, identity, report: dict, directory: Path, *, ready_action=None, frame_guard=None,
               identity_phase="final", on_final_identity=None, opening_timeout=120, wait_for_opening=False,
-              opening_deadline_provider=None) -> float:
+              opening_deadline_provider=None, native_start_target=None, native_start_fastpath=False) -> float:
         self.device.preflight()
+        startup_fastpath = native_start_target is not None and native_start_fastpath
+        if native_start_target is not None:
+            report["native_startup_hud_fastpath"] = {"enabled": startup_fastpath, "accepted_frames": 0, "fallback_frames": 0}
         self.preplay_life_frames = deque(maxlen=8)
         if ready_action is None:
             self.navigator.tap(1013, 563, "开始单人谱面演出")
@@ -781,7 +786,18 @@ class SoloLive:
         frame = None
         while time.monotonic() < (opening_deadline_provider() if final is None and opening_deadline_provider is not None else deadline):
             before = time.perf_counter()
-            frame = self.screenshot()
+            hud_playing = False
+            if startup_fastpath and final is not None:
+                self.navigator._check_stop()
+                frame = self.device.screenshot()
+                self.navigator._check_stop()
+                hud_playing = self.native_hud_visible(frame)
+                counters = report["native_startup_hud_fastpath"]
+                counters["accepted_frames" if hud_playing else "fallback_frames"] += 1
+                if not hud_playing:
+                    frame = self.check_observation_frame(frame)
+            else:
+                frame = self.screenshot()
             self.observe_preplay_life(frame, before, report)
             if frame_guard is not None:
                 frame_guard(frame)
@@ -838,7 +854,7 @@ class SoloLive:
                         raise RuntimeError(f"两个识别阶段均未确认歌曲，未派发谱面输入：{last_error}")
                     self.pause(.02)
                     continue
-            if self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
+            if hud_playing or self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
                 captured_frames.append((captured_at, frame.copy()))
                 if len(captured_frames) > 32:
                     # 长前奏会占满最初的空帧；保留原始基线和最近轨迹，确保失败后仍能回放首音。
@@ -861,10 +877,23 @@ class SoloLive:
                         report["start_anchor"]["trajectory_rate"] = float(np.polyfit(
                             np.array([when - origin for when, _ in samples]),
                             np.log(np.array([y + 30 for _, y in samples])), 1)[0])
-                    # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
-                    print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
                     # 锚点建立后不在触控前编码截图，避免错过第一音；结算时再保存证据。
                     self.anchor_frames = retained_anchor_frames()
+                    if native_start_target is not None:
+                        first_time, frozen_offset_ms = native_start_target
+                        first_target = float(epoch + first_time + frozen_offset_ms / 1000)
+                        checked_at = time.perf_counter()
+                        # 拟合可能返回 NumPy 标量；正式报告须保留 JSON 可序列化的 Python 数值和布尔值。
+                        remaining = float(first_target - checked_at)
+                        report["startup_handoff"] = {"first_target_s": first_target, "checked_at_s": checked_at,
+                            "remaining_ms": remaining * 1000, "required_margin_ms": 80., "accepted": bool(remaining >= .080)}
+                        # 拟合时的请求开始时间不能证明当前仍可启动；负偏移及首 Flick 提前量都包含在真实首条目标中。
+                        if remaining < .080:
+                            anchor.failure_reason = "native_start_handoff_margin"
+                            update_anchor_attempt(failed=True)
+                            raise RuntimeError("首音实际启动余量不足，拒绝从歌曲中途开始")
+                    # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
+                    print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
                     return epoch
             self.pause(.002)
         if frame is not None:
@@ -1036,10 +1065,7 @@ class SoloLive:
         frame = self.device.screenshot() if frame is None else frame
         self.navigator._check_stop()
         # 同一帧的两个固定 HUD 都明确才省去全屏检查；未知、缺标签及转场沿原策略。
-        hud_confirmed = (not blank_transition(frame)
-                         and "life_hud" in self.navigator.templates
-                         and self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] >= self.navigator.threshold
-                         and self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0] >= self.navigator.threshold)
+        hud_confirmed = self.native_hud_visible(frame)
         report = getattr(self, "last_report", None)
         if isinstance(report, dict):
             counters = report.setdefault("native_hud_fastpath", {"enabled": True, "accepted_frames": 0, "fallback_frames": 0})
@@ -1047,6 +1073,12 @@ class SoloLive:
         if not hud_confirmed:
             frame = self.check_observation_frame(frame)
         self.observe_play_state_frame(directory, frame, requested_at)
+
+    def native_hud_visible(self, frame):
+        return (not blank_transition(frame)
+                and "life_hud" in self.navigator.templates
+                and self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] >= self.navigator.threshold
+                and self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0] >= self.navigator.threshold)
 
     def observe_play_state_frame(self, directory: Path, frame, requested_at):
         # 诊断仅保留已有采样，不增加截图或改变输入；整局保存也限定在 180 秒内。
@@ -1463,6 +1495,7 @@ class SoloLive:
             report["engine"] = engine
             report["startup_abort_enabled"] = startup_abort_enabled
             if engine == "native":
+                report["native_startup_guard"] = getattr(self, "native_startup_guard", False)
                 report["native_hud_fastpath"] = {"enabled": getattr(self, "native_hud_fastpath", False),
                                                 "accepted_frames": 0, "fallback_frames": 0}
             if expected_song_id is not None:
@@ -1487,7 +1520,7 @@ class SoloLive:
                 self.prepare_playback(report)
                 self.ensure_bonus_available(recovery_mode, recovery_count, report, directory)
                 if engine == "native":
-                    from .native_player import NativePlayer
+                    from .native_player import NativePlayer, NativeStartupRejected
                     native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
                                                  latency_offsets=latency_offsets,
                                                  idle_observer=lambda: self.observe_native_play_state(directory),
@@ -1497,7 +1530,9 @@ class SoloLive:
                     native_player.prepare()
                 self.log("点击开始后持续等待加载与开场封面；确认歌曲、标题和难度后同步首音")
                 try:
-                    epoch = self.start(chart, identity, report, directory)
+                    startup_options = ({"native_start_target": (events[0].time, offset_ms), "native_start_fastpath": True}
+                                       if native_player is not None and getattr(self, "native_startup_guard", False) and events else {})
+                    epoch = self.start(chart, identity, report, directory, **startup_options)
                 except Exception:
                     startup_failed = True
                     raise
@@ -1506,14 +1541,31 @@ class SoloLive:
                     verify_profile_anchor(calibration_profile, report)
                 _write_json(directory / "report.json", report)
                 playback_error = None
+                startup_release_failure = None
                 try:
                     if native_player is not None:
                         report["playback"] = native_player.report
                         try:
                             native_player.play(epoch, offset_ms)
+                        except NativeStartupRejected as startup_error:
+                            if (getattr(self, "native_startup_guard", False)
+                                    and report["playback"].get("sent_actions") == 0
+                                    and report["playback"].get("executed_actions") == 0):
+                                # 清理也可能抛错，须在清理前冻结原零派发拒绝，禁止转入结算。
+                                startup_failed = True
+                                report["playback_error"] = f"{type(startup_error).__name__}: {startup_error}"
+                            raise
                         finally:
-                            native_player.close()
-                            native_player = None
+                            try:
+                                native_player.close()
+                            except Exception as release_error:
+                                if not startup_failed:
+                                    raise
+                                startup_release_failure = release_error
+                                report["release_error"] = f"{type(release_error).__name__}: {release_error}"
+                                # 保留原对象供外层再清理；清理错误不能替代当前 reset／进程证明。
+                            else:
+                                native_player = None
                     else:
                         self.play(events, epoch, offset_ms, report, directory)
                 except Exception as error:
@@ -1521,6 +1573,14 @@ class SoloLive:
                         raise
                     playback_error = error
                     report["playback_error"] = f"{type(error).__name__}: {error}"
+                    if (engine == "native" and getattr(self, "native_startup_guard", False)
+                            and isinstance(error, NativeStartupRejected)
+                            and report["playback"].get("sent_actions") == 0
+                            and report["playback"].get("executed_actions") == 0):
+                        startup_failed = True
+                        if startup_release_failure is not None:
+                            raise error from startup_release_failure
+                        raise
                 report["life_monitor"] = {"samples": self.life_guard.samples,
                                            "zero_confirmed": self.life_guard.zero_confirmed}
                 if isinstance(playback_error, LifeDepleted):
