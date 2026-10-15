@@ -31,6 +31,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
     private bool _cancelRequested;
     private string? _resultToken;
     private JObject? _runResult;
+    private Action<string>? _automaticProgress;
 
     [ObservableProperty] private string _catalogText = "本地尚未同步日服谱面";
     [ObservableProperty] private string _statusText = "停止演出任务后，可在这里增量更新谱面。";
@@ -92,6 +93,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
         while (_progressLines.Count > 120)
             _progressLines.Dequeue();
         ProgressText = string.Join(Environment.NewLine, _progressLines);
+        _automaticProgress?.Invoke(line.Length <= 120 ? line : line[..120]);
     }
 
     private async Task PumpAsync(StreamReader stream, CancellationToken token)
@@ -119,19 +121,24 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
     [RelayCommand]
     private Task CheckRecentAsync() => RunSyncAsync(checkRecent: true);
 
-    private async Task RunSyncAsync(bool checkRecent)
+    internal Task<bool> RunAutomaticSyncAsync(CancellationToken token, MFAAvalonia.Extensions.MaaFW.MaaProcessor? owner) => RunSyncAsync(false, true, token, owner);
+
+    private async Task<bool> RunSyncAsync(bool checkRecent, bool automatic = false, CancellationToken token = default,
+        MFAAvalonia.Extensions.MaaFW.MaaProcessor? owner = null)
     {
-        if (Instances.InstanceTabBarViewModel.Tabs.Any(tab => tab.IsRunning))
+        if (!automatic && Instances.InstanceTabBarViewModel.Tabs.Any(tab => tab.IsRunning))
         {
             StatusText = "请先停止所有演出任务，再同步谱面。";
-            return;
+            return false;
         }
-        if (!ChartCatalogMaintenance.TryBegin())
+        if (!(automatic ? MaaPjskMaintenance.TryBeginPreparation(owner) : ChartCatalogMaintenance.TryBegin()))
         {
             StatusText = "另一个谱面同步操作正在进行。";
-            return;
+            return false;
         }
         IsSyncing = true;
+        _automaticProgress = automatic && owner is not null
+            ? line => owner.ViewModel?.SetCurrentTaskName("更新谱面：" + line) : null;
         _cancelRequested = false;
         _progressLines.Clear();
         ProgressText = string.Empty;
@@ -142,6 +149,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
         var completionTitle = "谱面同步失败";
         string? completionStatistics = null;
         var completionStatus = string.Empty;
+        var accepted = false;
         try
         {
             var config = await LoadConfigAsync();
@@ -161,7 +169,9 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
                 startInfo.ArgumentList.Add("--check-recent");
             startInfo.Environment["PYTHONUTF8"] = "1";
             startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
-            _cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(45));
+            _cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, MaaPjskFirstLiveSync.ShutdownToken);
+            _cancellation.CancelAfter(TimeSpan.FromMinutes(45));
+            _cancellation.Token.ThrowIfCancellationRequested();
             _process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动谱面同步器");
             // 同时读取两条流，避免大量错误堵塞同步器；进度保持在 UI 线程更新。
             await Task.WhenAll(PumpAsync(_process.StandardOutput, _cancellation.Token),
@@ -178,6 +188,7 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
             if (exitCode is 0 or 2 && _runResult?.Value<int?>("exit_code") == exitCode
                 && _runResult["summary"] is JObject summary)
             {
+                accepted = !automatic || await VerifyCompleteManifestAsync(config, summary);
                 completionType = exitCode == 0 ? NotificationType.Success : NotificationType.Warning;
                 completionTitle = exitCode == 0 ? "谱面同步完成" : "谱面同步部分失败";
                 completionStatistics = $"本次资源（谱面与封面）：新增 {summary.Value<int?>("added") ?? 0} / "
@@ -194,14 +205,21 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
                 completionType = NotificationType.Information;
                 completionTitle = "谱面同步已取消";
             }
+            if (automatic && !accepted && exitCode is 0 or 2)
+            {
+                StatusText = "同步结果未能确认完整索引，演出未启动；下次启动将重试。";
+                completionType = NotificationType.Error;
+                completionTitle = "谱面同步失败";
+            }
         }
         catch (OperationCanceledException)
         {
             StopProcess();
-            StatusText = _cancelRequested ? "已取消；下次同步会复用已校验的下载。" : "同步超过 45 分钟，已停止；可再次同步续传。";
+            var cancelled = _cancelRequested || token.IsCancellationRequested || MaaPjskFirstLiveSync.ShutdownToken.IsCancellationRequested;
+            StatusText = cancelled ? "已取消；下次同步会复用已校验的下载。" : "同步超过 45 分钟，已停止；可再次同步续传。";
             AppendProgress(StatusText);
-            completionType = _cancelRequested ? NotificationType.Information : NotificationType.Error;
-            completionTitle = _cancelRequested ? "谱面同步已取消" : "谱面同步超时";
+            completionType = cancelled ? NotificationType.Information : NotificationType.Error;
+            completionTitle = cancelled ? "谱面同步已取消" : "谱面同步超时";
         }
         catch (Exception error)
         {
@@ -222,9 +240,42 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
             _cancellation = null;
             ChartCatalogMaintenance.End();
             IsSyncing = false;
+            _automaticProgress = null;
             await RefreshAsync();
         }
         // 完成通知属于本次进程结果；先清理进程、解锁并刷新，不用旧索引冒充本次成功。
+        var notification = ShowCompletionAsync(completionType, completionTitle, completionStatus, completionStatistics);
+        // 自动前置更新保留完成弹窗，但后续演出不依赖用户关闭它或已有弹窗。
+        if (!automatic) await notification;
+        return accepted && !_cancelRequested && !token.IsCancellationRequested;
+    }
+
+    private static async Task<bool> VerifyCompleteManifestAsync(JObject config, JObject summary)
+    {
+        var manifest = JObject.Parse(await File.ReadAllTextAsync(Required(config, "manifest_path")));
+        string[] difficulties = ["easy", "normal", "hard", "expert", "master", "append"];
+        string[] counts = ["indexed_songs", "stored_songs", "songs_with_charts", "charts", "jackets", "skipped_unpublished",
+            "added", "updated", "reused", "unchanged", "downloaded", "downloaded_bytes", "stale", "recoverable_errors", "fatal_errors"];
+        if (manifest.Value<int?>("schema_version") != 1 || manifest.Value<string>("game") != "project-sekai"
+            || manifest.Value<string>("server") != "jp" || manifest["scope"]?["song_ids"]?.Type != JTokenType.Null
+            || manifest["scope"]?["difficulties"] is not JArray requested || requested.Count != 6
+            || !requested.Values<string>().Order().SequenceEqual(difficulties.Order())
+            || manifest["sync"]?.Value<string>("mode") != "incremental"
+            || manifest["songs"] is not JArray songs || manifest["summary"] is not JObject persisted
+            || !JToken.DeepEquals(summary, persisted) || counts.Any(name => summary[name]?.Type != JTokenType.Integer
+                || summary.Value<long>(name) < 0) || summary.Value<long>("fatal_errors") != 0) return false;
+        // 这里只核对完整索引的元数据结构，不重复读取或计算已校验资源正文的哈希。
+        if (songs.Any(song => song["charts"] is not JObject || song["errors"] is not JArray)) return false;
+        return summary.Value<long>("stored_songs") == songs.Count
+            && summary.Value<long>("songs_with_charts") == songs.Count(song => ((JObject)song["charts"]!).Count > 0)
+            && summary.Value<long>("charts") == songs.Sum(song => ((JObject)song["charts"]!).Count)
+            && summary.Value<long>("jackets") == songs.Count(song => song["jacket"] is JObject)
+            && summary.Value<long>("recoverable_errors") == songs.Sum(song => ((JArray)song["errors"]!).Count);
+    }
+
+    private static async Task ShowCompletionAsync(NotificationType completionType, string completionTitle,
+        string completionStatus, string? completionStatistics)
+    {
         var manager = Instances.DialogManager;
         var completion = manager.CreateDialog().OfType(completionType).WithTitle(completionTitle)
             .WithContent(completionStatus + Environment.NewLine
@@ -240,7 +291,8 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
             {
                 if (completion.TryShow())
                     break;
-                await dismissed.Task;
+                try { await dismissed.Task.WaitAsync(MaaPjskFirstLiveSync.ShutdownToken); }
+                catch (OperationCanceledException) { return; }
             }
             finally
             {
@@ -253,6 +305,13 @@ public sealed partial class ChartCatalogSettingsUserControlModel : ViewModelBase
     {
         if (_process is not null && !_process.HasExited)
             _process.Kill(entireProcessTree: true);
+    }
+
+    internal void ShutdownProcess()
+    {
+        _cancellation?.Cancel();
+        StopProcess();
+        _process?.WaitForExit();
     }
 
     [RelayCommand]

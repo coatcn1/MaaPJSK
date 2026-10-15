@@ -33,6 +33,18 @@ public static class MaaPjskMaintenance
         }
     }
     public static void End() { lock (Sync) _maintenance = false; }
+    public static bool TryBeginPreparation(MaaProcessor? owner)
+    {
+        lock (Sync)
+        {
+            // 唯一启动租约仍持有时才允许前置同步；其他实例不能共享取消源或跨过维护。
+            if (_maintenance || _executing != 1 || MaaProcessor.Processors.Any(p =>
+                (p != owner && p.TaskQueue.Count > 0) || p.IsConnecting
+                || p.MaaTasker?.IsRunning == true || p.MaaTasker?.IsStopping == true)) return false;
+            _maintenance = true;
+            return true;
+        }
+    }
     public static IDisposable BeginExecution()
     {
         lock (Sync)

@@ -7,7 +7,7 @@ public partial class ChartCatalogSettingsUserControl : UserControl
 {
     public ChartCatalogSettingsUserControl()
     {
-        var model = new ChartCatalogSettingsUserControlModel();
+        var model = MFAAvalonia.Helper.MaaPjskFirstLiveSync.Model;
         DataContext = model;
         InitializeComponent();
         Loaded += (_, _) => model.RefreshCommand.Execute(null);
