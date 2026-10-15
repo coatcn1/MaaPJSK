@@ -16,7 +16,7 @@ import numpy as np
 
 from .chart_catalog import ChartRepository
 from .diagnostics import write_json as _write_json, make_directory, enabled
-from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context
+from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context, gold_tap_following_context, gold_tap_slide_following_context
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
@@ -98,6 +98,10 @@ class SoloLive:
         self.matcher = SongMatcher(self.repository, self.ocr)
         self.report_root = report_root
         self.completed_rounds = 0
+        # 仅单人 Native 保护回调默认使用快路径；初始化冻结，仅明确 0 回退，不改变首音及导航观察。
+        self.native_hud_fastpath = os.environ.get("MAAPJSK_SOLO_NATIVE_HUD_FASTPATH") != "0"
+        # 启动保护统一控制实际余量、同帧 HUD 快路径与零派发中止；默认开启，初始化冻结，仅明确 0 回退。
+        self.native_startup_guard = os.environ.get("MAAPJSK_SOLO_NATIVE_STARTUP_GUARD") != "0"
 
     def screenshot(self):
         self.navigator._check_stop()
@@ -115,11 +119,12 @@ class SoloLive:
                 raise RuntimeError("游戏已返回 TAP TO START 标题页，停止结算返回")
         return frame
 
-    def native_observation_options(self, directory):
+    def native_observation_options(self, directory, *, observer=None):
         if os.environ.get("MAAPJSK_NATIVE_ASYNC_OBSERVATION") != "1":
             return {}
+        observer = self.observe_play_state if observer is None else observer
         return {"async_observation": True, "observation_request": self.device.controller.post_screencap,
-                "captured_frame_observer": lambda frame, requested_at: self.observe_play_state(
+                "captured_frame_observer": lambda frame, requested_at: observer(
                     directory, frame=frame, requested_at=requested_at),
                 "observation_invalidated": self.invalidate_play_observation}
 
@@ -712,8 +717,11 @@ class SoloLive:
 
     def start(self, chart, identity, report: dict, directory: Path, *, ready_action=None, frame_guard=None,
               identity_phase="final", on_final_identity=None, opening_timeout=120, wait_for_opening=False,
-              opening_deadline_provider=None) -> float:
+              opening_deadline_provider=None, native_start_target=None, native_start_fastpath=False) -> float:
         self.device.preflight()
+        startup_fastpath = native_start_target is not None and native_start_fastpath
+        if native_start_target is not None:
+            report["native_startup_hud_fastpath"] = {"enabled": startup_fastpath, "accepted_frames": 0, "fallback_frames": 0}
         self.preplay_life_frames = deque(maxlen=8)
         if ready_action is None:
             self.navigator.tap(1013, 563, "开始单人谱面演出")
@@ -729,7 +737,9 @@ class SoloLive:
         minimum_samples = 4 if report.get("engine") == "native" else 2
         anchor = (StartAnchor(chart.first, minimum_samples=minimum_samples,
                               simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
-                              dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else ())
+                              dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else (),
+                              gold_tap_following_gestures=gold_tap_following_context(chart) if getattr(chart, "gestures", None) else (),
+                              gold_tap_slide_following_gestures=gold_tap_slide_following_context(chart) if getattr(chart, "gestures", None) else ())
                   if chart is not None else None)
         loading_saved = False
         last_error = ""
@@ -778,7 +788,18 @@ class SoloLive:
         frame = None
         while time.monotonic() < (opening_deadline_provider() if final is None and opening_deadline_provider is not None else deadline):
             before = time.perf_counter()
-            frame = self.screenshot()
+            hud_playing = False
+            if startup_fastpath and final is not None:
+                self.navigator._check_stop()
+                frame = self.device.screenshot()
+                self.navigator._check_stop()
+                hud_playing = self.native_hud_visible(frame)
+                counters = report["native_startup_hud_fastpath"]
+                counters["accepted_frames" if hud_playing else "fallback_frames"] += 1
+                if not hud_playing:
+                    frame = self.check_observation_frame(frame)
+            else:
+                frame = self.screenshot()
             self.observe_preplay_life(frame, before, report)
             if frame_guard is not None:
                 frame_guard(frame)
@@ -818,7 +839,9 @@ class SoloLive:
                         if anchor is None:
                             anchor = StartAnchor(chart.first, minimum_samples=minimum_samples,
                                                  simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
-                                                 dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else ())
+                                                 dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else (),
+                                                 gold_tap_following_gestures=gold_tap_following_context(chart) if getattr(chart, "gestures", None) else (),
+                                                 gold_tap_slide_following_gestures=gold_tap_slide_following_context(chart) if getattr(chart, "gestures", None) else ())
                     final = candidate
                     if opening_deadline_provider is not None:
                         # 房间等待可由调用方按正向进展计时；最终身份确认后固定窗口，不再延展首音。
@@ -835,7 +858,7 @@ class SoloLive:
                         raise RuntimeError(f"两个识别阶段均未确认歌曲，未派发谱面输入：{last_error}")
                     self.pause(.02)
                     continue
-            if self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
+            if hud_playing or self.navigator.match(frame, "playing")[0] >= self.navigator.threshold:
                 captured_frames.append((captured_at, frame.copy()))
                 if len(captured_frames) > 32:
                     # 长前奏会占满最初的空帧；保留原始基线和最近轨迹，确保失败后仍能回放首音。
@@ -858,10 +881,23 @@ class SoloLive:
                         report["start_anchor"]["trajectory_rate"] = float(np.polyfit(
                             np.array([when - origin for when, _ in samples]),
                             np.log(np.array([y + 30 for _, y in samples])), 1)[0])
-                    # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
-                    print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
                     # 锚点建立后不在触控前编码截图，避免错过第一音；结算时再保存证据。
                     self.anchor_frames = retained_anchor_frames()
+                    if native_start_target is not None:
+                        first_time, frozen_offset_ms = native_start_target
+                        first_target = float(epoch + first_time + frozen_offset_ms / 1000)
+                        checked_at = time.perf_counter()
+                        # 拟合可能返回 NumPy 标量；正式报告须保留 JSON 可序列化的 Python 数值和布尔值。
+                        remaining = float(first_target - checked_at)
+                        report["startup_handoff"] = {"first_target_s": first_target, "checked_at_s": checked_at,
+                            "remaining_ms": remaining * 1000, "required_margin_ms": 80., "accepted": bool(remaining >= .080)}
+                        # 拟合时的请求开始时间不能证明当前仍可启动；负偏移及首 Flick 提前量都包含在真实首条目标中。
+                        if remaining < .080:
+                            anchor.failure_reason = "native_start_handoff_margin"
+                            update_anchor_attempt(failed=True)
+                            raise RuntimeError("首音实际启动余量不足，拒绝从歌曲中途开始")
+                    # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
+                    print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
                     return epoch
             self.pause(.002)
         if frame is not None:
@@ -1023,6 +1059,32 @@ class SoloLive:
     def observe_play_state(self, directory: Path, *, frame=None, requested_at=None):
         requested_at = time.perf_counter() if requested_at is None else requested_at
         frame = self.screenshot() if frame is None else self.check_observation_frame(frame)
+        self.observe_play_state_frame(directory, frame, requested_at)
+
+    def observe_native_play_state(self, directory: Path, *, frame=None, requested_at=None):
+        if not getattr(self, "native_hud_fastpath", False):
+            return self.observe_play_state(directory, frame=frame, requested_at=requested_at)
+        requested_at = time.perf_counter() if requested_at is None else requested_at
+        self.navigator._check_stop()
+        frame = self.device.screenshot() if frame is None else frame
+        self.navigator._check_stop()
+        # 同一帧的两个固定 HUD 都明确才省去全屏检查；未知、缺标签及转场沿原策略。
+        hud_confirmed = self.native_hud_visible(frame)
+        report = getattr(self, "last_report", None)
+        if isinstance(report, dict):
+            counters = report.setdefault("native_hud_fastpath", {"enabled": True, "accepted_frames": 0, "fallback_frames": 0})
+            counters["accepted_frames" if hud_confirmed else "fallback_frames"] += 1
+        if not hud_confirmed:
+            frame = self.check_observation_frame(frame)
+        self.observe_play_state_frame(directory, frame, requested_at)
+
+    def native_hud_visible(self, frame):
+        return (not blank_transition(frame)
+                and "life_hud" in self.navigator.templates
+                and self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] >= self.navigator.threshold
+                and self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0] >= self.navigator.threshold)
+
+    def observe_play_state_frame(self, directory: Path, frame, requested_at):
         # 诊断仅保留已有采样，不增加截图或改变输入；整局保存也限定在 180 秒内。
         capture_limit = 180 if os.environ.get("MAAPJSK_DIAGNOSTIC_FULL_LIFE_FRAMES") == "1" else 8
         if requested_at - self.life_epoch < capture_limit:
@@ -1094,6 +1156,126 @@ class SoloLive:
                 self.device.back()
             self.pause(.6)
         raise RuntimeError("生命归零已停止触控，但退出页面未确认；保留截图并停止任务")
+
+    def startup_pause_action(self, frame, *, reject_partial=False):
+        # 暂停模态后面仍有暂停按钮和 LIFE；须由三个明确且有序的按钮证明，不能靠 HUD 消失。
+        points = [self.dialog_action(frame, {label}) for label in ("リタイア", "リトライ", "ライブに戻る")]
+        if (any(point is None for point in points) or not points[0][0] < points[1][0] < points[2][0]
+                or max(point[1] for point in points) - min(point[1] for point in points) > 25):
+            if reject_partial and any(point is not None for point in points):
+                raise RuntimeError("暂停模态按钮未完整确认，禁止再次点击暂停或盲退出")
+            return None
+        return points[0]
+
+    def startup_retire_confirmation(self, frame):
+        cancel = self.dialog_action(frame, {"キャンセル"})
+        retire = self.dialog_action(frame, {"リタイア"})
+        if cancel is None or retire is None or not cancel[0] < retire[0] or abs(cancel[1] - retire[1]) > 25:
+            return None
+        # 真实二次确认仍叫リタイア；原暂停三按钮或残留暂停按钮不能变成另一请求。
+        if any(self.dialog_action(frame, {label}) is not None for label in ("リトライ", "ライブに戻る")):
+            return None
+        return cancel, retire
+
+    def abort_failed_startup(self, report: dict, directory: Path):
+        abort = report["startup_abort"] = {"reason": "startup_recognition_failed", "original_error": report.get("error"),
+                                           "confirmed": False, "status": "checking", "pause_requests": 0,
+                                           "retire_requests": 0, "confirm_requests": 0, "back_requests": 0}
+        if report.get("release_error") or not release_finished(report):
+            abort["status"] = "release_unconfirmed"
+            return False
+
+        def check_control():
+            if self.stop_requested():
+                raise InterruptedError("用户已停止任务")
+            if report.get("release_error") or not release_finished(report):
+                raise RuntimeError("开场中止的当前触点释放未确认，禁止页面输入")
+
+        def page_state(frame):
+            if blank_transition(frame):
+                return [], False, False
+            pages = [name for name in ("home", "song_select", "prepare", "live_menu", "live_failed")
+                     if name in self.navigator.templates and self.navigator.match(frame, name)[0] >= self.navigator.threshold]
+            pause_visible = self.navigator.match(frame, "playing", (1190, 10, 1256, 80))[0] >= self.navigator.threshold
+            life_visible = ("life_hud" in self.navigator.templates
+                            and self.navigator.match(frame, "life_hud", LIFE_HUD_AREA)[0] >= self.navigator.threshold)
+            return pages, pause_visible, life_visible
+
+        check_control()
+        frame = self.screenshot()
+        pages, pause_visible, life_visible = page_state(frame)
+        if blank_transition(frame) or pages:
+            abort["status"] = "page_unconfirmed"
+            return False
+        retire = self.startup_pause_action(frame, reject_partial=True)
+        if retire is None and not (pause_visible and life_visible):
+            abort["status"] = "page_unconfirmed"
+            return False
+        report["live_status"] = "startup_aborted"
+        report["completed"] = False
+        self.log("开场识别失败：触点已释放，安全暂停并退出本局；保留原错误，本局不计数")
+        if retire is None:
+            fresh = self.screenshot()
+            fresh_pages, fresh_pause, fresh_life = page_state(fresh)
+            if blank_transition(fresh) or fresh_pages:
+                abort["status"] = "page_unconfirmed"
+                return False
+            retire = self.startup_pause_action(fresh, reject_partial=True)
+            if retire is None and not (fresh_pause and fresh_life):
+                abort["status"] = "page_unconfirmed"
+                return False
+        if retire is None:
+            # 暂停只请求一次；失败回执或迟到的画面不能授权后续退出点击。
+            check_control()
+            abort["pause_requests"] = 1
+            self.navigator.tap(1223, 44, "开场识别失败后暂停单人演出")
+            self.pause(.4)
+        else:
+            abort["pause_already_visible"] = True
+        phase = "pause"
+        deadline = time.monotonic() + 25
+        for attempt in range(48):
+            if time.monotonic() >= deadline:
+                break
+            check_control()
+            frame = self.screenshot()
+            pages, pause_visible, life_visible = page_state(frame)
+            write_image(directory / f"startup-abort-{attempt:02d}.png", frame)
+            if len(pages) == 1 and not pause_visible and not life_visible:
+                page = pages[0]
+                if page == "home":
+                    abort.update(confirmed=True, status="confirmed", page="home")
+                    return True
+                if page in {"song_select", "prepare", "live_menu"} and abort["back_requests"] < 12:
+                    fresh = self.screenshot()
+                    if page_state(fresh) == ([page], False, False):
+                        check_control()
+                        abort["back_requests"] += 1
+                        self.device.back()
+                        self.pause(.6)
+                        continue
+            if pages or blank_transition(frame):
+                self.pause(.6)
+                continue
+            action = (self.startup_pause_action(frame) if phase == "pause" else
+                      self.startup_retire_confirmation(frame) if phase == "confirm" and abort["retire_requests"] == 1
+                      and abort["confirm_requests"] == 0 else None)
+            if action is not None:
+                # 每次模态输入前复取新帧；未知转场、标签冲突和变化后的按钮都不能沿用旧坐标。
+                fresh = self.screenshot()
+                fresh_pages, _, _ = page_state(fresh)
+                confirmed = (self.startup_pause_action(fresh) if phase == "pause" else
+                             self.startup_retire_confirmation(fresh))
+                if not fresh_pages and not blank_transition(fresh) and confirmed == action:
+                    check_control()
+                    key = "retire_requests" if phase == "pause" else "confirm_requests"
+                    point = action if phase == "pause" else action[1]
+                    abort[key] += 1
+                    phase = "confirm" if phase == "pause" else "home"
+                    self.navigator.tap(*point, "开场中止：退出单人演出" if key == "retire_requests" else "开场中止：确认退出")
+            self.pause(.6)
+        abort["status"] = "exit_unconfirmed"
+        return False
 
     def play(self, events, epoch: float, offset_ms: int, report: dict, directory: Path):
         def observe_state():
@@ -1293,6 +1475,8 @@ class SoloLive:
         if engine not in {"legacy", "native"}:
             raise ValueError("演奏引擎无效")
         self.completed_rounds = 0
+        # 开场中止保护默认开启并在同一次任务冻结；仅明确 0 回退，原两帧生命零保护不受影响。
+        startup_abort_enabled = os.environ.get("MAAPJSK_SOLO_STARTUP_ABORT_GUARD") != "0"
         # 普通 run 每次都是新任务；校准的排练与验证显式共用同一个任务快照。
         bonus_snapshot = {} if _bonus_snapshot is None else _bonus_snapshot
         reports = []
@@ -1301,6 +1485,7 @@ class SoloLive:
         self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}")
         for round_index in range(1, count + 1):
             native_player = None
+            startup_failed = False
             self.life_guard = LifeGuard()
             self.life_frames = []
             self.playback_evidence_frames = {}
@@ -1312,6 +1497,11 @@ class SoloLive:
                       "requested_bonus_consumption": bonus_consumption,
                       "recovery_settings": {"mode": recovery_mode, "count": recovery_count}}
             report["engine"] = engine
+            report["startup_abort_enabled"] = startup_abort_enabled
+            if engine == "native":
+                report["native_startup_guard"] = getattr(self, "native_startup_guard", False)
+                report["native_hud_fastpath"] = {"enabled": getattr(self, "native_hud_fastpath", False),
+                                                "accepted_frames": 0, "fallback_frames": 0}
             if expected_song_id is not None:
                 report.update(requested_song_name=song_name, expected_song_id=expected_song_id)
             self.last_report = report
@@ -1334,29 +1524,52 @@ class SoloLive:
                 self.prepare_playback(report)
                 self.ensure_bonus_available(recovery_mode, recovery_count, report, directory)
                 if engine == "native":
-                    from .native_player import NativePlayer
+                    from .native_player import NativePlayer, NativeStartupRejected
                     native_player = NativePlayer(self.device.controller, events, directory, self.stop_requested,
                                                  latency_offsets=latency_offsets,
-                                                 idle_observer=lambda: self.observe_play_state(directory),
-                                                 **self.native_observation_options(directory))
+                                                 idle_observer=lambda: self.observe_native_play_state(directory),
+                                                 **self.native_observation_options(directory, observer=self.observe_native_play_state))
                     # 开场死亡也须清理同一个已准备对象，并保留零派发的释放证明。
                     report["playback"] = native_player.report
                     native_player.prepare()
                 self.log("点击开始后持续等待加载与开场封面；确认歌曲、标题和难度后同步首音")
-                epoch = self.start(chart, identity, report, directory)
+                try:
+                    startup_options = ({"native_start_target": (events[0].time, offset_ms), "native_start_fastpath": True}
+                                       if native_player is not None and getattr(self, "native_startup_guard", False) and events else {})
+                    epoch = self.start(chart, identity, report, directory, **startup_options)
+                except Exception:
+                    startup_failed = True
+                    raise
                 self.life_epoch = epoch
                 if calibration_profile is not None:
                     verify_profile_anchor(calibration_profile, report)
                 _write_json(directory / "report.json", report)
                 playback_error = None
+                startup_release_failure = None
                 try:
                     if native_player is not None:
                         report["playback"] = native_player.report
                         try:
                             native_player.play(epoch, offset_ms)
+                        except NativeStartupRejected as startup_error:
+                            if (getattr(self, "native_startup_guard", False)
+                                    and report["playback"].get("sent_actions") == 0
+                                    and report["playback"].get("executed_actions") == 0):
+                                # 清理也可能抛错，须在清理前冻结原零派发拒绝，禁止转入结算。
+                                startup_failed = True
+                                report["playback_error"] = f"{type(startup_error).__name__}: {startup_error}"
+                            raise
                         finally:
-                            native_player.close()
-                            native_player = None
+                            try:
+                                native_player.close()
+                            except Exception as release_error:
+                                if not startup_failed:
+                                    raise
+                                startup_release_failure = release_error
+                                report["release_error"] = f"{type(release_error).__name__}: {release_error}"
+                                # 保留原对象供外层再清理；清理错误不能替代当前 reset／进程证明。
+                            else:
+                                native_player = None
                     else:
                         self.play(events, epoch, offset_ms, report, directory)
                 except Exception as error:
@@ -1364,6 +1577,14 @@ class SoloLive:
                         raise
                     playback_error = error
                     report["playback_error"] = f"{type(error).__name__}: {error}"
+                    if (engine == "native" and getattr(self, "native_startup_guard", False)
+                            and isinstance(error, NativeStartupRejected)
+                            and report["playback"].get("sent_actions") == 0
+                            and report["playback"].get("executed_actions") == 0):
+                        startup_failed = True
+                        if startup_release_failure is not None:
+                            raise error from startup_release_failure
+                        raise
                 report["life_monitor"] = {"samples": self.life_guard.samples,
                                            "zero_confirmed": self.life_guard.zero_confirmed}
                 if isinstance(playback_error, LifeDepleted):
@@ -1373,14 +1594,21 @@ class SoloLive:
                     raise playback_error
                 report["phase"] = "settlement"
                 _write_json(directory / "report.json", report)
-                self.collect(report, directory)
+                try:
+                    self.collect(report, directory)
+                except Exception as settlement_error:
+                    report["settlement_error"] = f"{type(settlement_error).__name__}: {settlement_error}"
+                    # 结算失败是后续证据，不能覆盖先发生的输入错误；用户停止仍优先。
+                    if playback_error is not None and not self.stop_requested() and not isinstance(settlement_error, InterruptedError):
+                        raise playback_error from settlement_error
+                    raise
                 if playback_error is not None:
                     report["completed"] = False
                     raise playback_error
             except Exception as error:
                 report["completed"] = False
                 report["error"] = f"{type(error).__name__}: {error}"
-                report["cancelled"] = self.stop_requested()
+                report["cancelled"] = self.stop_requested() or isinstance(error, InterruptedError)
                 if not self.stop_requested() and not report.get("preplay_death_confirmed"):
                     try:
                         write_image(directory / "failure.png", self.device.screenshot())
@@ -1397,9 +1625,11 @@ class SoloLive:
                         report["release_error"] = f"{type(release_error).__name__}: {release_error}"
                         self.finish_performance_trace(report, directory)
                         _write_json(directory / "report.json", report)
-                        if not report.get("preplay_death_confirmed"):
+                        if not report.get("preplay_death_confirmed") and not startup_failed:
                             raise
                 followup_death = False
+                if self.stop_requested():
+                    report["cancelled"] = True
                 if not report.get("start_anchor") and not report.get("playback") and engine == "legacy":
                     report["playback"] = {"engine": "legacy", "sent_actions": 0, "executed_actions": 0,
                                           "release_confirmed": True, "release": {"release_proof": "no-gameplay-started"}}
@@ -1423,6 +1653,16 @@ class SoloLive:
                             report["exit_error"] = f"{type(exit_error).__name__}: {exit_error}"
                     else:
                         report.setdefault("release_error", "开场死亡的当前触点释放未确认，禁止页面退出")
+                elif startup_failed and startup_abort_enabled and not report.get("cancelled") and not self.stop_requested():
+                    # 仅本单人 run 的启动失败进入安全中止；共用 start 的协力和一键调用不扩大。
+                    try:
+                        self.abort_failed_startup(report, directory)
+                    except Exception as abort_error:
+                        if isinstance(abort_error, InterruptedError) or self.stop_requested():
+                            report["cancelled"] = True
+                        abort = report.setdefault("startup_abort", {})
+                        abort.update(confirmed=False, status="cancelled" if report.get("cancelled") else "failed",
+                                     error=f"{type(abort_error).__name__}: {abort_error}")
                 self.save_preplay_life_evidence(report, directory)
                 self.save_playback_evidence(report, directory)
                 self.finish_performance_trace(report, directory)

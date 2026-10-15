@@ -154,7 +154,22 @@ class ProjectSekaiSoloLive(CustomAction):
                 completed = workflow.completed_rounds if workflow else 0
                 count = settings.get("count", 0) if settings else 0
                 try:
-                    visible_log(context, f"单人谱面演出中止：已完成 {completed} / 总数 {count}；{error}")
+                    report = getattr(workflow, "last_report", {}) if workflow else {}
+                    identity = report.get("preparation_identity", {})
+                    title = identity.get("title")
+                    difficulty = report.get("requested_difficulty", settings.get("difficulty") if settings else None)
+                    details = []
+                    if title:
+                        details.append(f"歌曲 {title}，{str(difficulty).upper()}" if difficulty else f"歌曲 {title}")
+                    playback = report.get("playback", {})
+                    if playback.get("executed_actions") is not None and playback.get("planned_actions") is not None:
+                        details.append(f"输入已执行 {playback['executed_actions']} / {playback['planned_actions']}")
+                    if report.get("playback_error"):
+                        details.append(f"原输入异常：{report['playback_error']}")
+                    if report.get("settlement_error"):
+                        details.append(f"结算异常：{report['settlement_error']}")
+                    details.append(str(error))
+                    visible_log(context, f"单人谱面演出中止：已完成 {completed} / 总数 {count}；{'；'.join(details)}")
                 except Exception:
                     traceback.print_exc()
             traceback.print_exc()

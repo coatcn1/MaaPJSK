@@ -1,5 +1,6 @@
 from datetime import datetime
 import csv
+import os
 from pathlib import Path
 import time
 from uuid import uuid4
@@ -41,6 +42,11 @@ def append_one_shot_result_index(root, directory, report):
 
 
 class OneShotLive(SoloLive):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # 一键入口独立冻结开场保护，不沿用单人的模式开关；仅明确 0 回退。
+        self.one_shot_native_startup_guard = os.environ.get("MAAPJSK_ONE_SHOT_NATIVE_STARTUP_GUARD") != "0"
+
     def screenshot(self):
         # 等待入口不导航，也不因其他游戏页面而提前结束；只检查取消与截图连接。
         self.navigator._check_stop()
@@ -131,6 +137,7 @@ class OneShotLive(SoloLive):
         report = {"schema_version": 1, "mode": "one_shot", "started_at": datetime.now().astimezone().isoformat(),
                   "requested_difficulty": difficulty, "difficulty_source": "task_setting", "engine": engine,
                   "timing_offset_ms": offset_ms, "opening_timeout_seconds": OPENING_WAIT_SECONDS,
+                  "one_shot_native_startup_guard": getattr(self, "one_shot_native_startup_guard", False),
                   "completed": False, "phase": "waiting_opening", "result_status": "not_collected",
                   "report_path": str(directory / "report.json") if enabled() else None}
         self.last_report = report
@@ -138,6 +145,7 @@ class OneShotLive(SoloLive):
         self.life_guard, self.life_frames, self.anchor_frames = LifeGuard(), [], []
         self.playback_evidence_frames = {}
         events, native_player = None, None
+        native_start_target = ([] if engine == "native" and report["one_shot_native_startup_guard"] else None)
 
         def prepare_chart(identity):
             nonlocal events, native_player
@@ -148,6 +156,9 @@ class OneShotLive(SoloLive):
                 self.set_performance_trace_plan(events)
             except (KeyError, FileNotFoundError, ValueError) as error:
                 raise MissingOneShotChart(f"本地歌曲 {identity.song_id} 的 {difficulty.upper()} 谱面缺失或校验失败：{error}") from error
+            if native_start_target is not None and not native_start_target:
+                # 最终身份、本地校验及编译成功后才填充一次；复用实际首条触控，包含 Flick 提前量与冻结偏移。
+                native_start_target.extend((events[0].time, offset_ms))
             report["chart"] = {key: entry[key] for key in ("music_id", "difficulty", "sha256", "path", "total_note_count")}
             report["chart"].update(duration=chart.duration, planned_actions=len(events))
             report["phase"] = "anchor"
@@ -174,9 +185,11 @@ class OneShotLive(SoloLive):
         try:
             try:
                 self.log(f"一键演出：最长等待 5 分钟最终封面；{difficulty.upper()}，{engine}，偏移 {offset_ms} ms")
+                startup_options = ({"native_start_target": native_start_target, "native_start_fastpath": True}
+                                   if native_start_target is not None else {})
                 epoch = self.start(None, None, report, directory, ready_action=lambda: None,
                                    identity_phase="one_shot_final", on_final_identity=prepare_chart,
-                                   opening_timeout=OPENING_WAIT_SECONDS, wait_for_opening=True)
+                                   opening_timeout=OPENING_WAIT_SECONDS, wait_for_opening=True, **startup_options)
                 self.life_epoch = epoch
                 report["phase"] = "playing"
                 _write_json(directory / "report.json", report)

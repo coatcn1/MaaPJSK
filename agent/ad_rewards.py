@@ -44,7 +44,15 @@ class ProjectSekaiAdRewards(CustomAction):
                 return False
             from project_sekai.diagnostics import load_policy
             load_policy(Path(__file__).resolve().parents[1])
-            create_workflow(context, Path(__file__).resolve().parents[1]).run()
+            report = create_workflow(context, Path(__file__).resolve().parents[1]).run()
+            if context.tasker.stopping:
+                return False
+            if not isinstance(report, dict):
+                raise RuntimeError("广告任务未返回有效结果，无法确认本次循环完成")
+            if report.get('completed') is not True:
+                reason = report.get('error') or '本次广告点击循环未完整结束'
+                visible_log(context, f"广告奖励中止：{reason}")
+                return False
             return True
         except InterruptedError:
             return False

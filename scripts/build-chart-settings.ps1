@@ -96,6 +96,7 @@ $shutdown = @'
 private void OnShutdownRequested(object sender, ShutdownRequestedEventArgs e)
     {
         SystemSleepHelper.Shutdown();
+        MaaPjskFirstLiveSync.Shutdown();
 '@
 [IO.File]::WriteAllText($appPath, [regex]::Replace($appSource, $shutdownPattern, $shutdown), [Text.UTF8Encoding]::new($false))
 

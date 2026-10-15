@@ -6,8 +6,8 @@
     "custom_action_param": {},
     "focus": {
       "Node.Action.Starting": {"content": "广告奖励开始：从主页地图前往スクランブル交差点", "display": ["log"]},
-      "Node.Action.Succeeded": {"content": "本次固定位置广告点击循环结束，领取数量未确认", "display": ["log", "toast"]},
-      "Node.Action.Failed": {"content": "广告奖励中止或等待超时，详情见任务报告", "display": ["log", "toast"]}
+      "Node.Action.Succeeded": {"content": "本次已请求开始 7 次，广告点击循环结束，领取数量未确认", "display": ["log", "toast"]},
+      "Node.Action.Failed": {"content": "广告奖励未完成或已停止，请查看任务内错误说明", "display": ["log", "toast"]}
     }
   },
   "AdRewardsLog": {"recognition": "DirectHit", "action": "DoNothing", "post_delay": 0}

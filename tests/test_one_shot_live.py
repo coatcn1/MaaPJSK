@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import one_shot_live as agent
 import solo_live as solo_agent
 import cooperative_live as cooperative_agent
 from project_sekai.life_monitor import LifeDepleted, LifeGuard
+import project_sekai.one_shot_live as one_shot_module
 from project_sekai.one_shot_live import MissingOneShotChart, OneShotLive, OPENING_WAIT_SECONDS
 from project_sekai.solo_live import SoloLive
 
@@ -112,6 +114,134 @@ class OneShotTests(unittest.TestCase):
         self.assertFalse(agent.ProjectSekaiOneShotLive().run(context, argv))
         self.assertNotIn(88, agent._SETTINGS)
 
+    def test_native_startup_guard_is_independent_and_frozen_at_initialization(self):
+        for value in (None, "", "0", "1", "false", "other"):
+            for solo_value in ("0", "1"):
+                with self.subTest(value=value, solo_value=solo_value), \
+                        patch.dict(os.environ, {"MAAPJSK_SOLO_NATIVE_STARTUP_GUARD": solo_value}, clear=True), \
+                        patch("project_sekai.solo_live.Navigator"), \
+                        patch("project_sekai.solo_live.ChartRepository"), \
+                        patch("project_sekai.solo_live.LineOcr"), patch("project_sekai.solo_live.SongMatcher"):
+                    if value is not None:
+                        os.environ["MAAPJSK_ONE_SHOT_NATIVE_STARTUP_GUARD"] = value
+                    workflow = OneShotLive(Mock(), Path("."), Path("."), Path("."), Path("."))
+                    os.environ["MAAPJSK_ONE_SHOT_NATIVE_STARTUP_GUARD"] = "1" if value == "0" else "0"
+                    self.assertEqual(workflow.one_shot_native_startup_guard, value != "0")
+                    self.assertEqual(workflow.native_startup_guard, solo_value != "0")
+
+    def test_native_startup_target_uses_validated_compiled_first_flick_and_manual_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.workflow(Path(directory))
+            workflow.one_shot_native_startup_guard = True
+            workflow.repository.load_chart.return_value += "\n#00052:11"
+            player = self.native()
+            original = workflow.start.side_effect
+
+            def start(*args, **kwargs):
+                target = kwargs["native_start_target"]
+                self.assertEqual(target, [])
+                self.assertTrue(kwargs["native_start_fastpath"])
+                workflow.repository.load_chart.assert_not_called()
+                os.environ["MAAPJSK_ONE_SHOT_NATIVE_STARTUP_GUARD"] = "0"
+                epoch = original(*args, **kwargs)
+                self.assertEqual(len(target), 2)
+                self.assertAlmostEqual(target[0], -.018)
+                self.assertEqual(target[1], -51)
+                return epoch
+
+            workflow.start.side_effect = start
+            with patch.dict(os.environ, {}), \
+                    patch("project_sekai.one_shot_live.compile_touches", wraps=one_shot_module.compile_touches) as compile_plan, \
+                    patch("project_sekai.native_player.NativePlayer", return_value=player) as create_player:
+                report = workflow.run("master", -51, engine="native")
+            compile_plan.assert_called_once()
+            events = create_player.call_args.args[1]
+            self.assertEqual(events[0].time, workflow.start.call_args.kwargs["native_start_target"][0])
+            workflow.repository.load_chart.assert_called_once_with(7, "master")
+            player.play.assert_called_once_with(123.0, -51)
+            self.assertTrue(report["one_shot_native_startup_guard"])
+            workflow.navigator.tap.assert_not_called()
+            workflow.device.tap.assert_not_called()
+            workflow.device.back.assert_not_called()
+            workflow.device.home.assert_not_called()
+
+    def test_disabled_or_legacy_startup_keeps_original_start_arguments(self):
+        for engine, guard in (("native", False), ("legacy", True), ("legacy", False)):
+            with self.subTest(engine=engine, guard=guard), tempfile.TemporaryDirectory() as directory:
+                workflow = self.workflow(Path(directory))
+                workflow.one_shot_native_startup_guard = guard
+                with patch("project_sekai.native_player.NativePlayer", return_value=self.native()):
+                    report = workflow.run("master", -51, engine=engine)
+                self.assertNotIn("native_start_target", workflow.start.call_args.kwargs)
+                self.assertNotIn("native_start_fastpath", workflow.start.call_args.kwargs)
+                self.assertEqual(report["one_shot_native_startup_guard"], guard)
+
+    def test_native_startup_chart_errors_leave_target_empty_and_never_start_playback(self):
+        for stage in ("load", "compile"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                workflow = self.workflow(Path(directory))
+                workflow.one_shot_native_startup_guard = True
+                if stage == "load":
+                    workflow.repository.load_chart.side_effect = ValueError("本地 SHA256 不匹配")
+                compile_options = ({"side_effect": ValueError("编译拒绝非法触点")}
+                                   if stage == "compile" else {"wraps": one_shot_module.compile_touches})
+                with patch("project_sekai.one_shot_live.compile_touches", **compile_options), \
+                        patch("project_sekai.native_player.NativePlayer") as create_player, \
+                        self.assertRaises(MissingOneShotChart):
+                    workflow.run("master", -51, engine="native")
+                self.assertEqual(workflow.start.call_args.kwargs["native_start_target"], [])
+                create_player.assert_not_called()
+                workflow.play.assert_not_called()
+                workflow.device.tap.assert_not_called()
+                workflow.device.back.assert_not_called()
+                workflow.device.home.assert_called_once()
+
+    def test_real_start_consumes_late_target_and_rejects_late_handoff_after_release_without_logs(self):
+        for epoch, accepted in ((1001., True), (1000.1, False)):
+            with self.subTest(epoch=epoch), tempfile.TemporaryDirectory() as directory:
+                workflow = self.workflow(Path(directory))
+                workflow.one_shot_native_startup_guard = True
+                del workflow.start
+                workflow.repository.load_chart.return_value += "\n#00052:11"
+                workflow.matcher = Mock()
+                workflow.matcher.match.return_value = identity()
+                workflow.observe_preplay_life = Mock()
+                frame = np.full((720, 1280, 3), 50, np.uint8)
+                workflow.device.screenshot.return_value = frame
+                workflow.navigator.templates = {"life_hud": frame}
+                workflow.navigator.match.side_effect = lambda _frame, name, *area: (
+                    float(name in {"playing", "life_hud"}), (0, 0))
+                workflow.pause = Mock()
+                player = self.native()
+                anchor = Mock(samples=[], fit={})
+                anchor.observe.side_effect = [None, epoch]
+                with patch("project_sekai.diagnostics._disabled", True), \
+                        patch("project_sekai.solo_live.time.perf_counter", return_value=1000.), \
+                        patch("project_sekai.solo_live.StartAnchor", return_value=anchor), \
+                        patch("project_sekai.native_player.NativePlayer", return_value=player):
+                    if accepted:
+                        report = workflow.run("master", -51, engine="native")
+                        self.assertTrue(report["completed"])
+                        player.play.assert_called_once_with(epoch, -51)
+                        workflow.device.home.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "实际启动余量不足"):
+                            workflow.run("master", -51, engine="native")
+                        report = workflow.last_report
+                        player.play.assert_not_called()
+                        workflow.wait_for_finish.assert_not_called()
+                        workflow.device.home.assert_called_once()
+                        self.assertTrue(report["background_exit"]["confirmed"])
+                    player.close.assert_called_once()
+                    self.assertTrue(report["playback"]["release_confirmed"])
+                    self.assertEqual(report["startup_handoff"]["accepted"], accepted)
+                    self.assertAlmostEqual(report["startup_handoff"]["first_target_s"], epoch - .018 - .051)
+                    self.assertEqual(report["native_startup_hud_fastpath"]["accepted_frames"], 1)
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+                workflow.device.tap.assert_not_called()
+                workflow.device.back.assert_not_called()
+                workflow.navigator.tap.assert_not_called()
+
     def test_agent_uses_manual_settings_and_cannot_reuse_a_solo_profile(self):
         context, argv = self.configuration()
         with patch.object(agent, "load_performance", return_value=SimpleNamespace(
@@ -209,6 +339,7 @@ class OneShotTests(unittest.TestCase):
         for failure in ("anchor", "life"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 workflow = self.workflow(Path(directory))
+                workflow.one_shot_native_startup_guard = True
                 order = []
                 player = self.native(order)
                 if failure == "life":
@@ -251,6 +382,7 @@ class OneShotTests(unittest.TestCase):
     def test_native_cancel_releases_without_home_or_settlement(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = self.workflow(Path(directory))
+            workflow.one_shot_native_startup_guard = True
             player = self.native()
             player.play.side_effect = InterruptedError("用户停止")
             with patch("project_sekai.native_player.NativePlayer", return_value=player), self.assertRaises(InterruptedError):
@@ -262,6 +394,7 @@ class OneShotTests(unittest.TestCase):
     def test_release_failure_forbids_home_and_cannot_complete(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = self.workflow(Path(directory))
+            workflow.one_shot_native_startup_guard = True
             player = self.native()
             player.close.side_effect = RuntimeError("reset 失败")
             with patch("project_sekai.native_player.NativePlayer", return_value=player), self.assertRaisesRegex(RuntimeError, "reset"):

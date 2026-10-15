@@ -35,7 +35,7 @@ public sealed class SmokeApplication : Application
     }
 }
 
-internal static class Program
+internal static partial class Program
 {
     private static int _checks;
     [DllImport("MaaFramework", CallingConvention = CallingConvention.Cdecl)]
@@ -123,8 +123,11 @@ internal static class Program
 
     public static int Main(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--first-sync-state")
+            return MaaPjskFirstLiveSync.NeedsSync(["SoloChartLive"]) ? 0 : 1;
         if (args.Length == 3 && args[0] == "--logging-probe") return LoggingProbe(args[1], Path.GetFullPath(args[2]));
-        if (args.Length != 2)
+        var firstSyncProbe = args.Length == 4 && args[0] == "--first-sync-probe";
+        if (args.Length != 2 && !firstSyncProbe)
             throw new ArgumentException("参数：python.exe 和离屏截图输出路径");
         AppBuilder.Configure<SmokeApplication>().UseSkia()
             .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
@@ -149,6 +152,7 @@ internal static class Program
         typeof(App).GetProperty(nameof(App.Services))!.SetValue(null,
             new ServiceCollection().AddSingleton(tabBar).AddSingleton(smokeRoot).AddSingleton<ISukiToastManager, SukiToastManager>()
                 .AddSingleton<ISukiDialogManager, SukiDialogManager>().BuildServiceProvider());
+        if (firstSyncProbe) return FirstSyncProbe(args[1], args[2], args[3]);
 
         var reservation = (MaaProcessor)RuntimeHelpers.GetUninitializedObject(typeof(MaaProcessor));
         var reserve = typeof(MaaProcessor).GetMethod("ReserveProjectExecution", BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -404,6 +408,7 @@ sys.exit(2 if mode == 'partial' else 0)
                 && !buttons.Single(button => Equals(button.Content, "取消同步")).IsEnabled,
             "取消后必须重新启用同步及刷新按钮");
 
+        CheckFirstLiveSync(args[0], fixture, modePath, dialogs, manager);
         AvaloniaHeadlessPlatform.ForceRenderTimerTick();
         Dispatcher.UIThread.RunJobs();
         AvaloniaHeadlessPlatform.ForceRenderTimerTick();

@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 import time
 
-from .chart_catalog import _write_json
+from .diagnostics import write_json as _write_json
 from .live_end import release_finished
 from .song_identity import write_image
 

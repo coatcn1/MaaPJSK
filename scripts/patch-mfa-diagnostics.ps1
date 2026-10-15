@@ -1,6 +1,6 @@
 ﻿param([Parameter(Mandatory)][string]$SourceRoot, [Parameter(Mandatory)][string]$ProjectRoot)
 $ErrorActionPreference = 'Stop'
-foreach ($name in @('MaaPjskMaintenance.cs', 'MaaPjskDiagnostics.cs', 'MaaPjskCacheMaintenance.cs')) {
+foreach ($name in @('MaaPjskMaintenance.cs', 'MaaPjskDiagnostics.cs', 'MaaPjskCacheMaintenance.cs', 'MaaPjskFirstLiveSync.cs')) {
     Copy-Item -LiteralPath (Join-Path $ProjectRoot "mfa-chart-ui\$name") -Destination (Join-Path $SourceRoot 'MFAAvalonia\Helper') -Force
 }
 function Replace-Once([string]$path, [string]$pattern, [string]$replacement) {
@@ -59,17 +59,35 @@ Replace-Once $processor 'public static MaaToolkit Toolkit \{ get; \} = new\(true
 public static MaaGlobal Global { get; } = MaaPjskDiagnostics.CreateGlobal();
     public static MaaToolkit Toolkit { get; } = new(!MaaPjskDiagnostics.Disabled);
     private IDisposable? _pjskExecution;
+    private volatile bool _pjskPreparing;
+    private volatile bool _pjskPending;
+    private int _pjskStarting;
     public bool HasProjectExecution => _pjskExecution != null;
     private bool ReserveProjectExecution()
     {
         lock (MaaPjskMaintenance.Sync)
         {
-            if (_isClosed || _pjskExecution != null || MaaPjskMaintenance.IsBusy) return false;
+            if (_isClosed || _pjskExecution != null || MaaPjskMaintenance.IsBusy
+                || (!MaaPjskFirstLiveSync.IsPrepared && MaaPjskMaintenance.HasExecuting))
+            {
+                ToastHelper.Warn("任务暂不能启动", "另一个启动、谱面同步或停止清理仍在进行，请等待完成后再次点击开始。");
+                return false;
+            }
             _pjskExecution = MaaPjskMaintenance.BeginExecution();
+            CancellationTokenSource = new CancellationTokenSource();
+            _pjskPending = true;
             return true;
         }
     }
-    private void ReleaseProjectExecution() => Interlocked.Exchange(ref _pjskExecution, null)?.Dispose();
+    private void ReleaseProjectExecution()
+    {
+        lock (MaaPjskMaintenance.Sync)
+        {
+            _pjskPending = false;
+            Interlocked.Exchange(ref _pjskStarting, 0);
+            Interlocked.Exchange(ref _pjskExecution, null)?.Dispose();
+        }
+    }
 '@
 Replace-Once $processor 'public void Start\(bool onlyStart = false, bool checkUpdate = false\)\s*\{' @'
 public void Start(bool onlyStart = false, bool checkUpdate = false)
@@ -104,6 +122,11 @@ Replace-Once $processor '(LoggerHelper.Info\("命令队列已停止，已忽略�
 Replace-Once $processor 'public async Task StartTask\(List<DragItemViewModel>\? tasks, bool onlyStart = false, bool checkUpdate = false\)\s*\{' @'
 public async Task StartTask(List<DragItemViewModel>? tasks, bool onlyStart = false, bool checkUpdate = false)
     {
+        lock (MaaPjskMaintenance.Sync)
+        {
+            if (Interlocked.CompareExchange(ref _pjskStarting, 1, 0) != 0) return;
+            if (_pjskExecution == null && !ReserveProjectExecution()) { _pjskStarting = 0; return; }
+        }
         try
         {
 '@
@@ -121,11 +144,44 @@ $1
         finally
         {
             // 初始化失败或任务取消同样经过原停止与释放流程，租约直到停止回调结束才释放。
+            _pjskPreparing = false;
             Stop(Status, true, onlyStart);
         }
     }
 '@
 Replace-Once $processor '(await Task.Run\(async \(\) => await ExecuteTasks\(token\)\);\s*\})\s*catch \(Exception error\)' '$1 catch (OperationCanceledException) { Status = MFATask.MFATaskStatus.STOPPED; } catch (Exception error)'
+Replace-Once $processor 'CancellationTokenSource = new CancellationTokenSource\(\);(\s*_startTime = DateTime.Now;)' '$1'
+Replace-Once $processor '(await Task.Run\(async \(\) => await ExecuteTasks\(token\)\);)' 'lock (MaaPjskMaintenance.Sync) _pjskPending = false; $1'
+Replace-Once $processor '(var taskAndParams = tasks.Select\(\(task, index\) => CreateNodeAndParam\(task, index \+ 1\)\).ToList\(\);)' @'
+$1
+            if (MaaPjskFirstLiveSync.NeedsSync(tasks.Select(task => task.InterfaceItem?.Entry)))
+            {
+                _pjskPreparing = true;
+                TaskQueue.Enqueue(CreateMFATask("首次演出前更新谱面", async () =>
+                {
+                    DispatcherHelper.PostOnMainThread(() =>
+                    {
+                        ViewModel?.SetCurrentTaskName("首次演出前更新谱面");
+                        AddLog("正在更新日服谱面，完成后继续演出；可点击停止取消。", (IBrush?)null);
+                    });
+                    try { await MaaPjskFirstLiveSync.PrepareAsync(token, this); }
+                    finally { _pjskPreparing = false; }
+                    token.ThrowIfCancellationRequested();
+                }));
+            }
+'@
+Replace-Once $processor '(private Task StopInternal\(MFATask.MFATaskStatus status, bool finished, bool onlyStart, Action\? action\)\s*\{)' @'
+$1
+        // 前置同步的子进程退出前不释放启动租约；由 StartTask 的最终停止统一收尾。
+        lock (MaaPjskMaintenance.Sync)
+        {
+            if ((_pjskPending || _pjskPreparing) && !finished)
+            {
+                CancellationTokenSource?.Cancel();
+                return Task.CompletedTask;
+            }
+        }
+'@
 Replace-Once $processor '(if \(!ShouldProcessStop\(finished\)\)\s*\{\s*ToastHelper.Warn\(LangKeys.NoTaskToStop.ToLocalization\(\)\);\s*TaskQueue.Clear\(\);)' '$1 ReleaseProjectExecution();'
 Replace-Once $processor 'EnqueueCommand\(\(\) => StartInternal\(null, onlyStart, checkUpdate\)\);' 'try { EnqueueCommand(() => StartInternal(null, onlyStart, checkUpdate)); } catch { ReleaseProjectExecution(); throw; }'
 Replace-Once $processor 'EnqueueCommand\(\(\) => StartInternal\(dragItemViewModels, onlyStart, checkUpdate, ignoreCheckedState\)\);' 'try { EnqueueCommand(() => StartInternal(dragItemViewModels, onlyStart, checkUpdate, ignoreCheckedState)); } catch { ReleaseProjectExecution(); throw; }'
@@ -134,7 +190,8 @@ Replace-Once $tabs '(private async Task CloseInstance\(InstanceTabViewModel\? ta
 $1
         if (tab.Processor.HasProjectExecution)
         {
-            ToastHelper.Warn("实例仍在执行", "请先停止任务并等待释放完成，再关闭实例。");
+            tab.Processor.Stop(MFAAvalonia.Helper.ValueType.MFATask.MFATaskStatus.STOPPED);
+            ToastHelper.Warn("实例仍在执行", "已请求停止，请等待释放完成后再关闭实例。");
             return;
         }
 '@

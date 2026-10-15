@@ -19,7 +19,7 @@ from .song_identity import read_image, write_image
 REWARD_POINT = (249, 328)
 WATCH_POINT = (760, 542)
 MAX_AD_STARTS = 7
-BACK_RECOVERY_SECONDS = 20.
+BACK_RECOVERY_SECONDS = 90.
 
 
 def loading_spinner(frame):
@@ -55,7 +55,11 @@ class AdRewardPages:
         self.navigator = navigator
 
     def matches(self, frame, name):
-        template, (x1, y1, x2, y2) = self.anchors[name]
+        anchor = self.anchors.get(name)
+        # 旧采样配置可以缺少新增的可选问题；缺失不能提供观看确认依据。
+        if anchor is None:
+            return False
+        template, (x1, y1, x2, y2) = anchor
         crop = frame[y1:y2, x1:x2]
         if crop.shape != template.shape:
             return False
@@ -113,7 +117,8 @@ class AdRewardPages:
             raise RuntimeError("广告任务截图尺寸不符合本机基准")
         if loading_spinner(frame):
             return {'state': 'unknown', 'reason': '加载转圈尚未结束'}
-        if self.matches(frame, "ad_watch_question") and self.matches(frame, "ad_watch_start"):
+        if (self.matches(frame, "ad_watch_question") or self.matches(frame, "ad_watch_bonus_question")) \
+                and self.matches(frame, "ad_watch_start"):
             return {"state": "watch_confirm"}
         # 遮罩与加载帧仍保留背景文字；绝对亮度门槛阻止归一化模板把它们误判为返回。
         if self.matches(frame, "ad_rewards") and np.median(frame[145:157, 141:170]) >= 235:
@@ -293,7 +298,7 @@ class AdRewards:
         attempt["restart"] = restart
         self.report['restart_requests'] += 1
         self.persist()
-        self.log("广告 BACK 20 秒未返回：关闭并重启日服游戏，再回到奖励页")
+        self.log(f"广告 BACK {BACK_RECOVERY_SECONDS:g} 秒未返回：关闭并重启日服游戏，再回到奖励页")
         # 只关闭本任务已请求广告的日服进程；不会触碰其他应用或调用演出控制器。
         self.device.shell("am force-stop com.sega.pjsekai")
         self.check_stop()
@@ -396,20 +401,23 @@ class AdRewards:
                 attempt = self.start_ad(state)
                 if attempt is None:
                     self.report['finish_reason'] = 'fixed_position_no_confirmation'
+                    self.report['error'] = '固定位置未弹出观看确认，结束本次点击循环'
                     self.log('固定位置未弹出观看确认，结束本次点击循环')
                     break
                 state = self.watch(attempt)
                 if self.report['consecutive_restarts'] >= 3:
                     self.report['finish_reason'] = 'consecutive_restart_limit'
+                    self.report['error'] = '连续三次 BACK 无效，已恢复游戏页面，结束本次点击循环'
                     self.log('连续三次 BACK 无效，已恢复游戏页面，结束本次点击循环')
                     break
             else:
                 self.report['finish_reason'] = 'start_request_limit'
+                self.report['completed'] = True
                 self.log('本次已请求开始 7 次，结束本次点击循环；领取数量未确认')
-            self.report['completed'] = True
+            self.check_stop()
             return self.report
         except Exception as error:
-            self.report.update(error=f"{type(error).__name__}: {error}", cancelled=self.stop_requested())
+            self.report.update(completed=False, error=f"{type(error).__name__}: {error}", cancelled=self.stop_requested())
             if self.last_frame is not None and not self.stop_requested():
                 write_image(self.directory / "failure.png", self.last_frame)
             raise
