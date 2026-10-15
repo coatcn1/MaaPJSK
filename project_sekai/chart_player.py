@@ -14,7 +14,7 @@ from .sus_chart import Chart, Gesture, slide_x
 
 TOUCH_PLAN_VERSION = 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 5
-START_ANCHOR_VERSION = 17
+START_ANCHOR_VERSION = 19
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -275,11 +275,126 @@ def dense_first_note_context(chart) -> tuple[Gesture, ...]:
     return validated_dense_followers(first, prefix)
 
 
+def validated_gold_tap_followers(gesture: Gesture, followers) -> tuple[Gesture, ...]:
+    # 普通金 TAP 后继只解释同轨、同宽的独立首芯，不借用 TRACE 或同刻音的上下文。
+    try:
+        values = tuple(followers)
+        if not 1 <= len(values) <= 32:
+            return ()
+        for value in (gesture, *values):
+            if (not isinstance(value, Gesture) or value.kind != "tap" or value.critical is not True
+                    or type(value.flick) is not int or value.flick != 0 or len(value.points) != 1):
+                return ()
+            point = value.points[0]
+            if (not math.isfinite(point.time) or type(point.kind) is not int or point.kind != 2
+                    or type(point.lane) is not int or type(point.width) is not int
+                    or not 2 <= point.lane < point.lane + point.width <= 14
+                    or type(point.direction) is not int or point.direction != 0):
+                return ()
+        point = gesture.points[0]
+        ordered = tuple(sorted(values, key=lambda value: value.start))
+        previous = gesture.start
+        for value in ordered:
+            following = value.points[0]
+            if (not previous < value.start <= gesture.start + 1.
+                    or following.lane != point.lane or following.width != point.width):
+                return ()
+            previous = value.start
+        return ordered
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return ()
+
+
+def gold_tap_following_context(chart) -> tuple[Gesture, ...]:
+    # 只从实际首时刻及其后一秒取元数据；其他轨道的同刻首音可以并存，但重叠音不能跳过。
+    try:
+        first = chart.first
+        point = first.points[0]
+        values = []
+        for value in chart.gestures:
+            if not math.isfinite(value.start):
+                return ()
+            if value is first or not first.start <= value.start <= first.start + 1.:
+                continue
+            following = value.points[0]
+            if point.lane < following.lane + following.width and following.lane < point.lane + point.width:
+                values.append(value)
+        return validated_gold_tap_followers(first, values)
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return ()
+
+
 class FirstHeadOutsideWindow(RuntimeError):
     """完整首头已越过同步窗口，不能改用后继同色音启动。"""
 
 
-def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | None = None, *, simultaneous_gestures=(), dense_following_gestures=(), reject_passed_slide=False, gold_tap_head_guard=False, gold_slide_pair_guard=False) -> float | None:
+def validated_gold_tap_slide_follower(gesture: Gesture, followers) -> tuple[Gesture, ...]:
+    # 普通金 TAP 与同轨后继长条单独校验，不能改变普通 TAP 后继合同或借末尾 flick 解释首头。
+    try:
+        values = tuple(followers)
+        if len(values) != 1 or not isinstance(gesture, Gesture):
+            return ()
+        if (gesture.kind != "tap" or gesture.critical is not True or type(gesture.flick) is not int
+                or gesture.flick != 0 or len(gesture.points) != 1):
+            return ()
+        first = gesture.points[0]
+        if (not math.isfinite(first.time) or type(first.kind) is not int or first.kind != 2
+                or type(first.lane) is not int or type(first.width) is not int
+                or not 2 <= first.lane < first.lane + first.width <= 14
+                or type(first.direction) is not int or first.direction != 0):
+            return ()
+        slide = values[0]
+        if (not isinstance(slide, Gesture) or slide.kind != "slide" or slide.critical is not True
+                or type(slide.flick) is not int or slide.flick not in range(7) or len(slide.points) < 2
+                or not gesture.start < slide.start <= gesture.start + 1. or slide.end <= slide.start
+                or slide.points[0].lane != first.lane or slide.points[0].width != first.width):
+            return ()
+        previous_time = float("-inf")
+        for index, point in enumerate(slide.points):
+            # SLIDE 首点 direction 是路径缓动元数据；首头类型由 kind=1 判断，不能当作起点 flick。
+            kinds = {1} if index == 0 else {2} if index == len(slide.points) - 1 else {3, 4, 5}
+            if (not math.isfinite(point.time) or point.time < previous_time
+                    or type(point.kind) is not int or point.kind not in kinds
+                    or type(point.lane) is not int or type(point.width) is not int
+                    or not 2 <= point.lane < point.lane + point.width <= 14
+                    or type(point.direction) is not int or point.direction not in range(7)):
+                return ()
+            previous_time = point.time
+        return values
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return ()
+
+
+def gold_tap_slide_following_context(chart) -> tuple[Gesture, ...]:
+    # 只解释首后一秒内一个同轨金色长条；可跳过明确蓝 TAP，不能跳过任何重叠金色冲突。
+    try:
+        first = chart.first
+        point = first.points[0]
+        values = []
+        for value in chart.gestures:
+            if not math.isfinite(value.start):
+                return ()
+            if value is first or not first.start <= value.start <= first.start + 1.:
+                continue
+            following = value.points[0]
+            if not (point.lane < following.lane + following.width
+                    and following.lane < point.lane + point.width):
+                continue
+            if (value.kind == "tap" and value.critical is False and type(value.flick) is int
+                    and value.flick == 0 and len(value.points) == 1
+                    and type(following.kind) is int and following.kind == 1
+                    and type(following.lane) is int and type(following.width) is int
+                    and 2 <= following.lane < following.lane + following.width <= 14
+                    and type(following.direction) is int and following.direction == 0):
+                # 普通蓝 TAP 使用独立 HSV 色带，不能成为此处两个金色芯的解释来源。
+                continue
+            values.append(value)
+        return validated_gold_tap_slide_follower(first, values)
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return ()
+
+
+def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | None = None, *, simultaneous_gestures=(), dense_following_gestures=(), gold_tap_following_gestures=(), gold_tap_slide_following_gestures=(), reject_passed_slide=False, gold_tap_head_guard=False, gold_slide_pair_guard=False, gold_tap_followers_guard=False, gold_tap_slide_follower_guard=False, gold_tap_slide_evidence=None) -> float | None:
     """只追踪谱面第一音的开场锚点；演奏开始后不再识别音符。"""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     if gesture.critical or gesture.points[0].kind in {2, 6}:
@@ -363,6 +478,10 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
                 and abs(x + width / 2 - span_center) < max(25, span_width * .35))
 
     if gold_head:
+        head_sources = []
+        slide_follower = (validated_gold_tap_slide_follower(gesture, gold_tap_slide_following_gestures)
+                          if gold_tap_slide_follower_guard else ())
+        unconfirmed_heads = []
         core = cv2.inRange(hsv, (15, 0, 235), (45, 110, 255))
         _, core_labels, core_stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
         _, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(full_mask, connectivity=8)
@@ -381,11 +500,15 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
             labels = np.unique(sources)
             # 金色芯低饱和时几乎不在外框掩膜里；用周围完整外框和同高两侧确认足量、唯一来源。
             if len(labels) != 1 or len(sources) < width:
+                if slide_follower:
+                    unconfirmed_heads.append(float(y + height / 2))
                 continue
             source = labels[0]
             left = component_labels[y:y + height, max(0, x - padding):x + 2]
             right = component_labels[y:y + height, x + width - 2:min(frame.shape[1], x + width + padding)]
             if np.count_nonzero(left == source) < height or np.count_nonzero(right == source) < height:
+                if slide_follower:
+                    unconfirmed_heads.append(float(y + height / 2))
                 continue
             fx, fy, fw, fh = component_stats[source][:4]
             bottom = fy + fh
@@ -396,11 +519,30 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
                 return None
             # 后继轨迹向上延伸不改变首 TAP 前沿；未越界但仍向下伸出一个芯高时不是首头。
             if not y + height <= bottom <= y + 2 * height:
+                if slide_follower:
+                    unconfirmed_heads.append(float(y + height / 2))
                 continue
             candidates.append(y + height / 2)
-        # 单个首 TAP 必须只有一个完整横芯；不能从碎裂半芯或多个来源中按高低任选一个。
-        # 不回退到背景横条或后继 TRACE，也不扩展异时序上下文。
-        return candidates[0] if len(candidates) == 1 else None
+            head_sources.append((y + height / 2, int(source), int(height)))
+        # 较前完整芯来源仍未知时保留未知；不能忽略孤立噪点并让后方长条芯接管首 TAP。
+        if slide_follower and candidates and any(y >= max(candidates) for y in unconfirmed_heads):
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        followers = validated_gold_tap_followers(gesture, gold_tap_following_gestures) if gold_tap_followers_guard else ()
+        # 多芯必须由真实后继音解释，且每颗来自不同的完整来源；同一外框的半芯仍整组拒绝。
+        if ((not followers and not slide_follower)
+                or not 2 <= len(head_sources) <= (2 if slide_follower else len(followers) + 1)
+                or len({source for _, source, _ in head_sources}) != len(head_sources)):
+            return None
+        ordered = sorted(head_sources)
+        # 25 像素沿用轨迹的明确运动跨度；还须超过两倍芯高，不能按微小高低差拆解同深度歧义。
+        if any(front_y - rear_y <= max(25, 2 * max(rear_height, front_height))
+               for (rear_y, _, rear_height), (front_y, _, front_height) in zip(ordered, ordered[1:])):
+            return None
+        if slide_follower and gold_tap_slide_evidence is not None:
+            gold_tap_slide_evidence["pair_confirmed"] = True
+        return ordered[-1][0]
 
     for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
         x, y, width, height = cv2.boundingRect(contour)
@@ -508,7 +650,7 @@ def first_note_y(frame: np.ndarray, gesture: Gesture, baseline: np.ndarray | Non
 
 
 class StartAnchor:
-    def __init__(self, gesture: Gesture, *, minimum_samples: int = 2, simultaneous_gestures=(), dense_following_gestures=()) -> None:
+    def __init__(self, gesture: Gesture, *, minimum_samples: int = 2, simultaneous_gestures=(), dense_following_gestures=(), gold_tap_following_gestures=(), gold_tap_slide_following_gestures=()) -> None:
         self.gesture = gesture
         self.minimum_samples = minimum_samples
         # 双金色长条保护默认开启，仅明确 0 回退；本局初始化冻结，纯检测函数不读取环境。
@@ -522,6 +664,14 @@ class StartAnchor:
         self.failure_reason: str | None = None
         # 首头保护默认开启并冻结到本局；仅明确 0 回退，非普通金色 TAP 仍走原识别路径。
         self.gold_tap_head_guard = os.environ.get("MAAPJSK_GOLD_TAP_HEAD_GUARD") != "0"
+        # 独立后继 TAP 保护默认开启，仅明确 0 回退；本局冻结，不读取运行中环境变化。
+        self.gold_tap_followers_guard = os.environ.get("MAAPJSK_GOLD_TAP_FOLLOWERS_GUARD") != "0"
+        self.gold_tap_following_gestures = validated_gold_tap_followers(gesture, gold_tap_following_gestures)
+        # 同轨后继长条保护已通过保存帧及同曲单人验收，默认开启并冻结，仅明确 0 回退。
+        self.gold_tap_slide_follower_guard = (self.gold_tap_head_guard
+                                             and os.environ.get("MAAPJSK_GOLD_TAP_SLIDE_FOLLOWER_GUARD") != "0")
+        self.gold_tap_slide_following_gestures = validated_gold_tap_slide_follower(gesture, gold_tap_slide_following_gestures)
+        self.gold_tap_slide_pair_confirmed = False
         # 本局创建时冻结保护设置；明确主开关优先，兼容旧试验开关，空值不关闭默认保护。
         guard_setting = os.environ.get("MAAPJSK_START_ANCHOR_AMBIGUITY_GUARD")
         if guard_setting not in {"0", "1"}:
@@ -540,13 +690,23 @@ class StartAnchor:
             self.failure_reason = "trajectory_gate_timeout"
             raise RuntimeError("首音轨迹未通过同步门槛且等待超时，拒绝从歌曲中途开始")
         try:
+            slide_evidence = {}
             y = first_note_y(frame, self.gesture, self.baseline, simultaneous_gestures=self.simultaneous_gestures,
                             dense_following_gestures=self.dense_following_gestures, reject_passed_slide=True,
-                            gold_tap_head_guard=self.gold_tap_head_guard, gold_slide_pair_guard=self.gold_slide_pair_guard)
+                            gold_tap_following_gestures=self.gold_tap_following_gestures,
+                            gold_tap_head_guard=self.gold_tap_head_guard, gold_slide_pair_guard=self.gold_slide_pair_guard,
+                            gold_tap_followers_guard=self.gold_tap_followers_guard,
+                            gold_tap_slide_following_gestures=self.gold_tap_slide_following_gestures,
+                            gold_tap_slide_follower_guard=self.gold_tap_slide_follower_guard,
+                            gold_tap_slide_evidence=slide_evidence)
         except FirstHeadOutsideWindow:
             self.failure_reason = "first_head_outside_window"
             raise
         if y is None:
+            return None
+        slide_context_active = self.gold_tap_slide_follower_guard and bool(self.gold_tap_slide_following_gestures)
+        # 双芯已证明后，单芯缺失属于未知；既有轨迹不能改由剩下的后继长条继续拟合。
+        if slide_context_active and self.gold_tap_slide_pair_confirmed and not slide_evidence.get("pair_confirmed"):
             return None
         if self.samples:
             previous_time, previous_y = self.samples[-1]
@@ -565,6 +725,11 @@ class StartAnchor:
                 # 小幅倒退不是向下运动，也不延长候选期限；已建立轨迹始终不能重置。
                 return None
         self.samples.append((captured_at, y))
+        if slide_context_active:
+            self.gold_tap_slide_pair_confirmed |= bool(slide_evidence.get("pair_confirmed"))
+            # 初始迟到只看到后继时不能假定它是首 TAP；完整双芯关系成立前只积累原轨迹。
+            if not self.gold_tap_slide_pair_confirmed:
+                return None
         recent = self.samples[-5:]
         fit_window = "recent"
         # 快截图的五帧可能仅覆盖约 125 ms，局部斜率噪声会放大成整曲相位误差。
@@ -594,6 +759,11 @@ class StartAnchor:
                 self.fit["gold_tap_head_guard"] = True
             if self.gold_slide_pair_guard:
                 self.fit["gold_slide_pair_guard"] = True
+            if self.gold_tap_followers_guard:
+                self.fit["gold_tap_followers_guard"] = True
+            if self.gold_tap_slide_follower_guard:
+                self.fit["gold_tap_slide_follower_guard"] = True
+                self.fit["gold_tap_slide_pair_confirmed"] = bool(self.gold_tap_slide_pair_confirmed)
             return first_hit - self.gesture.start
         if y < 230:
             return None
@@ -675,6 +845,11 @@ class StartAnchor:
             self.fit["gold_tap_head_guard"] = True
         if self.gold_slide_pair_guard:
             self.fit["gold_slide_pair_guard"] = True
+        if self.gold_tap_followers_guard:
+            self.fit["gold_tap_followers_guard"] = True
+        if self.gold_tap_slide_follower_guard:
+            self.fit["gold_tap_slide_follower_guard"] = True
+            self.fit["gold_tap_slide_pair_confirmed"] = bool(self.gold_tap_slide_pair_confirmed)
         return first_hit - self.gesture.start
 
 

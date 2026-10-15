@@ -26,7 +26,7 @@
         "display": ["log", "toast"]
       },
       "Node.Action.Failed": {
-        "content": "一键演出中止或等待超时，详情见本局报告",
+        "content": "一键演出中止或等待超时，请查看任务内错误说明",
         "display": ["log", "toast"]
       }
     }

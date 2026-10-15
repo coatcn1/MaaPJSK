@@ -16,7 +16,7 @@ import numpy as np
 
 from .chart_catalog import ChartRepository
 from .diagnostics import write_json as _write_json, make_directory, enabled
-from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context
+from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context, gold_tap_following_context, gold_tap_slide_following_context
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
@@ -737,7 +737,9 @@ class SoloLive:
         minimum_samples = 4 if report.get("engine") == "native" else 2
         anchor = (StartAnchor(chart.first, minimum_samples=minimum_samples,
                               simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
-                              dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else ())
+                              dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else (),
+                              gold_tap_following_gestures=gold_tap_following_context(chart) if getattr(chart, "gestures", None) else (),
+                              gold_tap_slide_following_gestures=gold_tap_slide_following_context(chart) if getattr(chart, "gestures", None) else ())
                   if chart is not None else None)
         loading_saved = False
         last_error = ""
@@ -837,7 +839,9 @@ class SoloLive:
                         if anchor is None:
                             anchor = StartAnchor(chart.first, minimum_samples=minimum_samples,
                                                  simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
-                                                 dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else ())
+                                                 dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else (),
+                                                 gold_tap_following_gestures=gold_tap_following_context(chart) if getattr(chart, "gestures", None) else (),
+                                                 gold_tap_slide_following_gestures=gold_tap_slide_following_context(chart) if getattr(chart, "gestures", None) else ())
                     final = candidate
                     if opening_deadline_provider is not None:
                         # 房间等待可由调用方按正向进展计时；最终身份确认后固定窗口，不再延展首音。
