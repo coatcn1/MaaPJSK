@@ -10,6 +10,7 @@
     "ad_cm": {"capture": "scramble-right-1.png", "box": [1127, 169, 1177, 200]},
     "ad_rewards": {"capture": "reward-list.png", "box": [139, 312, 358, 344]},
     "ad_watch_question": {"capture": "watch-confirm.png", "box": [459, 242, 821, 270]},
+    "ad_watch_bonus_question": {"capture": "watch-bonus-confirm.png", "box": [408, 245, 872, 295], "optional": true},
     "ad_watch_start": {"capture": "watch-confirm.png", "box": [714, 528, 808, 557]}
   }
 }

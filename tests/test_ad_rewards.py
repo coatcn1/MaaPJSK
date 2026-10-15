@@ -1,5 +1,6 @@
 import json
 import hashlib
+import importlib.util
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from project_sekai.ad_rewards import AdRewardPages, AdRewards, REWARD_POINT, WAT
 from project_sekai.ocr import Reading
 from project_sekai.navigator import Navigator
 from project_sekai.song_identity import read_image
+from project_sekai import diagnostics
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,6 +99,36 @@ class SimulatedAdDevice:
 
 
 class AdRewardsTests(unittest.TestCase):
+    def assert_agent_completion(self, report, completed):
+        context = SimpleNamespace(tasker=SimpleNamespace(stopping=False))
+        with patch.object(agent, 'create_workflow') as create, \
+                patch('project_sekai.diagnostics.load_policy'), patch.object(agent, 'visible_log') as visible:
+            create.return_value.run.return_value = report
+            self.assertIs(agent.ProjectSekaiAdRewards().run(context, SimpleNamespace()), completed)
+            if completed:
+                visible.assert_not_called()
+            else:
+                self.assertIn(report['error'], visible.call_args.args[1])
+
+    def confirmation_pages(self, question):
+        pages = AdRewardPages.__new__(AdRewardPages)
+        pages.threshold = .9
+        pages.navigator = None
+        pages.ocr = Mock()
+        pages.ocr.read.side_effect = AssertionError('观看确认不得使用 OCR')
+        boxes = {'ad_watch_question': (459, 242, 821, 270),
+                 'ad_watch_bonus_question': (408, 245, 872, 295),
+                 'ad_watch_start': (714, 528, 808, 557),
+                 'ad_rewards': (139, 312, 358, 344)}
+        rng = np.random.default_rng(42)
+        pages.anchors = {name: (rng.integers(0, 256, (y2 - y1, x2 - x1, 3), dtype=np.uint8), box)
+                         for name, box in boxes.items() for x1, y1, x2, y2 in [box]}
+        frame = np.full((720, 1280, 3), 255, np.uint8)
+        for name in (question, 'ad_watch_start'):
+            template, (x1, y1, x2, y2) = pages.anchors[name]
+            frame[y1:y2, x1:x2] = template
+        return pages, frame
+
     def workflow(self, root, **options):
         clock = SimpleNamespace(now=0.)
         device = SimulatedAdDevice(clock, **options)
@@ -116,6 +148,8 @@ class AdRewardsTests(unittest.TestCase):
         self.assertIsNone(report['completed_ads'])
         self.assertIsNone(report['daily_exhausted'])
         self.assertEqual(report['finish_reason'], 'fixed_position_no_confirmation')
+        self.assertIs(report['completed'], False)
+        self.assertIn('观看确认', report['error'])
         self.assertTrue(all(event[1] in {REWARD_POINT, WATCH_POINT, (42, 42), (223, 435), (1152, 190)}
                             for event in device.events if event[0] == 'tap'))
         for _, clicked_at, observed_at in device.fixed_click_observations[1:3]:
@@ -142,6 +176,8 @@ class AdRewardsTests(unittest.TestCase):
         self.assertLessEqual(clock.now, 6.1)
         self.assertEqual(report['started_ads'], 0)
         self.assertEqual(report['finish_reason'], 'fixed_position_no_confirmation')
+        self.assertIs(report['completed'], False)
+        self.assert_agent_completion(report, False)
         self.assertIsNone(report['rewards_claimed'])
         self.assertIsNone(report['daily_exhausted'])
         workflow.log.assert_called_with('固定位置未弹出观看确认，结束本次点击循环')
@@ -153,8 +189,10 @@ class AdRewardsTests(unittest.TestCase):
         self.assertEqual(report['started_ads'], 7)
         self.assertEqual(report['normal_returns'], 7)
         self.assertEqual(report['finish_reason'], 'start_request_limit')
+        self.assertIs(report['completed'], True)
         self.assertIsNone(report['completed_ads'])
         self.assertEqual(len([e for e in device.events if e[:2] == ('tap', WATCH_POINT)]), 7)
+        self.assert_agent_completion(report, True)
 
     def test_back_waits_ten_seconds_and_third_restart_recovers_then_stops(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -166,11 +204,64 @@ class AdRewardsTests(unittest.TestCase):
         self.assertEqual(len(starts), 3)
         self.assertEqual(len(stops), 3)
         self.assertGreaterEqual(backs[0] - starts[0], 10.)
-        self.assertGreaterEqual(stops[0] - starts[0], 30. - 1e-6)
+        for started_at, stopped_at in zip(starts, stops):
+            self.assertAlmostEqual(stopped_at - started_at, 100., places=5)
+            attempt_backs = [at for at in backs if started_at <= at < stopped_at]
+            self.assertEqual(len(attempt_backs), 90)
+            self.assertAlmostEqual(attempt_backs[0] - started_at, 10., places=5)
+            self.assertTrue(all(abs(later - earlier - 1.) < 1e-6
+                                for earlier, later in zip(attempt_backs, attempt_backs[1:])))
         self.assertEqual(report['restart_requests'], 3)
         self.assertEqual(report['finish_reason'], 'consecutive_restart_limit')
+        self.assertIs(report['completed'], False)
+        self.assertIn('连续三次', report['error'])
         self.assertEqual(device.state, 'rewards')
         self.assertIsNone(report['completed_ads'])
+        self.assert_agent_completion(report, False)
+
+    def test_return_after_old_twenty_second_limit_keeps_back_and_avoids_restart(self):
+        for return_after in (21., 89., 90.):
+            with self.subTest(return_after=return_after), tempfile.TemporaryDirectory() as directory:
+                workflow, device, clock = self.workflow(Path(directory), returns=False, max_popup_starts=1)
+                original_observe = device.observe
+                watching_since = None
+
+                def observe(frame):
+                    nonlocal watching_since
+                    if device.state == 'unknown' and device.starts:
+                        if watching_since is None:
+                            watching_since = clock.now
+                        if clock.now - watching_since >= return_after - 1e-6:
+                            device.state = 'rewards'
+                    return original_observe(frame)
+
+                device.observe = observe
+                report = workflow.run()
+                backs = [event[2] for event in device.events if event[0] == 'back']
+                self.assertEqual(report['normal_returns'], 1)
+                self.assertEqual(report['restart_requests'], 0)
+                self.assertEqual(len(backs), int(return_after))
+                self.assertLess(backs[-1], watching_since + return_after)
+                device.shell.assert_not_called()
+
+    def test_slow_observation_retains_back_hard_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, device, clock = self.workflow(Path(directory), returns=False, max_popup_starts=1)
+            original_observe = device.observe
+
+            def observe(frame):
+                if device.state == 'unknown' and device.starts:
+                    clock.now += 120.
+                return original_observe(frame)
+
+            device.observe = observe
+            report = workflow.run()
+        self.assertTrue(report['ads'][0]['hard_timeout_recovery'])
+        self.assertEqual(report['ads'][0]['back_requests'], 0)
+        self.assertEqual(report['restart_requests'], 1)
+        started_at = next(e[2] for e in device.events if e[:2] == ('tap', WATCH_POINT))
+        stopped_at = next(e[2] for e in device.events if e[0] == 'shell')
+        self.assertAlmostEqual(stopped_at - started_at, 130., places=5)
 
     def test_normal_return_resets_consecutive_restart_counter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -183,7 +274,7 @@ class AdRewardsTests(unittest.TestCase):
         self.assertEqual(report['consecutive_restarts'], 3)
 
     def test_stop_interrupts_no_popup_ten_second_wait_and_back_loop(self):
-        for stop_after, popups in [(1., False), (5., True), (14., True)]:
+        for stop_after, popups in [(1., False), (5., True), (14., True), (99., True)]:
             with self.subTest(stop_after=stop_after), tempfile.TemporaryDirectory() as directory:
                 workflow, device, clock = self.workflow(Path(directory), returns=False, popups=popups)
                 device.state = 'rewards'
@@ -228,6 +319,117 @@ class AdRewardsTests(unittest.TestCase):
         self.assertEqual(pages.observe(frame), {'state': 'watch_confirm'})
         pages.ocr.read.assert_not_called()
 
+    def test_old_and_bonus_questions_both_require_start_button_without_ocr(self):
+        for question in ('ad_watch_question', 'ad_watch_bonus_question'):
+            for has_question, has_button in ((True, True), (True, False), (False, True), (False, False)):
+                with self.subTest(question=question, has_question=has_question, has_button=has_button):
+                    pages, frame = self.confirmation_pages(question)
+                    for name, present in ((question, has_question), ('ad_watch_start', has_button)):
+                        if not present:
+                            _, (x1, y1, x2, y2) = pages.anchors[name]
+                            frame[y1:y2, x1:x2] = 255
+                    self.assertEqual(pages.observe(frame)['state'],
+                                     'watch_confirm' if has_question and has_button else 'unknown')
+                    pages.ocr.read.assert_not_called()
+                    self.assertEqual(pages.threshold, .9)
+
+    def test_old_template_config_without_optional_bonus_question_still_confirms(self):
+        pages, frame = self.confirmation_pages('ad_watch_question')
+        del pages.anchors['ad_watch_bonus_question']
+        self.assertEqual(pages.observe(frame), {'state': 'watch_confirm'})
+        frame[242:270, 459:821] = 255
+        self.assertEqual(pages.observe(frame), {'state': 'unknown'})
+
+    def test_bonus_question_start_ad_clicks_once_and_rechecks_changed_page(self):
+        for changed_before_click in (False, True):
+            with self.subTest(changed_before_click=changed_before_click), tempfile.TemporaryDirectory() as directory:
+                workflow, device, _ = self.workflow(Path(directory), max_popup_starts=1)
+                device.state = 'rewards'
+                pages, confirm = self.confirmation_pages('ad_watch_bonus_question')
+                original_observe = device.observe
+                confirmation_observations = 0
+
+                def observe(frame):
+                    nonlocal confirmation_observations
+                    if device.state == 'watch_confirm':
+                        confirmation_observations += 1
+                        if changed_before_click and confirmation_observations == 2:
+                            device.state = 'unknown'
+                        else:
+                            return pages.observe(confirm)
+                    return original_observe(frame)
+
+                workflow.pages = SimpleNamespace(observe=observe)
+                if changed_before_click:
+                    with self.assertRaisesRegex(RuntimeError, '页面已改变'):
+                        workflow.run()
+                    self.assertEqual(device.starts, 0)
+                    self.assertFalse(any(event[:2] == ('tap', WATCH_POINT) for event in device.events))
+                else:
+                    report = workflow.run()
+                    self.assertEqual(device.starts, 1)
+                    self.assertEqual(report['started_ads'], 1)
+                    self.assertEqual(len([event for event in device.events if event[:2] == ('tap', WATCH_POINT)]), 1)
+                pages.ocr.read.assert_not_called()
+
+    def test_missing_question_or_button_never_clicks_start(self):
+        for missing in ('ad_watch_bonus_question', 'ad_watch_start'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                workflow, device, _ = self.workflow(Path(directory))
+                device.state = 'rewards'
+                pages, frame = self.confirmation_pages('ad_watch_bonus_question')
+                _, (x1, y1, x2, y2) = pages.anchors[missing]
+                frame[y1:y2, x1:x2] = 255
+                original_observe = device.observe
+                workflow.pages = SimpleNamespace(observe=lambda image: pages.observe(frame)
+                    if device.state == 'watch_confirm' else original_observe(image))
+                report = workflow.run()
+                self.assertEqual(report['started_ads'], 0)
+                self.assertIs(report['completed'], False)
+                self.assertEqual(device.events, [('tap', REWARD_POINT, 0.)])
+
+    def test_optional_template_builder_skips_only_missing_optional_capture(self):
+        module_spec = importlib.util.spec_from_file_location('ad_template_builder', ROOT / 'scripts/build-ad-rewards-templates.py')
+        builder = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(builder)
+        for optional, exists, valid_image in ((True, False, False), (False, False, False),
+                                             (True, True, False), (True, True, True)):
+            with self.subTest(optional=optional, exists=exists, valid_image=valid_image), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                spec = {'screen': [1280, 720], 'threshold': .9, 'regions': {
+                    'ad_watch_bonus_question': {'capture': 'bonus.png', 'box': [408, 245, 872, 295], 'optional': optional}}}
+                manifest = root / 'manifest.json'
+                manifest.write_text(json.dumps(spec), encoding='utf-8')
+                if exists:
+                    if valid_image:
+                        self.assertTrue(cv2.imwrite(str(root / 'bonus.png'), np.full((720, 1280, 3), 255, np.uint8)))
+                    else:
+                        (root / 'bonus.png').write_bytes(b'broken image')
+                if (not exists and not optional) or (exists and not valid_image):
+                    with self.assertRaises((FileNotFoundError, ValueError, RuntimeError)):
+                        builder.build(root, root / 'output', manifest)
+                else:
+                    builder.build(root, root / 'output', manifest)
+                    config = json.loads((root / 'output/config.json').read_text(encoding='utf-8'))
+                    if exists:
+                        anchor = config['anchors']['ad_watch_bonus_question']
+                        self.assertEqual(anchor['sha256'], hashlib.sha256((root / 'output' / anchor['path']).read_bytes()).hexdigest())
+                        self.assertEqual(anchor['source_sha256'], hashlib.sha256((root / 'bonus.png').read_bytes()).hexdigest())
+                    else:
+                        self.assertEqual(config['anchors'], {})
+
+    def test_optional_bonus_template_corrupt_hash_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'bonus.png').write_bytes(b'corrupted')
+            (root / 'config.json').write_text(json.dumps({'screen': [1280, 720], 'threshold': .9,
+                'anchors': {'ad_watch_bonus_question': {'path': 'bonus.png', 'box': [408, 245, 872, 295],
+                    'sha256': hashlib.sha256(b'original').hexdigest()}}}), encoding='utf-8')
+            with patch('project_sekai.ad_rewards.LineOcr') as ocr:
+                with self.assertRaisesRegex(ValueError, '哈希不符.*ad_watch_bonus_question'):
+                    AdRewardPages(root / 'config.json', root / 'unused')
+                ocr.assert_not_called()
+
     @unittest.skipUnless((ROOT / '.local/ad-rewards-templates/config.json').is_file()
                          and (ROOT / '.local/mfa-generic/config/maapjsk-templates.json').is_file(),
                          '本机原始奖励页回放，图片保持忽略')
@@ -267,7 +469,7 @@ class AdRewardsTests(unittest.TestCase):
         self.assertEqual(len(switches), 2)
         self.assertGreaterEqual(switches[1][2] - switches[0][2], 1.)
         self.assertGreaterEqual(switches[0][2], .4)
-        self.assertTrue(report['completed'])
+        self.assertFalse(report['completed'])
 
 
     def test_world_map_unchanged_page_consumes_only_three_requests_then_times_out(self):
@@ -300,7 +502,7 @@ class AdRewardsTests(unittest.TestCase):
                     unknown_frames = 3
             device.observe, device.tap = transient_observe, request
             report = workflow.run()
-        self.assertTrue(report['completed'])
+        self.assertFalse(report['completed'])
         self.assertEqual(device.world_requests, 2)
 
 
@@ -411,12 +613,44 @@ class AdRewardsTests(unittest.TestCase):
         self.assertEqual(pipeline[task['entry']]['custom_action'], 'ProjectSekaiAdRewards')
         context = SimpleNamespace(tasker=SimpleNamespace(stopping=False))
         with patch.object(agent, 'create_workflow') as create:
+            create.return_value.run.return_value = {'completed': True}
             self.assertTrue(agent.ProjectSekaiAdRewards().run(context, SimpleNamespace()))
             create.return_value.run.assert_called_once()
         context.tasker.stopping = True
         with patch.object(agent, 'create_workflow') as create:
             self.assertFalse(agent.ProjectSekaiAdRewards().run(context, SimpleNamespace()))
             create.assert_not_called()
+
+    def test_agent_rejects_missing_false_or_non_boolean_completion_with_visible_error(self):
+        context = SimpleNamespace(tasker=SimpleNamespace(stopping=False))
+        for report in (None, [], {}, {'completed': False, 'error': '未弹出观看确认'},
+                       {'completed': 'true'}, {'completed': 1}, {'completed': None}):
+            with self.subTest(report=report), patch.object(agent, 'create_workflow') as create, \
+                    patch('project_sekai.diagnostics.load_policy'), patch.object(agent, 'visible_log') as visible:
+                create.return_value.run.return_value = report
+                self.assertFalse(agent.ProjectSekaiAdRewards().run(context, SimpleNamespace()))
+                self.assertIn('广告奖励中止', visible.call_args.args[1])
+                if isinstance(report, dict) and report.get('error'):
+                    self.assertIn(report['error'], visible.call_args.args[1])
+
+    def test_agent_failed_no_confirmation_with_logging_disabled_creates_no_files(self):
+        context = SimpleNamespace(tasker=SimpleNamespace(stopping=False))
+        was_disabled = not diagnostics.enabled()
+        try:
+            diagnostics.configure(True, framework=False)
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workflow, device, _ = self.workflow(root / 'reports', popups=False)
+                device.state = 'rewards'
+                with patch.object(agent, 'create_workflow', return_value=workflow), \
+                        patch('project_sekai.diagnostics.load_policy'), patch.object(agent, 'visible_log') as visible:
+                    self.assertFalse(agent.ProjectSekaiAdRewards().run(context, SimpleNamespace()))
+                self.assertEqual(workflow.report['started_ads'], 0)
+                self.assertIs(workflow.report['completed'], False)
+                self.assertIn('观看确认', visible.call_args.args[1])
+                self.assertEqual(list(root.iterdir()), [])
+        finally:
+            diagnostics.configure(was_disabled, framework=False)
 
 
     def test_agent_propagates_failure_and_cancel_without_claiming_success(self):

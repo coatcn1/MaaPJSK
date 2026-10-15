@@ -16,6 +16,9 @@ def build(captures, output, manifest):
     anchors = {}
     for name, region in spec["regions"].items():
         source = Path(captures) / region["capture"]
+        # 旧采样缺少可选弹窗时沿用必需模板；已有但损坏的图片仍须报错。
+        if region.get("optional") is True and not source.exists():
+            continue
         frame = read_image(source)
         x1, y1, x2, y2 = region["box"]
         if frame.shape[:2] != (720, 1280) or not (0 <= x1 < x2 <= 1280 and 0 <= y1 < y2 <= 720):
