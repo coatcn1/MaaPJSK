@@ -19,6 +19,7 @@ from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context, gold_tap_following_context, gold_tap_slide_following_context
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
+from .failure_retry import FailureRetryBudget
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
 from .navigator import Navigator, read_available_bonus
 from .ocr import LineOcr, Reading
@@ -1461,7 +1462,9 @@ class SoloLive:
     def run(self, count: int, difficulty: str, song_mode: str, offset_ms: int = 0, *,
             bonus_consumption: str | int = "current", recovery_mode: str = "off", recovery_count: int = 1,
             engine: str = "legacy", latency_offsets: dict | None = None, calibration_profile: dict | None = None,
-            song_name: str | None = None, _bonus_snapshot: dict | None = None):
+            song_name: str | None = None, _bonus_snapshot: dict | None = None, play_failure_retry_count: int = 0):
+        retry_budget = self.failure_retry_budget = FailureRetryBudget(
+            play_failure_retry_count, on_change=getattr(self, 'failure_retry_changed', None))
         if difficulty not in {*DIFFICULTY_POINTS, "append"} or song_mode not in {"current", "random", "specified"}:
             raise ValueError("单人谱面任务选项无效")
         expected_song_id = self.resolve_specified_song(song_name, difficulty) if song_mode == "specified" else None
@@ -1475,6 +1478,7 @@ class SoloLive:
         if engine not in {"legacy", "native"}:
             raise ValueError("演奏引擎无效")
         self.completed_rounds = 0
+        self.performed_rounds = 0
         # 开场中止保护默认开启并在同一次任务冻结；仅明确 0 回退，原两帧生命零保护不受影响。
         startup_abort_enabled = os.environ.get("MAAPJSK_SOLO_STARTUP_ABORT_GUARD") != "0"
         # 普通 run 每次都是新任务；校准的排练与验证显式共用同一个任务快照。
@@ -1483,7 +1487,12 @@ class SoloLive:
         consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
         recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
         self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}")
-        for round_index in range(1, count + 1):
+        while self.performed_rounds < count:
+            if self.stop_requested():
+                raise InterruptedError('用户已停止单人演出')
+            round_index = self.performed_rounds + 1
+            attempt_id = uuid4().hex
+            runtime_error = None
             native_player = None
             startup_failed = False
             self.life_guard = LifeGuard()
@@ -1559,6 +1568,9 @@ class SoloLive:
                                 startup_failed = True
                                 report["playback_error"] = f"{type(startup_error).__name__}: {startup_error}"
                             raise
+                        except LifeDepleted:
+                            report['death_confirmed'] = True
+                            raise
                         finally:
                             try:
                                 native_player.close()
@@ -1588,8 +1600,11 @@ class SoloLive:
                 report["life_monitor"] = {"samples": self.life_guard.samples,
                                            "zero_confirmed": self.life_guard.zero_confirmed}
                 if isinstance(playback_error, LifeDepleted):
-                    if not report.get("playback", {}).get("release_confirmed"):
+                    report['death_confirmed'] = True
+                    retry_budget.record_failure(attempt_id, publish=False)
+                    if not release_finished(report):
                         raise RuntimeError("生命归零后的触点释放未确认，禁止继续点击退出")
+                    retry_budget.publish()
                     self.exit_depleted_live(report, directory)
                     raise playback_error
                 report["phase"] = "settlement"
@@ -1606,15 +1621,19 @@ class SoloLive:
                     report["completed"] = False
                     raise playback_error
             except Exception as error:
+                runtime_error = error
                 report["completed"] = False
                 report["error"] = f"{type(error).__name__}: {error}"
                 report["cancelled"] = self.stop_requested() or isinstance(error, InterruptedError)
+                report['death_confirmed'] = bool(report.get('death_confirmed') or isinstance(error, LifeDepleted)
+                                                 or self.life_guard.zero_confirmed or report.get('preplay_death_confirmed'))
+                if report['death_confirmed']:
+                    retry_budget.record_failure(attempt_id, publish=False)
                 if not self.stop_requested() and not report.get("preplay_death_confirmed"):
                     try:
                         write_image(directory / "failure.png", self.device.screenshot())
                     except Exception:
                         pass
-                raise
             finally:
                 if native_player is not None:
                     report["playback"] = native_player.report
@@ -1640,6 +1659,12 @@ class SoloLive:
                         report["cancelled"] = True
                     except Exception as followup_error:
                         report["preplay_followup_error"] = f"{type(followup_error).__name__}: {followup_error}"
+                if report.get('preplay_death_confirmed'):
+                    report['death_confirmed'] = True
+                    retry_budget.record_failure(attempt_id, publish=False)
+                if report.get('death_confirmed') and release_finished(report):
+                    # 原对象清理完成后才发布统计，磁盘异常不能延迟 Native reset。
+                    retry_budget.publish()
                 if report.get("preplay_death_confirmed") and not self.stop_requested():
                     if not report.get("playback") and engine == "legacy":
                         report["playback"] = {"engine": "legacy", "sent_actions": 0, "executed_actions": 0,
@@ -1683,6 +1708,7 @@ class SoloLive:
                     report.setdefault("life_frames", []).append({"elapsed_s": when, "path": name})
                 self.life_frames = []
                 report["finished_at"] = datetime.now().astimezone().isoformat()
+                report['failure_retry'] = retry_budget.snapshot()
                 try:
                     _write_json(directory / "report.json", report)
                     append_result_index(self.report_root, directory, report)
@@ -1692,7 +1718,26 @@ class SoloLive:
                     _write_json(directory / "report.json", report)
                     raise
                 if followup_death:
-                    raise LifeDepleted(report["preplay_followup_death_reason"])
+                    runtime_error = LifeDepleted(report["preplay_followup_death_reason"])
+            reports.append(report)
+            if report.get('cancelled') or self.stop_requested():
+                if runtime_error is not None:
+                    raise runtime_error
+                raise InterruptedError('用户已停止单人演出')
+            if report.get('death_confirmed'):
+                exited = report.get('life_exit', {})
+                if (release_finished(report) and not report.get('release_error') and not report.get('exit_error')
+                        and exited.get('confirmed') is True and exited.get('page') == 'home'
+                        and retry_budget.reserve_retry(attempt_id)):
+                    report['failure_retry'] = retry_budget.snapshot()
+                    _write_json(directory / 'report.json', report)
+                    self.log(f'单人真实死亡已退出主页；累计失败 {retry_budget.failure_count} 次，'
+                             f'重试 {retry_budget.retries_used}/{retry_budget.limit}，继续剩余演出')
+                    continue
+                raise runtime_error or LifeDepleted('单人真实死亡，本次不再重试')
+            if runtime_error is not None:
+                raise runtime_error
+            self.performed_rounds += 1
             if report.get("completed"):
                 self.completed_rounds += 1
             self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
@@ -1701,5 +1746,4 @@ class SoloLive:
             if report.get("judgements"):
                 values = report["judgements"]
                 self.log(f"PERFECT {values['perfect']}，GREAT {values['great']}，GOOD {values['good']}，BAD {values['bad']}，MISS {values['miss']}；PERFECT 占比 {values['perfect_rate']:.2%}")
-            reports.append(report)
         return reports

@@ -17,6 +17,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
     [ObservableProperty] private bool _useCalibrationProfile = true;
     [ObservableProperty] private bool _cooperativeGameTimingFeedback;
     [ObservableProperty] private bool _disableLogging;
+    [ObservableProperty] private int _playFailureRetryCount;
     [ObservableProperty] private string _statusText = "保存后在下一次启动任务时生效。";
     [ObservableProperty] private string _calibrationText = "尚未生成已通过验证的校准配置。";
 
@@ -50,6 +51,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 if (logging is not null && logging.Type != JTokenType.Boolean)
                     throw new InvalidDataException("禁用日志开关必须为布尔值");
                 DisableLogging = logging?.Value<bool>() ?? false;
+                var retry = value["play_failure_retry_count"];
+                if (retry is not null && (retry.Type != JTokenType.Integer || retry.Value<long>() is < 0 or > 99))
+                    throw new InvalidDataException("中途失败重试次数必须为 0 到 99 的整数");
+                PlayFailureRetryCount = retry?.Value<int>() ?? 0;
                 if (TouchOffsetMs is < -300 or > 300 || BonusIndex is < 0 or > 11)
                     throw new InvalidDataException("触控偏移或体力数量越界");
             }
@@ -80,9 +85,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
         }
         try
         {
-        if (EngineIndex is < 0 or > 1 || TouchOffsetMs is < -300 or > 300 || BonusIndex is < 0 or > 11)
+        if (EngineIndex is < 0 or > 1 || TouchOffsetMs is < -300 or > 300 || BonusIndex is < 0 or > 11
+            || PlayFailureRetryCount is < 0 or > 99)
         {
-            StatusText = "触控偏移须为 -300 到 300 ms，每局体力须沿用游戏设置或为 0 到 10。";
+            StatusText = "触控偏移须为 -300 到 300 ms，每局体力须沿用游戏设置或为 0 到 10，中途失败重试为 0 到 99。";
             return;
         }
         var previousLogging = MaaPjskDiagnostics.Disabled;
@@ -95,7 +101,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 ["bonus_consumption"] = BonusIndex == 0 ? new JValue("current") : new JValue(BonusIndex - 1),
                 ["use_calibration_profile"] = UseCalibrationProfile,
                 ["cooperative_game_timing_feedback"] = CooperativeGameTimingFeedback,
-                ["disable_logging"] = DisableLogging
+                ["disable_logging"] = DisableLogging, ["play_failure_retry_count"] = PlayFailureRetryCount
             };
             MaaPjskDiagnostics.Apply(DisableLogging);
             Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath)!);

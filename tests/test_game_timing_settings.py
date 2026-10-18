@@ -1,13 +1,58 @@
 from dataclasses import asdict
 import json
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from project_sekai.performance_settings import PerformanceSettings, migrate_settings
 
 
 class GameTimingSettingsTests(unittest.TestCase):
+    def test_cli_temporary_override_validates_retry_without_writing_user_settings(self):
+        from agent.solo_live import load_performance
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'config/performance-settings.json'
+            path.parent.mkdir()
+            original = json.dumps(asdict(PerformanceSettings()))
+            path.write_text(original, encoding='utf-8')
+            for count in (True, '1', -1, 100):
+                values = {**asdict(PerformanceSettings(bonus_consumption=0)), 'play_failure_retry_count': count}
+                with self.subTest(count=count), patch.dict(os.environ, {'MAAPJSK_TEST_PERFORMANCE_JSON': json.dumps(values)}), self.assertRaisesRegex(ValueError, '失败重试'):
+                    load_performance(root)
+            self.assertEqual(path.read_text(encoding='utf-8'), original)
+    def test_failure_retry_defaults_off_and_old_settings_remain_unchanged(self):
+        self.assertEqual(PerformanceSettings().play_failure_retry_count, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            values = asdict(PerformanceSettings(touch_offset_ms=-51, bonus_consumption=5))
+            values.pop('play_failure_retry_count')
+            path.write_text(json.dumps(values), encoding='utf-8')
+            before = path.read_bytes()
+            loaded = PerformanceSettings.load(path)
+            self.assertEqual(loaded.play_failure_retry_count, 0)
+            self.assertEqual((loaded.touch_offset_ms, loaded.bonus_consumption), (-51, 5))
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_failure_retry_count_round_trips_and_rejects_invalid_json_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            for value in (0, 1, 99):
+                with self.subTest(value=value):
+                    values = asdict(PerformanceSettings())
+                    values['play_failure_retry_count'] = value
+                    path.write_text(json.dumps(values), encoding='utf-8')
+                    self.assertEqual(PerformanceSettings.load(path).play_failure_retry_count, value)
+            for value in (-1, 100, True, False, 1., '1', None, [], {}):
+                with self.subTest(value=value):
+                    values = asdict(PerformanceSettings())
+                    values['play_failure_retry_count'] = value
+                    path.write_text(json.dumps(values), encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError, '失败重试'):
+                        PerformanceSettings.load(path)
+
     def test_new_settings_and_missing_config_keep_feedback_off(self):
         self.assertIs(PerformanceSettings().cooperative_game_timing_feedback, False)
         with tempfile.TemporaryDirectory() as directory:

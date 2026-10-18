@@ -25,6 +25,10 @@
                     <ComboBoxItem Content="9 体力" /><ComboBoxItem Content="10 体力" />
                 </ComboBox>
             </Grid>
+            <TextBlock Text="中途失败重试次数（整次任务共用，0 关闭）" />
+            <NumericUpDown Value="{Binding PlayFailureRetryCount, Mode=TwoWay}"
+                           Minimum="0" Maximum="99" Increment="1" FormatString="0" />
+            <TextBlock Text="仅普通单人／协力的真实演出死亡可重试，失败局不计目标，成功不重置预算。单人退出游戏主页后继续；协力切出后关闭并重新登录日服游戏。任务结束或手动停止时显示累计失败次数；校准、一键和 AUTO 不使用此设置。" TextWrapping="Wrap" />
             <CheckBox Content="自动使用当前设备、难度已通过验证的 Native 校准配置"
                       IsChecked="{Binding UseCalibrationProfile, Mode=TwoWay}" />
             <CheckBox Content="协力演奏中按 FAST / LATE 微调（试验）"

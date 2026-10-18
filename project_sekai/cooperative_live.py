@@ -16,6 +16,8 @@ from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import compile_touches
 from .game_timing import GameTimingGuard, GameTimingTemplates
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
+from .failure_retry import FailureRetryBudget
+from .game_login import GameLogin
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, input_finished, release_finished
 from .live_exit import background_game as exit_to_emulator_home
 from .navigator import Navigator
@@ -815,7 +817,11 @@ class CooperativeLive(SoloLive):
             self.pause(1.)
 
     def finish_death(self, report, directory):
+        self.record_retry_death(report)
         self.wait_death_release(report, directory)
+        budget = getattr(self, 'failure_retry_budget', None)
+        if budget is not None:
+            budget.publish()
         while True:
             self.check_runtime_stop()
             try:
@@ -826,6 +832,67 @@ class CooperativeLive(SoloLive):
             except Exception as error:
                 self.recovery_state(report, directory, "waiting_connection", error)
                 self.pause(2.)
+
+    def record_retry_death(self, report):
+        budget = getattr(self, 'failure_retry_budget', None)
+        if budget is not None:
+            budget.record_failure(self._failure_retry_event_id, publish=False)
+            if release_finished(report):
+                budget.publish()
+            report['failure_retry'] = budget.snapshot()
+
+    def restart_after_death(self, report, directory):
+        self.check_runtime_stop()
+        if (not release_finished(report) or getattr(self, 'pending_native_player', None) is not None
+                or report.get('background_exit', {}).get('confirmed') is not True):
+            raise RuntimeError('协力死亡尚无当前释放及模拟器主页证明，禁止重启游戏')
+        restart = report.setdefault('failure_retry_restart', {})
+        self.device.checked_shell('am force-stop com.sega.pjsekai')
+        restart['force_stop_completed'] = True
+        self.check_runtime_stop()
+        stopped = self.device.checked_shell('if pidof com.sega.pjsekai >/dev/null 2>&1; then echo MAAPJSK_RUNNING; else probe_status=$?; if [ "$probe_status" -eq 1 ]; then echo MAAPJSK_STOPPED; else echo MAAPJSK_PROBE_FAILED; fi; fi')
+        if stopped.strip() != 'MAAPJSK_STOPPED':
+            raise RuntimeError('日服游戏进程未明确关闭，禁止重新启动')
+        restart['process_stopped_confirmed'] = True
+        self.check_runtime_stop()
+        def launch_game():
+            self.check_runtime_stop()
+            self.device.checked_shell('monkey -p com.sega.pjsekai -c android.intent.category.LAUNCHER 1')
+            self.check_runtime_stop()
+        login = GameLogin(self.device, self.navigator, self.report_root.parent / 'game-login-runs',
+                          stop_requested=self.stop_requested, log_message=self.safe_log,
+                          ocr=getattr(self, 'ocr', None), launch_game=launch_game)
+        restart['login'] = login.run(wait_for_home=True)
+        self.check_runtime_stop()
+        if restart['login'].get('completed') is not True or restart['login'].get('phase') != 'home_confirmed':
+            raise RuntimeError('协力重启登录尚未确认游戏主页，停止重试')
+
+    def retry_dead_performance(self, report, directory):
+        self.check_runtime_stop()
+        budget = self.failure_retry_budget
+        self.record_retry_death(report)
+        if (report.get('cancelled') or not release_finished(report)
+                or getattr(self, 'pending_native_player', None) is not None
+                or report.get('background_exit', {}).get('confirmed') is not True
+                or not budget.reserve_retry(self._failure_retry_event_id)):
+            return False
+        report['failure_retry'] = budget.snapshot()
+        self.persist_runtime_report(report, directory)
+        try:
+            self.check_runtime_stop()
+            self.restart_after_death(report, directory)
+        except Exception as error:
+            report['failure_retry_restart_error'] = f'{type(error).__name__}: {error}'
+            self.persist_runtime_report(report, directory)
+            raise
+        self.persist_runtime_report(report, directory)
+        self.round_rematches = self.entry_request_count = self.menu_request_count = self.join_request_count = 0
+        self.entry_deadline = self.join_deadline = None
+        self.resume_selection, self.resume_stage, self.matched = False, None, False
+        self.room_progress = {}
+        self.safe_log(f'协力真实死亡后已重启登录；累计失败 {budget.failure_count} 次，'
+                      f'重试 {budget.retries_used}/{budget.limit}，继续剩余演出')
+        return True
 
     def save_recovery_evidence(self, report, directory):
         if report.get("playback") is not None and not release_finished(report):
@@ -1235,7 +1302,13 @@ class CooperativeLive(SoloLive):
         return life_visible
 
     def background_game(self, report, directory, reason):
-        return exit_to_emulator_home(self.device, report, directory, reason, self.log, stop_requested=self.stop_requested)
+        budget = getattr(self, 'failure_retry_budget', None)
+        def log_exit(message):
+            if reason == 'life_zero' and budget is not None and budget.retries_used < budget.limit:
+                self.safe_log('协力本局失败，已返回模拟器主页；准备按剩余重试次数重启并继续')
+            else:
+                self.safe_log(message)
+        return exit_to_emulator_home(self.device, report, directory, reason, log_exit, stop_requested=self.stop_requested)
 
     def read_result(self, frame):
         if self.score(frame, "cooperative_personal_result") < self.navigator.threshold:
@@ -1440,7 +1513,10 @@ class CooperativeLive(SoloLive):
             raise RuntimeError("协力输入派发、设备执行或本轮释放不完整，不能计入完成")
 
     def run(self, count, difficulty, song_mode, offset_ms=0, *, room="free", bonus_consumption="current",
-            recovery_mode="off", recovery_count=1, engine="legacy", max_rematches=3, game_timing_feedback=False):
+            recovery_mode="off", recovery_count=1, engine="legacy", max_rematches=3, game_timing_feedback=False,
+            play_failure_retry_count=0):
+        self.failure_retry_budget = FailureRetryBudget(
+            play_failure_retry_count, on_change=getattr(self, 'failure_retry_changed', None))
         if (type(count) is not int or not 1 <= count <= 999 or difficulty not in COOPERATIVE_DIFFICULTIES
                 or song_mode not in {"current", "random"} or room not in {"free", "veteran"}
                 or type(offset_ms) is not int or not -300 <= offset_ms <= 300
@@ -1468,6 +1544,7 @@ class CooperativeLive(SoloLive):
         self.safe_log(f"协力谱面演出：已完成 0 / 总数 {count}；{'自由' if room == 'free' else '资深'}公房；{difficulty.upper()}")
         while self.performed_rounds < count:
             self.check_runtime_stop()
+            self._failure_retry_event_id = uuid4().hex
             round_index = self.performed_rounds + 1
             directory = self.report_root / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
             self.make_report_directory(directory)
@@ -1644,6 +1721,8 @@ class CooperativeLive(SoloLive):
                 report["cancelled"] = self.stop_requested() or isinstance(error, InterruptedError)
                 report["death_confirmed"] = (report.get("death_confirmed", False) or isinstance(error, LifeDepleted)
                                              or self.life_guard.zero_confirmed)
+                if report['death_confirmed']:
+                    self.record_retry_death(report)
                 if not report["cancelled"]:
                     try:
                         # 先保存实际失败页；HOME 后另存桌面，避免把退出后的截图当作识别失败证据。
@@ -1652,6 +1731,7 @@ class CooperativeLive(SoloLive):
                         pass
                 report["joined_room"] = report.get("joined_room", False) or bool(getattr(self, "matched", False))
                 if report["death_confirmed"] and not report["cancelled"]:
+                    self.record_retry_death(report)
                     self.finish_death(report, directory)
                     runtime_error = LifeDepleted(report.get("failure_reason", str(error)))
                 elif report["cancelled"]:
@@ -1666,10 +1746,18 @@ class CooperativeLive(SoloLive):
             if report["completed"]:
                 self.completed_rounds += 1
             reports.append(report)
+            if report.get('death_confirmed') and not report.get('cancelled'):
+                if self.retry_dead_performance(report, directory):
+                    continue
             if report.get("cancelled") or report.get("death_confirmed"):
                 raise runtime_error or InterruptedError("用户已停止协力")
             if runtime_error is not None:
-                self.recover_runtime_failure(report, directory, runtime_error)
+                try:
+                    self.recover_runtime_failure(report, directory, runtime_error)
+                except LifeDepleted:
+                    if self.retry_dead_performance(report, directory):
+                        continue
+                    raise
                 continue
             if report.get("performance_completed"):
                 self.performed_rounds += 1

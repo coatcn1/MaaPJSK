@@ -154,6 +154,27 @@ public void StartTask()
 
 & (Join-Path $PSScriptRoot 'patch-mfa-diagnostics.ps1') -SourceRoot $sourceRoot -ProjectRoot $projectRoot
 
+# 真实队列和停止回调都必须连到同一作用域桥，不能只编译出一个未被调用的弹窗工具。
+$patchedProcessor = [IO.File]::ReadAllText($processorPath)
+foreach ($contract in @(
+    'failureSummary.Prepare(task, param)',
+    'HandleStopResult(status, stopResult, onlyStart, action, isUpdateRelated, failureSummary)',
+    'private void ExecuteStopCore(bool finished, Func<Task> stopAction, MaaPjskFailureSummary? failureSummary)',
+    'await stopAction();',
+    'failureSummary?.MarkTaskSubmitted();',
+    'executionSummary?.MarkExecutionReturned();',
+    'EnqueueCommand(() => StopProjectExecution(status, finished, onlyStart, action, summary))'
+)) {
+    if ($patchedProcessor.Split(@($contract), [StringSplitOptions]::None).Count -ne 2) {
+        throw "失败重试终态桥未接入实际 MFA 路径：$contract"
+    }
+}
+if ($patchedProcessor.Contains('Action stopAction') -or $patchedProcessor.Contains('var stopResult = MaaJobStatus.Succeeded;') -or
+    $patchedProcessor.Contains('EnqueueCommand(() => StopInternal(status, finished, onlyStart, action))') -or
+    ([regex]::Matches($patchedProcessor, 'catch \(Exception ex\) \{ HandleStopException\(ex, failureSummary\); \}').Count -ne 2)) {
+    throw '失败重试停止桥仍有未等待的旧签名、假定成功或缺失异常捕获。'
+}
+
 $buildRoot = Join-Path $outputRoot 'build'
 dotnet build (Join-Path $sourceRoot 'MFAAvalonia\MFAAvalonia.csproj') -c Release -r win-x64 -o $buildRoot --nologo -v quiet
 if ($LASTEXITCODE -ne 0) { throw '谱面管理设置页编译失败' }

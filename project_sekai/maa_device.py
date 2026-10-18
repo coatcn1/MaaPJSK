@@ -56,6 +56,14 @@ class MaaDevice:
         _bind_shell_api()
         return str(self.controller.post_shell(command, 5000).wait().get())
 
+    def checked_shell(self, command: str) -> str:
+        _bind_shell_api()
+        job = self.controller.post_shell(command, 5000).wait()
+        # 重启游戏必须确认本次作业成功；失败时不能读取可能残留的旧输出。
+        if not job.succeeded:
+            raise RuntimeError('MFA 控制器 shell 作业失败，停止游戏重启')
+        return str(job.get())
+
     def preflight(self) -> None:
         self.screenshot()
         density = self.shell("wm density")
