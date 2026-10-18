@@ -138,8 +138,19 @@ sys.exit(2 if mode=='partial' else 0)
         using (var execution = MaaPjskMaintenance.BeginExecution()) Wait(MaaPjskFirstLiveSync.PrepareAsync(CancellationToken.None));
         Require(MaaPjskFirstLiveSync.IsPrepared && entries.All(entry => !MaaPjskFirstLiveSync.NeedsSync([entry])),
             "partial完整索引允许继续，同进程后续演出不重复同步，已有弹窗不阻塞");
-        existing.Dialog.ActionButtons.OfType<Button>().Single().RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-        Dispatcher.UIThread.RunJobs();
+        var warningShown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        SukiDialogManagerEventHandler onWarningShown = (_, args) =>
+        {
+            if (args.Dialog.Title == "谱面同步部分失败") warningShown.TrySetResult();
+        };
+        manager.OnDialogShown += onWarningShown;
+        try
+        {
+            existing.Dialog.ActionButtons.OfType<Button>().Single().RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            // 异步续体未必赶上一次 RunJobs；等待实际目标事件，并沿既有有界等待持续处理 UI 队列。
+            Wait(warningShown.Task);
+        }
+        finally { manager.OnDialogShown -= onWarningShown; }
         Require(dialogs.Count == 1 && dialogs[0].Title == "谱面同步部分失败", "自动同步警告须在已有弹窗关闭后保留显示");
         Dismiss();
         var fresh = Process.Start(new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false,
