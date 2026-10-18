@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .chart_catalog import _write_json
+from .failure_retry import validate_retry_count
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class PerformanceSettings:
     use_calibration_profile: bool = True
     cooperative_game_timing_feedback: bool = False
     disable_logging: bool = False
+    play_failure_retry_count: int = 0
 
     @classmethod
     def load(cls, path: Path):
@@ -27,7 +29,13 @@ class PerformanceSettings:
         # 旧版配置缺少试验开关时保持关闭，不能因新增字段而拒绝原有演奏设置。
         values.setdefault("cooperative_game_timing_feedback", False)
         values.setdefault("disable_logging", False)
+        values.setdefault("play_failure_retry_count", 0)
         result = cls(**{key: values[key] for key in cls.__dataclass_fields__})
+        return result.validate()
+
+    def validate(self):
+        result = self
+        validate_retry_count(result.play_failure_retry_count)
         if (result.engine not in {"legacy", "native"} or type(result.touch_offset_ms) is not int
                 or not -300 <= result.touch_offset_ms <= 300 or type(result.use_calibration_profile) is not bool):
             raise ValueError("演奏引擎或谱面触控偏移无效")

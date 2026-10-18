@@ -520,6 +520,7 @@ sys.exit(2 if mode == 'partial' else 0)
         performance.BonusIndex = 12; performance.SaveCommand.Execute(null);
         Require(savedBefore.SequenceEqual(File.ReadAllBytes(savedPerformance)), "越界体力数量不能写入配置");
         performance.BonusIndex = 6;
+        FailureRetrySmoke.Run(Require, operation => Wait(operation));
         AvaloniaHeadlessPlatform.ForceRenderTimerTick();
         using var performanceBitmap = performanceWindow.CaptureRenderedFrame() ?? throw new InvalidOperationException("演奏设置未渲染");
         performanceBitmap.Save(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[1]))!, "performance-settings.png"));

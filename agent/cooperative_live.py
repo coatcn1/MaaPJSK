@@ -9,6 +9,7 @@ from maa.agent.agent_server import AgentServer
 from maa.custom_action import CustomAction
 
 from project_sekai.cooperative_live import CooperativeLive
+from project_sekai.failure_summary import attach_failure_summary, finish_failure_summary
 from project_sekai.maa_device import MaaDevice
 from project_sekai.game_login import GameLogin
 from project_sekai.song_identity import COOPERATIVE_DIFFICULTIES
@@ -100,6 +101,8 @@ class ProjectSekaiCooperativeLiveConfig(CustomAction):
 class ProjectSekaiCooperativeLive(CustomAction):
     def run(self, context, argv):
         workflow, settings = None, None
+        summary = None
+        outcome = 'failed'
         try:
             settings = _SETTINGS.pop(task_id(argv), None)
             if context.tasker.stopping:
@@ -108,12 +111,18 @@ class ProjectSekaiCooperativeLive(CustomAction):
                 raise ValueError("协力配置不完整，请从任务入口重新运行")
             root = Path(__file__).resolve().parents[1]
             performance = load_performance(root)
+            retry_limit = getattr(performance, 'play_failure_retry_count', 0)
+            summary = attach_failure_summary(root, getattr(argv, 'custom_action_param', ''), 'cooperative', retry_limit)
+            if summary is not None:
+                summary.update({'target_rounds': settings['count']})
             if type(performance.cooperative_game_timing_feedback) is not bool:
                 raise ValueError("协力 FAST / LATE 微调开关必须为布尔值")
             # 单人 Profile 尚未验证协力链路；显式失败，不能静默复用或忽略用户的校准开关。
             if performance.engine == "native" and performance.use_calibration_profile:
                 raise RuntimeError("协力尚无独立验收的校准配置，请在演奏设置中关闭自动使用校准配置后采用手动偏移")
             workflow = create_workflow(context, root)
+            if summary is not None:
+                workflow.failure_retry_changed = summary.update
             feedback_status = "开" if performance.cooperative_game_timing_feedback else "关"
             try:
                 visible_log(context, f"协力演奏设置：{performance.engine}；手动触控偏移 {performance.touch_offset_ms} ms；"
@@ -124,9 +133,12 @@ class ProjectSekaiCooperativeLive(CustomAction):
             workflow.run(settings["count"], settings["difficulty"], settings["song_mode"], performance.touch_offset_ms,
                          room=settings["room"], bonus_consumption=performance.bonus_consumption,
                          recovery_mode=settings["recovery_mode"], recovery_count=settings["recovery_count"],
-                         engine=performance.engine, game_timing_feedback=performance.cooperative_game_timing_feedback)
+                         engine=performance.engine, game_timing_feedback=performance.cooperative_game_timing_feedback,
+                         play_failure_retry_count=retry_limit)
+            outcome = 'succeeded'
             return True
         except InterruptedError:
+            outcome = 'stopped'
             return False
         except Exception as error:
             if not context.tasker.stopping:
@@ -138,3 +150,6 @@ class ProjectSekaiCooperativeLive(CustomAction):
                     traceback.print_exc()
             traceback.print_exc()
             return False
+        finally:
+            if not finish_failure_summary(summary, workflow, 'stopped' if context.tasker.stopping else outcome):
+                return False

@@ -12,6 +12,7 @@ from project_sekai.maa_device import MaaDevice
 from project_sekai.game_login import login_at_task_start
 from project_sekai.solo_live import SoloLive
 from project_sekai.performance_settings import PerformanceSettings
+from project_sekai.failure_summary import attach_failure_summary, finish_failure_summary
 from project_sekai.calibration import CalibrationProfiles, CalibrationRunner, environment_signature
 
 
@@ -26,7 +27,7 @@ def load_performance(root: Path):
         temporary = json.loads(override)
         if temporary.get("bonus_consumption") != 0 and os.environ.get("MAAPJSK_TEST_ALLOW_STAMINA") != "1":
             raise ValueError("独立验收只允许 0 体力")
-        settings = PerformanceSettings(**temporary)
+        settings = PerformanceSettings(**temporary).validate()
         if settings.engine not in {"legacy", "native"} or not -300 <= settings.touch_offset_ms <= 300:
             raise ValueError("独立验收演奏设置无效")
     from project_sekai.diagnostics import configure
@@ -120,6 +121,8 @@ class ProjectSekaiSoloLive(CustomAction):
     def run(self, context, argv) -> bool:
         workflow = None
         settings = None
+        summary = None
+        outcome = 'failed'
         try:
             if context.tasker.stopping:
                 return False
@@ -131,7 +134,13 @@ class ProjectSekaiSoloLive(CustomAction):
                 raise ValueError("单人谱面任务配置不完整")
             root = Path(__file__).resolve().parents[1]
             performance = load_performance(root)
+            retry_limit = getattr(performance, 'play_failure_retry_count', 0)
+            summary = attach_failure_summary(root, getattr(argv, 'custom_action_param', ''), 'solo', retry_limit)
+            if summary is not None:
+                summary.update({'target_rounds': settings['count']})
             workflow = create_workflow(context, root)
+            if summary is not None:
+                workflow.failure_retry_changed = summary.update
             profile = None
             if performance.engine == "native" and performance.use_calibration_profile:
                 environment = environment_signature(workflow.device)
@@ -145,9 +154,12 @@ class ProjectSekaiSoloLive(CustomAction):
                          recovery_count=settings["recovery_count"], engine=performance.engine,
                          latency_offsets=profile.get("latency_offsets", {}) if profile else None,
                          calibration_profile=profile,
+                         play_failure_retry_count=retry_limit,
                          **({"song_name": settings["song_name"]} if settings["song_mode"] == "specified" else {}))
+            outcome = 'succeeded'
             return True
         except InterruptedError:
+            outcome = 'stopped'
             return False
         except Exception as error:
             if not context.tasker.stopping:
@@ -174,6 +186,9 @@ class ProjectSekaiSoloLive(CustomAction):
                     traceback.print_exc()
             traceback.print_exc()
             return False
+        finally:
+            if not finish_failure_summary(summary, workflow, 'stopped' if context.tasker.stopping else outcome):
+                return False
 
 
 @AgentServer.custom_action("ProjectSekaiNativeCalibration")

@@ -29,13 +29,14 @@ def title_menu_ready(frame):
 
 class GameLogin:
     def __init__(self, device, navigator, report_root, *, stop_requested=None, log_message=None,
-                 clock=None, sleeper=None, ocr_root=None, ocr=None):
+                 clock=None, sleeper=None, ocr_root=None, ocr=None, launch_game=None):
         self.device, self.navigator = device, navigator
         self.report_root = Path(report_root)
         self.stop_requested = stop_requested or (lambda: False)
         self.log = log_message or (lambda message: print(message, flush=True))
         self.clock, self.sleeper = clock or time.monotonic, sleeper or time.sleep
         self.ocr_root, self.ocr = ocr_root, ocr
+        self.launch_game = launch_game
 
     def check_stop(self):
         if self.stop_requested():
@@ -167,7 +168,10 @@ class GameLogin:
                     self.check_stop()
                     self.safe_log("当前日服未在前台，启动游戏并等待标题登录")
                     # 启动指定日服包，不强停用户的其他前台应用。
-                    self.device.shell("monkey -p com.sega.pjsekai -c android.intent.category.LAUNCHER 1")
+                    if self.launch_game is None:
+                        self.device.shell("monkey -p com.sega.pjsekai -c android.intent.category.LAUNCHER 1")
+                    else:
+                        self.launch_game()
                 elif (title and title_menu_ready(frame) and report["title_requests"] < 3
                       and self.clock() - self._last_title >= 5.):
                     # shell 检查可能经历页面切换，点击前必须重新取帧并再次确认标题。

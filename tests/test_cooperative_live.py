@@ -111,7 +111,7 @@ class CooperativeTests(unittest.TestCase):
                 patch.object(agent, "create_workflow", return_value=workflow), patch.object(agent, "visible_log") as log:
             self.assertTrue(agent.ProjectSekaiCooperativeLive().run(context, argv))
         workflow.run.assert_called_once_with(1, "easy", "current", -51, room="free", bonus_consumption=5,
-                                            recovery_mode="off", recovery_count=1, engine="native", game_timing_feedback=False)
+                recovery_mode="off", recovery_count=1, engine="native", game_timing_feedback=False, play_failure_retry_count=0)
         self.assertEqual(performance.bonus_consumption, 5)
         self.assertIn("FAST / LATE 微调（试验）：关", log.call_args.args[1])
 
