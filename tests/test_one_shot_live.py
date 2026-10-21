@@ -256,6 +256,19 @@ class OneShotTests(unittest.TestCase):
             self.assertFalse(agent.ProjectSekaiOneShotLive().run(context, argv))
             create.assert_not_called()
 
+    def test_trace_candidate_request_is_reported_and_announced_once_before_start(self):
+        for flag in ('0', '1'):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, {'MAAPJSK_TRACE_OPENING_HEAD_GUARD': flag,
+                                            'MAAPJSK_GOLD_TAP_HEAD_GUARD': '1'}):
+                workflow = self.workflow(Path(directory))
+                report = workflow.run('master', -51)
+                self.assertEqual(report['trace_opening_head_guard_requested'], flag == '1')
+                messages = [str(call.args[0]) for call in workflow.log.call_args_list]
+                announced = [message for message in messages if 'TRACE首头候选请求' in message]
+                self.assertEqual(len(announced), 1)
+                self.assertIn('开启' if flag == '1' else '关闭', announced[0])
+
     def test_one_song_finishes_without_navigation_or_result_collection(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = self.workflow(Path(directory))
@@ -403,6 +416,29 @@ class OneShotTests(unittest.TestCase):
             workflow.device.home.assert_not_called()
             self.assertIn("释放", workflow.last_report["background_error"])
             self.assertFalse(workflow.last_report["completed"])
+
+    def test_failed_close_never_encodes_retained_opening_evidence(self):
+        from project_sekai.opening_head import OpeningEvidence
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.workflow(Path(directory))
+            player = self.native()
+            player.close.side_effect = RuntimeError('reset 失败')
+            original_start = workflow.start.side_effect
+            def start(*args, **kwargs):
+                result = original_start(*args, **kwargs)
+                frame = np.zeros((720, 1280, 3), np.uint8)
+                workflow.anchor_frames = [(10., frame)]
+                workflow.opening_evidence = OpeningEvidence(True)
+                workflow.opening_evidence.observe(10., frame, {'nonempty': True, 'reason': 'incomplete'})
+                return result
+            workflow.start.side_effect = start
+            with patch('project_sekai.native_player.NativePlayer', return_value=player), \
+                    patch('project_sekai.solo_live.write_image') as encode, self.assertRaisesRegex(RuntimeError, 'reset'):
+                workflow.run('master', engine='native')
+            encode.assert_not_called()
+            self.assertFalse(player.report['release_confirmed'])
+            self.assertIn('释放证明不足', workflow.last_report['opening_evidence_warning'])
+            self.assertTrue(workflow.anchor_frames)
 
     def test_incomplete_native_execution_cannot_become_successful_finish(self):
         with tempfile.TemporaryDirectory() as directory:

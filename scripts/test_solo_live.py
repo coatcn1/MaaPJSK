@@ -57,6 +57,15 @@ def main():
     if not arguments.inspect_only and ((arguments.recovery_mode != "off" and not arguments.allow_item_use) or arguments.bonus_consumption == "current"
             or (arguments.bonus_consumption != "0" and not arguments.allow_stamina_spend)):
         parser.error("独立验收默认 0 体力且关闭用药；消耗体力需 --allow-stamina-spend，用药另需 --allow-item-use")
+    from scripts.task_wake import TaskWakeScope
+    # 独立CLI关闭MFA后不持有GUI的任务保护；连接前申请，直到停止、释放和Agent退出后才恢复。
+    with TaskWakeScope() as wake:
+        if wake.active:
+            print("已确认Windows任务防息屏和防休眠请求；本次验收结束后恢复原状态", flush=True)
+        _run(arguments)
+
+
+def _run(arguments):
     runtime = arguments.mfa_root.resolve()
     sys.path[:0] = [str(runtime), str(runtime / "agent")]
     from maa.controller import AdbController
@@ -147,18 +156,48 @@ def main():
         result = tasker.post_task("SoloChartCalibration" if arguments.calibrate else "SoloChartLive", overrides).wait()
         if not result.succeeded:
             raise RuntimeError("单人谱面验收任务未完成，查看 debug/solo-chart-runs 本局报告")
-    except BaseException:
+    except BaseException as error:
         # 超时、连接异常和用户停止都先通知任务清理触点，再断开 Agent。
-        tasker.post_stop().wait()
+        try:
+            tasker.post_stop().wait()
+        except BaseException as stop_error:
+            error.add_note(f"验收停止清理异常：{type(stop_error).__name__}: {stop_error}")
         raise
     finally:
-        client.disconnect()
+        _finish_acceptance_agent(client, agent, primary_error=sys.exception())
+    print("单人谱面验收完成")
+
+
+def _finish_acceptance_agent(client, agent, *, primary_error=None):
+    import subprocess
+    cleanup_errors = []
+    try:
+        try:
+            client.disconnect()
+        except BaseException as error:
+            cleanup_errors.append(error)
+    finally:
+        # IPC断开失败也必须等待Agent退出；外层防息屏作用域始终覆盖当前进程收尾。
         try:
             agent.wait(timeout=8)
         except subprocess.TimeoutExpired:
-            agent.terminate()
-            agent.wait(timeout=5)
-    print("单人谱面验收完成")
+            try:
+                agent.terminate()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                agent.wait(timeout=5)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        except BaseException as error:
+            cleanup_errors.append(error)
+    if cleanup_errors:
+        original = primary_error or cleanup_errors[0]
+        for error in cleanup_errors:
+            if error is not original:
+                original.add_note(f"验收Agent收尾异常：{type(error).__name__}: {error}")
+        if primary_error is None:
+            raise original
 
 
 if __name__ == "__main__":

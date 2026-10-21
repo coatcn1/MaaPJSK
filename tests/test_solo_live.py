@@ -991,7 +991,7 @@ class SoloTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report,Path(directory))
         self.assertTrue(report['completed'])
-        self.assertEqual(workflow.device.back.call_count,1)
+        self.assertEqual(workflow.device.back.call_count,0)
         self.assertEqual(workflow.device.tap.call_args.args,(1279,719))
 
     def test_judgement_page_arriving_in_confirmation_frame_is_read_before_back(self):
@@ -1003,6 +1003,319 @@ class SoloTests(unittest.TestCase):
         self.assertTrue(report['completed'])
         self.assertEqual(report['judgements']['total'],259)
         self.assertEqual(workflow.device.back.call_count,0)
+
+    def test_late_digits_in_main_loop_are_observed_before_any_settlement_input(self):
+        unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 160, 180)]
+        workflow = self._collection([unknown, judge, judge, home, home], None, None, judge)
+        reads = []
+        original_read = workflow.read_result
+        def read_result(frame):
+            workflow._result_label_visible = frame is unknown
+            reads.append(frame)
+            return original_read(frame)
+        workflow.read_result = read_result
+        def input_gate(*args):
+            self.assertGreaterEqual(sum(frame is judge for frame in reads), 2)
+        workflow.device.tap.side_effect = input_gate
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
+        end_guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.LiveEndGuard', return_value=end_guard):
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['completed'])
+
+    def test_late_digits_after_animation_tap_are_observed_before_back(self):
+        clear, unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (130, 150, 170, 190)]
+        workflow = self._collection([clear, unknown, unknown, judge, judge, home, home], clear, None, judge)
+        reads = []
+        original_read = workflow.read_result
+        workflow.read_result = lambda frame: (reads.append(frame), original_read(frame))[1]
+        workflow.device.back.side_effect = lambda: self.assertGreaterEqual(sum(frame is judge for frame in reads), 2)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['completed'])
+
+    def test_clear_then_long_comic_transition_preserves_result_fade_in_budget(self):
+        clear, comic, label, judge, home = [np.full((720, 1280, 3), value, np.uint8)
+                                          for value in (130, 150, 160, 170, 190)]
+        sequence = [clear] + [comic] * 18 + [clear, label, judge, judge, home, home]
+        workflow = self._collection(sequence, clear, None, judge)
+        clock = SimpleNamespace(now=0., current=None, judge_reads=0)
+        frames = iter(sequence)
+        def screenshot():
+            clock.current = next(frames)
+            return clock.current
+        def read_result(frame):
+            workflow._result_label_visible = frame is label or frame is judge
+            if frame is judge:
+                clock.judge_reads += 1
+                return LiveResult(250, 5, 2, 1, 1)
+        def input_gate(*args):
+            if any(clock.current is frame for frame in (comic, label, judge)):
+                self.assertGreaterEqual(clock.judge_reads, 2, '漫画及成绩淡入不能耗尽真正数字页预算')
+        workflow.screenshot.side_effect = screenshot
+        workflow.read_result = read_result
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.device.tap.side_effect = input_gate
+        workflow.device.back.side_effect = input_gate
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['completed'])
+        self.assertEqual(report['result_status'], 'recorded')
+        self.assertEqual(clock.judge_reads, 2)
+
+    def test_completed_unknown_without_result_label_keeps_original_global_deadline(self):
+        clear, unknown, home = [np.full((720, 1280, 3), value, np.uint8) for value in (130, 150, 190)]
+        workflow = self._collection([clear, unknown, home], clear, None, None)
+        clock = SimpleNamespace(now=0., reads=0)
+        def screenshot():
+            clock.reads += 1
+            return clear if clock.reads == 1 else unknown
+        workflow.screenshot.side_effect = screenshot
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now):
+            with self.assertRaisesRegex(TimeoutError, '结算返回超时'):
+                workflow.collect(report, Path(directory))
+        self.assertGreaterEqual(clock.now, 120.)
+        self.assertLess(clock.now, 120.4)
+        workflow.device.tap.assert_called_once_with(1279, 719)
+        workflow.device.back.assert_not_called()
+        self.assertNotIn('judgements', report)
+        self.assertNotIn('returned_home', report)
+
+    def test_unreadable_digits_share_one_finite_budget_then_preserve_warning(self):
+        clear, label, home = [np.full((720, 1280, 3), value, np.uint8) for value in (130, 150, 190)]
+        workflow = self._collection([clear, label, home], clear, None, None)
+        clock = SimpleNamespace(now=0., reads=0)
+        def screenshot():
+            clock.reads += 1
+            self.assertLess(clock.reads, 25)
+            return home if workflow.device.back.called else clear if clock.reads == 1 else label
+        workflow.read_result = lambda frame: setattr(workflow, '_result_label_visible', frame is label)
+        workflow.screenshot.side_effect = screenshot
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now):
+            workflow.collect(report, Path(directory))
+        self.assertGreaterEqual(clock.now, 4.2)
+        self.assertLess(clock.now, 10.)
+        self.assertFalse(report['completed'])
+        self.assertEqual(report['result_status'], 'unreadable')
+        workflow.device.back.assert_called_once()
+
+    def test_tips_cannot_spend_digit_budget_before_clear_in_either_collection_path(self):
+        for confirmation in (False, True):
+            with self.subTest(confirmation=confirmation):
+                tips, clear, unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8)
+                                                    for value in (110, 130, 150, 170, 190)]
+                sequence = [tips] * 14 + [clear, unknown, unknown, unknown, unknown, judge, judge, home, home]
+                if confirmation:
+                    sequence.insert(0, tips)
+                workflow = self._collection(sequence, clear, None, judge)
+                clock = SimpleNamespace(now=0., current=None, judge_reads=0)
+                frames = iter(sequence)
+                def screenshot():
+                    clock.current = next(frames)
+                    return clock.current
+                def read_result(frame):
+                    if frame is judge:
+                        clock.judge_reads += 1
+                        return LiveResult(250, 5, 2, 1, 1)
+                def input_gate(*args):
+                    if clock.current is unknown or clock.current is judge:
+                        self.assertGreaterEqual(clock.judge_reads, 2, 'TIPS 不能耗尽后续成绩数字的观察机会')
+                workflow.screenshot.side_effect = screenshot
+                workflow.read_result = read_result
+                workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+                workflow.device.tap.side_effect = input_gate
+                workflow.device.back.side_effect = input_gate
+                report = {'engine': 'legacy', 'playback': {'release_confirmed': True},
+                          'chart': {'total_note_count': 259}}
+                guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+                with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+                    workflow.collect(report, Path(directory))
+                self.assertTrue(report['completed'])
+
+    def test_perfect_label_without_clear_starts_budget_even_when_digits_are_not_ready(self):
+        label, unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8)
+                                       for value in (110, 130, 150, 190)]
+        workflow = self._collection([label, unknown, judge, judge, home, home], None, None, judge)
+        reads = []
+        def read_result(frame):
+            workflow._result_label_visible = frame is label
+            reads.append(frame)
+            return LiveResult(250, 5, 2, 1, 1) if frame is judge else None
+        workflow.read_result = read_result
+        workflow.device.tap.side_effect = lambda *args: self.assertGreaterEqual(sum(frame is judge for frame in reads), 2)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['completed'])
+
+    def test_result_label_marker_is_current_frame_only_even_if_digit_reading_fails(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.ocr = Mock()
+        workflow.ocr.read.side_effect = [Reading('PERFECT', .99), Reading('TIPS', .99)]
+        workflow.read_judgement_number = Mock(side_effect=ValueError('数字尚未出现'))
+        frame = np.full((720, 1280, 3), 110, np.uint8)
+        self.assertIsNone(workflow.read_result(frame))
+        self.assertTrue(workflow._result_label_visible)
+        self.assertIsNone(workflow.read_result(frame))
+        self.assertFalse(workflow._result_label_visible)
+        self.assertEqual(workflow.ocr.read.call_count, 2)
+
+    def test_collection_cannot_inherit_result_label_from_a_previous_round(self):
+        tips, home = [np.full((720, 1280, 3), value, np.uint8) for value in (110, 190)]
+        workflow = self._collection([tips, home, home], None, None, None)
+        workflow._result_label_visible = True
+        clock = SimpleNamespace(now=0., tap_at=None)
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.device.tap.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect({'playback': {'release_confirmed': True}}, Path(directory))
+        self.assertIsNone(clock.tap_at)
+        self.assertFalse(workflow._result_label_visible)
+
+    def test_reappearing_result_labels_cannot_restart_the_single_digit_budget(self):
+        page, home = [np.full((720, 1280, 3), value, np.uint8) for value in (110, 190)]
+        workflow = self._collection([page, home], None, None, None)
+        clock = SimpleNamespace(now=0., reads=0, tap_at=None)
+        workflow.screenshot.side_effect = lambda: home if workflow.device.back.called else page
+        def read_result(frame):
+            clock.reads += 1
+            workflow._result_label_visible = frame is page and clock.reads % 2 == 1
+        workflow.read_result = read_result
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.device.tap.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect({'playback': {'release_confirmed': True}}, Path(directory))
+        self.assertGreaterEqual(clock.tap_at, 3.)
+        self.assertLess(clock.tap_at, 3.6)
+        workflow.device.back.assert_called_once()
+
+    @staticmethod
+    def _settlement_loading_frame(*, light=False, slots=8):
+        frame = np.full((720, 1280, 3), 35, np.uint8)
+        if light:
+            frame[:] = np.linspace((255, 252, 248), (250, 220, 185), 720).astype(np.uint8)[:, None, :]
+        else:
+            cv2.rectangle(frame, (150, 100), (1000, 510), (90, 70, 65), -1)
+            cv2.putText(frame, 'TIPS', (400, 300), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
+        for x, y in ((36, 15), (56, 23), (64, 43), (56, 63), (36, 71), (16, 63), (8, 43), (16, 23))[:slots]:
+            cv2.circle(frame, (1185 + x, 618 + y), 3, (255, 255, 255), -1)
+        return frame
+
+    def test_settlement_loading_requires_distinct_fixed_spinner_slots(self):
+        from project_sekai.solo_live import settlement_loading
+        self.assertTrue(settlement_loading(self._settlement_loading_frame()))
+        self.assertTrue(settlement_loading(self._settlement_loading_frame(light=True, slots=5)))
+        self.assertFalse(settlement_loading(self._settlement_loading_frame(slots=3)))
+        text = np.full((720, 1280, 3), 90, np.uint8)
+        cv2.putText(text, '123456', (1186, 666), cv2.FONT_HERSHEY_SIMPLEX, .35, (255, 255, 255), 1)
+        home, playing = [np.full((720, 1280, 3), value, np.uint8) for value in (150, 65)]
+        cv2.rectangle(playing, (1008, 40), (1176, 47), (0, 255, 0), -1)
+        for frame in (text, home, playing, np.zeros_like(text), np.full_like(text, 255)):
+            self.assertFalse(settlement_loading(frame))
+
+    def test_loading_in_both_collection_paths_waits_without_reading_or_input(self):
+        for confirmation in (False, True):
+            with self.subTest(confirmation=confirmation):
+                clear, unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8)
+                                               for value in (130, 150, 170, 190)]
+                loading = [self._settlement_loading_frame(light=bool(index % 2)) for index in range(16)]
+                sequence = ([clear] if confirmation else [unknown]) + loading + [judge, judge, home, home]
+                workflow = self._collection(sequence, clear, None, judge)
+                clock = SimpleNamespace(now=0., read_judges=0)
+                def read_result(frame):
+                    self.assertFalse(any(frame is image for image in loading), '加载页不能读取判定或推进结算')
+                    workflow._result_label_visible = frame is unknown
+                    if frame is judge:
+                        clock.read_judges += 1
+                        return LiveResult(250, 5, 2, 1, 1)
+                workflow.read_result = read_result
+                workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+                def input_gate(*args):
+                    if not (confirmation and workflow.device.tap.call_count == 1):
+                        self.assertGreaterEqual(clock.read_judges, 2)
+                workflow.device.tap.side_effect = input_gate
+                workflow.device.back.side_effect = lambda: self.assertGreaterEqual(clock.read_judges, 2)
+                report = {'engine': 'legacy', 'playback': {'release_confirmed': True},
+                          'chart': {'total_note_count': 259}}
+                guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+                guard.observe = lambda frame: setattr(guard, 'ended', True)
+                with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+                    workflow.collect(report, Path(directory))
+                self.assertTrue(report['completed'])
+
+    def test_loading_pauses_remaining_digit_budget_without_restarting_it(self):
+        unknown, home = [np.full((720, 1280, 3), value, np.uint8) for value in (150, 190)]
+        loading = self._settlement_loading_frame()
+        workflow = self._collection([unknown, home], None, None, None)
+        clock = SimpleNamespace(now=0., tap_at=None)
+        workflow.read_result = lambda frame: setattr(workflow, '_result_label_visible', frame is unknown)
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.screenshot.side_effect = lambda: (home if workflow.device.back.called else
+            loading if .6 <= clock.now < 4.8 else unknown)
+        workflow.device.tap.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}}
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        guard.observe = lambda frame: setattr(guard, 'ended', True)
+        with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertGreaterEqual(clock.tap_at, 7.2 - 1e-6)
+        self.assertLess(clock.tap_at, 7.8)
+        self.assertEqual(report['result_status'], 'unreadable')
+
+    def test_loading_does_not_extend_collection_deadline_or_hide_stop_or_title(self):
+        loading = self._settlement_loading_frame()
+        for error in (None, InterruptedError('stop'), RuntimeError('TAP TO START')):
+            with self.subTest(error=error):
+                workflow = self._collection([loading], None, None, None)
+                clock = SimpleNamespace(now=0., reads=0)
+                def screenshot():
+                    clock.reads += 1
+                    if error is not None and clock.reads == 2:
+                        raise error
+                    return loading
+                workflow.screenshot.side_effect = screenshot
+                workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+                workflow.read_result = Mock(side_effect=AssertionError('加载期间不能读取成绩'))
+                expected = type(error) if error is not None else TimeoutError
+                with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), self.assertRaises(expected):
+                    workflow.collect({'playback': {'release_confirmed': True}}, Path(directory))
+                workflow.device.tap.assert_not_called()
+                workflow.device.back.assert_not_called()
+                self.assertLess(clock.now, 120.4)
+
+    def test_real_observation_checks_title_and_stop_before_loading_wait(self):
+        loading = self._settlement_loading_frame()
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                workflow = self._collection([loading], None, None, None)
+                workflow.navigator.match = lambda *args: (0., (0, 0))
+                workflow.screenshot = SoloLive.screenshot.__get__(workflow)
+                workflow.device.screenshot.return_value = loading
+                workflow.navigator._check_title_screen = Mock()
+                workflow.ocr = Mock()
+                workflow.ocr.read.return_value = Reading('TAP TO START', .99)
+                if stopped:
+                    workflow.navigator._check_stop = Mock(side_effect=InterruptedError('stop'))
+                expected = InterruptedError if stopped else RuntimeError
+                with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.settlement_loading') as spinner, self.assertRaises(expected):
+                    workflow.collect({'playback': {'release_confirmed': True}}, Path(directory))
+                spinner.assert_not_called()
+                workflow.device.tap.assert_not_called()
+                workflow.device.back.assert_not_called()
+                if stopped:
+                    workflow.device.screenshot.assert_not_called()
+                else:
+                    workflow.navigator._check_title_screen.assert_called_once_with(loading)
 
     def test_live_clear_banner_in_confirmation_frame_counts_only_after_result_and_home(self):
         other,clear,judge,home=[np.full((720,1280,3),value,np.uint8) for value in [170,180,190,210]]
@@ -1678,6 +1991,37 @@ class SoloTests(unittest.TestCase):
                 if deferred:
                     loaded.assert_called_once_with(identity)
 
+    def test_blue_context_candidate_uses_actual_chart_in_both_start_anchor_constructors(self):
+        from project_sekai.chart_player import StartAnchor
+        from project_sekai.sus_chart import parse_sus
+        chart = parse_sus('#BPM01:120\n#00008:01\n#0001c:0000222200000000\n#0001b:0000000000130000\n')
+        for deferred in (False, True):
+            for enabled in ('0', '1'):
+                with self.subTest(deferred=deferred, enabled=enabled):
+                    final, playing = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 160)]
+                    identity = SimpleNamespace(song_id=443, difficulty='expert', title='song', to_dict=lambda: {'song_id': 443})
+                    workflow = self._opening_workflow([final, playing], [identity])
+                    created = []
+                    report = {}
+                    def create(*args, **kwargs):
+                        self.assertIs(kwargs['gold_tap_context_chart'], chart)
+                        anchor = StartAnchor(*args, **kwargs)
+                        anchor.observe = Mock(return_value=123.)
+                        created.append(anchor)
+                        return anchor
+                    with tempfile.TemporaryDirectory() as directory, \
+                            patch.dict(os.environ, {'MAAPJSK_GOLD_TAP_BLUE_CONTEXT_GUARD': enabled,
+                                                    'MAAPJSK_CHART_BOUND_HEAD_GUARD': enabled}), \
+                            patch('project_sekai.solo_live.StartAnchor', side_effect=create) as factory:
+                        self.assertEqual(workflow.start(None if deferred else chart, identity, report, Path(directory),
+                            on_final_identity=(lambda _: chart) if deferred else None), 123.)
+                    factory.assert_called_once()
+                    self.assertEqual(created[0].gold_tap_blue_context_guard, enabled == '1')
+                    self.assertEqual(report['anchor_attempt']['gold_tap_blue_context_guard'], enabled == '1')
+                    self.assertEqual(created[0].chart_bound_head_guard, enabled == '1')
+                    self.assertEqual(report['anchor_attempt']['chart_bound_head_guard'], enabled == '1')
+                    self.assertEqual(created[0].gold_tap_following_gestures, (chart.gestures[1],) if enabled == '1' else ())
+
     def test_loading_frames_are_retried_until_opening_cover_and_title_match(self):
         loading,final,playing = [np.full((720,1280,3),value,np.uint8) for value in [255,140,160]]
         identity = SimpleNamespace(song_id=730,difficulty='normal',title='エメラルド',to_dict=lambda:{'song_id':730})
@@ -1704,9 +2048,13 @@ class SoloTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.StartAnchor') as anchor:
             anchor.return_value.observe.side_effect = [None]*39+[RuntimeError('首音失败')]
             anchor.return_value.samples = []
+            anchor.return_value.gold_tap_blue_context_guard = True
             with self.assertRaisesRegex(RuntimeError,'首音失败'):
                 workflow.start(chart,identity,report,Path(directory))
+            report['playback'] = {'release_confirmed': True, 'release': {'release_proof': 'no-gameplay-started'}}
+            workflow.save_anchor_evidence(report, Path(directory))
             saved = report['anchor_frames']
+            self.assertIs(report['anchor_attempt']['gold_tap_blue_context_guard'], True)
             self.assertEqual(len(saved),32)
             self.assertTrue(np.array_equal(read_image(Path(directory)/saved[0]['path']),frames[0]))
             self.assertTrue(np.array_equal(read_image(Path(directory)/saved[-1]['path']),frames[-1]))
@@ -1728,6 +2076,8 @@ class SoloTests(unittest.TestCase):
             anchor.observe.side_effect=observe
             with self.assertRaisesRegex(RuntimeError,'候选未确认运动'):
                 workflow.start(chart,identity,report,Path(directory))
+            report['playback'] = {'release_confirmed': True, 'release': {'release_proof': 'no-gameplay-started'}}
+            workflow.save_anchor_evidence(report, Path(directory))
             self.assertEqual(report['anchor_attempt']['samples'],anchor.samples)
             self.assertEqual(report['anchor_attempt']['sample_count'],1)
             self.assertEqual(report['anchor_attempt']['sample_state'],'candidate_unconfirmed')
@@ -1758,6 +2108,8 @@ class SoloTests(unittest.TestCase):
             anchor.observe.side_effect = observe
             with self.assertRaisesRegex(RuntimeError, '轨迹失败'):
                 workflow.start(chart, identity, report, Path(directory))
+            report['playback'] = {'release_confirmed': True, 'release': {'release_proof': 'no-gameplay-started'}}
+            workflow.save_anchor_evidence(report, Path(directory))
             retained = [read_image(Path(directory) / item['path']) for item in report['anchor_frames']]
             for frame in frames[1:3]:
                 self.assertTrue(any(np.array_equal(frame, image) for image in retained))

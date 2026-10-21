@@ -1473,6 +1473,7 @@ class CooperativeLive(SoloLive):
         raise TimeoutError("协力结算或返回主页超时")
 
     def save_evidence(self, report, directory):
+        self.save_opening_evidence(report, directory)
         self.save_preplay_life_evidence(report, directory)
         self.save_recovery_evidence(report, directory)
         self.finish_performance_trace(report, directory)
@@ -1485,11 +1486,7 @@ class CooperativeLive(SoloLive):
             if frame is not None:
                 write_image(directory / name, frame)
                 delattr(self, attribute)
-        for index, (when, frame) in enumerate(getattr(self, "anchor_frames", [])):
-            name = f"anchor-frame-{index:02d}.png"
-            write_image(directory / name, frame)
-            report.setdefault("anchor_frames", []).append({"captured_at": when, "path": name})
-        self.anchor_frames = []
+        self.save_anchor_evidence(report, directory)
         for index, (when, frame) in enumerate(self.life_frames):
             name = f"life-frame-{index:02d}.png"
             write_image(directory / name, frame)
