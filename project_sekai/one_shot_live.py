@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from .diagnostics import write_json as _write_json, make_directory, enabled
 from .chart_player import compile_touches
+from .opening_head import trace_opening_head_guard_requested
 from .life_monitor import LifeDepleted, LifeGuard
 from .live_end import LiveEndGuard, blank_transition
 from .live_exit import background_game
@@ -109,6 +110,7 @@ class OneShotLive(SoloLive):
         raise TimeoutError("一键演出输入已结束，但生命栏消失或演出结束仍未确认")
 
     def save_evidence(self, report, directory):
+        self.save_opening_evidence(report, directory)
         self.save_playback_evidence(report, directory)
         self.finish_performance_trace(report, directory)
         for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
@@ -117,11 +119,7 @@ class OneShotLive(SoloLive):
             if frame is not None:
                 write_image(directory / name, frame)
                 delattr(self, attribute)
-        for index, (when, frame) in enumerate(getattr(self, "anchor_frames", [])):
-            name = f"anchor-frame-{index:02d}.png"
-            write_image(directory / name, frame)
-            report.setdefault("anchor_frames", []).append({"captured_at": when, "path": name})
-        self.anchor_frames = []
+        self.save_anchor_evidence(report, directory)
         for index, (when, frame) in enumerate(self.life_frames):
             name = f"life-frame-{index:02d}.png"
             write_image(directory / name, frame)
@@ -138,6 +136,7 @@ class OneShotLive(SoloLive):
                   "requested_difficulty": difficulty, "difficulty_source": "task_setting", "engine": engine,
                   "timing_offset_ms": offset_ms, "opening_timeout_seconds": OPENING_WAIT_SECONDS,
                   "one_shot_native_startup_guard": getattr(self, "one_shot_native_startup_guard", False),
+                  "trace_opening_head_guard_requested": trace_opening_head_guard_requested(),
                   "completed": False, "phase": "waiting_opening", "result_status": "not_collected",
                   "report_path": str(directory / "report.json") if enabled() else None}
         self.last_report = report
@@ -184,7 +183,8 @@ class OneShotLive(SoloLive):
         _write_json(directory / "report.json", report)
         try:
             try:
-                self.log(f"一键演出：最长等待 5 分钟最终封面；{difficulty.upper()}，{engine}，偏移 {offset_ms} ms")
+                self.log(f"一键演出：最长等待 5 分钟最终封面；{difficulty.upper()}，{engine}，偏移 {offset_ms} ms；"
+                         f"TRACE首头候选请求：{'开启' if report['trace_opening_head_guard_requested'] else '关闭'}")
                 startup_options = ({"native_start_target": native_start_target, "native_start_fastpath": True}
                                    if native_start_target is not None else {})
                 epoch = self.start(None, None, report, directory, ready_action=lambda: None,

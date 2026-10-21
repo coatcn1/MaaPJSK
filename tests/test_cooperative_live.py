@@ -19,6 +19,7 @@ from project_sekai.live_end import LIFE_HUD_AREA
 from project_sekai.life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from project_sekai.ocr import Reading
 from project_sekai.solo_live import LiveResult
+from project_sekai.sus_chart import Gesture, Point
 from project_sekai.song_identity import COOPERATIVE_DIFFICULTIES, cooperative_difficulty_selected
 from project_sekai.song_identity import SongMatcher
 
@@ -843,7 +844,7 @@ class CooperativeTests(unittest.TestCase):
             for destination in ["disbanded", "final"]:
                 workflow, clock, _ = self.ui_workflow(["ready", destination])
                 workflow.matcher.match.side_effect = [identity(), identity(90)]
-                chart = SimpleNamespace(first=SimpleNamespace(start=1.0), gestures=[])
+                chart = SimpleNamespace(first=Gesture((Point(1., 2, 2),), 'tap'), gestures=[])
                 expected = RoomDisbanded if destination == "disbanded" else RuntimeError
                 with self.assertRaises(expected):
                     workflow.start(chart, identity(), {}, Path(directory))

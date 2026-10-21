@@ -16,7 +16,8 @@ import numpy as np
 
 from .chart_catalog import ChartRepository
 from .diagnostics import write_json as _write_json, make_directory, enabled
-from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context, gold_tap_following_context, gold_tap_slide_following_context
+from .opening_head import OpeningEvidence, trace_opening_head_guard_requested
+from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_context, dense_first_note_context, gold_tap_slide_following_context
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from .failure_retry import FailureRetryBudget
@@ -33,6 +34,22 @@ DIFFICULTY_POINTS = {"easy": (854, 488), "normal": (934, 492), "hard": (1016, 49
 SEARCH_QUERY_BOX = (151, 24, 580, 62)
 SEARCH_QUERY_BOXES = (SEARCH_QUERY_BOX, (151, 20, 580, 65), (151, 27, 580, 57))
 SEARCH_NATIVE_QUERY_BOX = (12, 642, 460, 696)
+
+
+def settlement_loading(frame):
+    # 固定八槽转圈可出现在暗色 TIPS 和白蓝渐变上；文字散点不能仅凭数量冒充加载。
+    crop = cv2.cvtColor(frame[618:710, 1185:1269], cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(crop, (0, 0, 235), (179, 50, 255))
+    slots = ((36, 15), (56, 23), (64, 43), (56, 63),
+             (36, 71), (16, 63), (8, 43), (16, 23))
+    matched = set()
+    for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        x, y, width, height = cv2.boundingRect(contour)
+        if 3 <= width <= 12 and 3 <= height <= 12:
+            for index, (slot_x, slot_y) in enumerate(slots):
+                if (x + width / 2 - slot_x) ** 2 + (y + height / 2 - slot_y) ** 2 <= 16:
+                    matched.add(index)
+    return len(matched) >= 4
 
 
 def numeric(reading: Reading) -> int:
@@ -739,7 +756,7 @@ class SoloLive:
         anchor = (StartAnchor(chart.first, minimum_samples=minimum_samples,
                               simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
                               dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else (),
-                              gold_tap_following_gestures=gold_tap_following_context(chart) if getattr(chart, "gestures", None) else (),
+                              gold_tap_context_chart=chart if getattr(chart, "gestures", None) else None,
                               gold_tap_slide_following_gestures=gold_tap_slide_following_context(chart) if getattr(chart, "gestures", None) else ())
                   if chart is not None else None)
         loading_saved = False
@@ -748,6 +765,7 @@ class SoloLive:
         samples = []
         captured_frames = []
         sampled_frames = {}
+        self.opening_evidence = OpeningEvidence(enabled())
 
         def retained_anchor_frames():
             retained = {when: screenshot for when, screenshot in captured_frames}
@@ -767,7 +785,13 @@ class SoloLive:
             samples = current
             state = ("accepted" if accepted else "no_candidate" if not samples
                      else "candidate_unconfirmed" if len(samples) == 1 else "trajectory_pending")
-            attempt = {"samples": samples, "sample_count": len(samples), "sample_state": state}
+            attempt = {"samples": samples, "sample_count": len(samples), "sample_state": state,
+                       "gold_tap_blue_context_guard": getattr(anchor, "gold_tap_blue_context_guard", False) is True,
+                       "chart_bound_head_guard": getattr(anchor, "chart_bound_head_guard", False) is True,
+                       "trace_opening_head_guard": getattr(anchor, "trace_opening_head_guard", False) is True}
+            tracker_status = getattr(getattr(anchor, 'chart_bound_tracker', None), 'status', None)
+            if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']) and isinstance(tracker_status, str):
+                attempt['chart_bound_head_status'] = tracker_status
             if failed:
                 reason = getattr(anchor, "failure_reason", None)
                 attempt["failure_class"] = (reason if isinstance(reason, str)
@@ -780,11 +804,8 @@ class SoloLive:
             report["anchor_attempt"] = attempt
 
         def save_anchor_frames():
-            report["anchor_frames"] = []
-            for index, (when, screenshot) in enumerate(retained_anchor_frames()):
-                name = f"anchor-frame-{index:02d}.png"
-                write_image(directory / name, screenshot)
-                report["anchor_frames"].append({"captured_at": when, "path": name})
+            # 开场尚未释放Native；这里只冻结引用，统一由run清理后的证据阶段编码。
+            self.anchor_frames = retained_anchor_frames()
 
         frame = None
         while time.monotonic() < (opening_deadline_provider() if final is None and opening_deadline_provider is not None else deadline):
@@ -841,7 +862,7 @@ class SoloLive:
                             anchor = StartAnchor(chart.first, minimum_samples=minimum_samples,
                                                  simultaneous_gestures=first_note_context(chart) if getattr(chart, "gestures", None) else (),
                                                  dense_following_gestures=dense_first_note_context(chart) if getattr(chart, "gestures", None) else (),
-                                                 gold_tap_following_gestures=gold_tap_following_context(chart) if getattr(chart, "gestures", None) else (),
+                                                 gold_tap_context_chart=chart if getattr(chart, "gestures", None) else None,
                                                  gold_tap_slide_following_gestures=gold_tap_slide_following_context(chart) if getattr(chart, "gestures", None) else ())
                     final = candidate
                     if opening_deadline_provider is not None:
@@ -870,6 +891,11 @@ class SoloLive:
                     update_anchor_attempt(failed=True)
                     save_anchor_frames()
                     raise
+                finally:
+                    detail = getattr(anchor, 'observation', None)
+                    if isinstance(detail, dict):
+                        # 引用原环形缓存的同一帧，不增加截图、编码或额外图像拷贝。
+                        self.opening_evidence.observe(captured_at, captured_frames[-1][1], detail)
                 if list(anchor.samples) != samples:
                     update_anchor_attempt()
                 if epoch is not None:
@@ -902,7 +928,7 @@ class SoloLive:
                     return epoch
             self.pause(.002)
         if frame is not None:
-            write_image(directory / "start-failure.png", frame)
+            self.start_failure_frame = frame
         if anchor is not None:
             update_anchor_attempt(failed=True)
         save_anchor_frames()
@@ -910,10 +936,57 @@ class SoloLive:
             raise TimeoutError(f"等待最终歌曲封面超过 {opening_timeout} 秒，未派发谱面输入：{last_error}")
         raise RuntimeError(f"开场封面或第一音锚点未确认，未派发谱面输入：{last_error}")
 
+    def save_opening_evidence(self, report, directory):
+        evidence = getattr(self, 'opening_evidence', None)
+        if evidence is None or not evidence.enabled:
+            return
+        if evidence.frames and not release_finished(report):
+            report['opening_evidence_warning'] = '当前触点释放证明不足，早期诊断仅保留内存，未编码截图'
+            return
+        try:
+            summary = evidence.summary()
+            for index, (_, when, frame, detail) in enumerate(evidence.frames):
+                name = f'opening-rejected-{index:02d}.png'
+                write_image(directory / name, frame)
+                summary['frames'][index]['path'] = name
+            report['opening_evidence'] = summary
+        except Exception as error:
+            # 只在释放之后保存新增诊断；磁盘失败不能覆盖开场、输入或停止的原始异常。
+            report['opening_evidence_warning'] = f'{type(error).__name__}: {error}'
+        finally:
+            del self.opening_evidence
+
+    def save_anchor_evidence(self, report, directory):
+        if not enabled():
+            self.anchor_frames = []
+            if hasattr(self, 'start_failure_frame'):
+                del self.start_failure_frame
+            return
+        if (getattr(self, 'anchor_frames', []) or getattr(self, 'start_failure_frame', None) is not None) and not release_finished(report):
+            report['anchor_evidence_warning'] = '当前触点释放证明不足，开场帧仅保留内存，未编码截图'
+            return
+        try:
+            frame = getattr(self, 'start_failure_frame', None)
+            if frame is not None:
+                write_image(directory / 'start-failure.png', frame)
+            report['anchor_frames'] = []
+            for index, (when, frame) in enumerate(getattr(self, 'anchor_frames', [])):
+                name = f'anchor-frame-{index:02d}.png'
+                write_image(directory / name, frame)
+                report['anchor_frames'].append({'captured_at': when, 'path': name})
+        except Exception as error:
+            report['anchor_evidence_warning'] = f'{type(error).__name__}: {error}'
+        finally:
+            self.anchor_frames = []
+            if hasattr(self, 'start_failure_frame'):
+                del self.start_failure_frame
+
     def read_result(self, frame: np.ndarray) -> LiveResult | None:
+        self._result_label_visible = False
         label = self.ocr.read(frame, (151, 393, 290, 434))
         if "PERFECT" not in label.text.upper():
             return None
+        self._result_label_visible = True
         boxes = {"perfect": (302, 391, 384, 434), "great": (302, 435, 384, 475),
                  "good": (302, 479, 384, 519), "bad": (302, 522, 384, 562), "miss": (302, 565, 384, 605)}
         try:
@@ -1330,6 +1403,10 @@ class SoloLive:
         last_candidate = None
         stable = 0
         settlement_index = 0
+        result_observation_deadline = None
+        transition_started_at = None
+        settlement_banner = False
+        result_page_seen = False
         date_frames = []
         end_guard = LiveEndGuard(self.navigator, report, life_seen=getattr(getattr(self, "life_guard", None), "hud_seen", False))
 
@@ -1362,10 +1439,11 @@ class SoloLive:
                 raise RuntimeError('结算尚未取得本轮严格触点释放证明，禁止页面输入或记为完成')
 
         def inspect_settlement(frame):
-            nonlocal stable, last_candidate, result, completed, failed
+            nonlocal stable, last_candidate, result, completed, failed, settlement_banner, result_page_seen
             end_guard.observe(frame)
             clear_score = self.navigator.match(frame, "live_clear")[0]
             failed_score = self.navigator.match(frame, "live_failed")[0] if "live_failed" in self.navigator.templates else 0
+            settlement_banner = max(clear_score, failed_score) >= self.navigator.threshold
             if clear_score >= self.navigator.threshold and clear_score > failed_score + .04:
                 completed = True
                 report["live_status"] = "cleared"
@@ -1374,7 +1452,10 @@ class SoloLive:
                 failed = True
                 report["live_status"] = "failed"
                 write_image(directory / "live-failed.png", frame)
+            # 标签来自本帧既有 OCR；数字尚未就绪也能证明已到成绩页，不沿用上一帧或上一局标记。
+            self._result_label_visible = False
             candidate = self.read_result(frame)
+            result_page_seen = result_page_seen or self._result_label_visible or candidate is not None
             if candidate is not None:
                 stable = stable + 1 if candidate == last_candidate else 1
                 last_candidate = candidate
@@ -1387,15 +1468,56 @@ class SoloLive:
                     write_image(directory / "result.png", frame)
             return candidate
 
+        def wait_for_result_digits(frame):
+            nonlocal result_observation_deadline
+            require_current_release()
+            if (result is not None or settlement_banner
+                    or self.navigator.match(frame, 'home')[0] >= self.navigator.threshold
+                    or self.navigator.match(frame, 'playing')[0] >= self.navigator.threshold):
+                return False
+            if result_observation_deadline is None:
+                if not result_page_seen:
+                    # 已结束后的漫画等未知转场只受整段120秒期限约束，不能先耗尽成绩数字预算。
+                    if completed or failed or end_guard.ended:
+                        self.pause(.3)
+                        return True
+                    return False
+                # 仅本次实际成绩标签或候选启动一次；标签淡出、未知重现都不能重新计时。
+                result_observation_deadline = time.monotonic() + 3.
+            if time.monotonic() < result_observation_deadline:
+                self.pause(.3)
+                return True
+            return False
+
+        def wait_for_transition(frame):
+            nonlocal transition_started_at, result_observation_deadline
+            blank = blank_transition(frame)
+            if blank or settlement_loading(frame):
+                if transition_started_at is None:
+                    transition_started_at = time.monotonic()
+                # 加载不是有效结束帧，也不能消耗成绩数字的剩余观察时间。
+                # 保留原黑白转场策略；固定转圈同样中断连续的 HUD 消失证明。
+                if blank:
+                    end_guard.observe(frame)
+                else:
+                    end_guard.absent_frames = 0
+                    end_guard.ended = False
+                    end_guard.candidate_page = None
+                self.pause(.3)
+                return True
+            if transition_started_at is not None:
+                if result_observation_deadline is not None:
+                    result_observation_deadline += time.monotonic() - transition_started_at
+                transition_started_at = None
+            return False
+
         while time.monotonic() < deadline:
             frame = self.screenshot()
             if inspect_date_update(frame):
                 continue
-            if blank_transition(frame):
-                end_guard.observe(frame)
-                self.pause(.3)
+            if wait_for_transition(frame):
                 continue
-            candidate = inspect_settlement(frame)
+            inspect_settlement(frame)
             if self.navigator.match(frame, "home")[0] >= self.navigator.threshold:
                 require_current_release()
                 if failed:
@@ -1426,9 +1548,8 @@ class SoloLive:
             if settlement_index < 40:
                 settlement_index += 1
                 write_image(directory / f"settlement-{settlement_index:02d}.png", frame)
-            # 判定页先采集两帧；其余结算只用安全像素加速与 BACK 推进。
-            if candidate is not None and stable < 2:
-                self.pause(.3)
+            # 未完整读出的成绩先共用有界观察，耗尽后仍保留实际数据及原未读全警告。
+            if wait_for_result_digits(frame):
                 continue
             require_current_release()
             self.device.tap(1279, 719)
@@ -1437,14 +1558,11 @@ class SoloLive:
             confirmation = self.screenshot()
             if inspect_date_update(confirmation):
                 continue
-            if blank_transition(confirmation):
-                end_guard.observe(confirmation)
-                self.pause(.3)
+            if wait_for_transition(confirmation):
                 continue
             # 判定页也可能在这张复查帧才出现，先取得两帧数字再返回。
-            confirmation_candidate = inspect_settlement(confirmation)
-            if confirmation_candidate is not None and stable < 2:
-                self.pause(.3)
+            inspect_settlement(confirmation)
+            if wait_for_result_digits(confirmation):
                 continue
             # 动画加速点击可能已切换到主页；必须重新检查后才能发送 BACK。
             if self.navigator.match(confirmation, "home")[0] >= self.navigator.threshold:
@@ -1486,7 +1604,9 @@ class SoloLive:
         reports = []
         consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
         recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
-        self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}")
+        trace_requested = trace_opening_head_guard_requested()
+        self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}；"
+                 f"TRACE首头候选请求：{'开启' if trace_requested else '关闭'}")
         while self.performed_rounds < count:
             if self.stop_requested():
                 raise InterruptedError('用户已停止单人演出')
@@ -1506,6 +1626,7 @@ class SoloLive:
                       "requested_bonus_consumption": bonus_consumption,
                       "recovery_settings": {"mode": recovery_mode, "count": recovery_count}}
             report["engine"] = engine
+            report['trace_opening_head_guard_requested'] = trace_requested
             report["startup_abort_enabled"] = startup_abort_enabled
             if engine == "native":
                 report["native_startup_guard"] = getattr(self, "native_startup_guard", False)
@@ -1689,6 +1810,7 @@ class SoloLive:
                         abort.update(confirmed=False, status="cancelled" if report.get("cancelled") else "failed",
                                      error=f"{type(abort_error).__name__}: {abort_error}")
                 self.save_preplay_life_evidence(report, directory)
+                self.save_opening_evidence(report, directory)
                 self.save_playback_evidence(report, directory)
                 self.finish_performance_trace(report, directory)
                 for attribute, name in (("loading_frame", "loading.png"), ("final_frame", "final-cover.png"),
@@ -1697,11 +1819,7 @@ class SoloLive:
                     if frame is not None:
                         write_image(directory / name, frame)
                         delattr(self, attribute)
-                for index, (when, frame) in enumerate(getattr(self, "anchor_frames", [])):
-                    name = f"anchor-frame-{index:02d}.png"
-                    write_image(directory / name, frame)
-                    report.setdefault("anchor_frames", []).append({"captured_at": when, "path": name})
-                self.anchor_frames = []
+                self.save_anchor_evidence(report, directory)
                 for index, (when, frame) in enumerate(self.life_frames):
                     name = f"life-frame-{index:02d}.png"
                     write_image(directory / name, frame)

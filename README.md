@@ -33,6 +33,9 @@ powershell -ExecutionPolicy Bypass -File scripts/launch-mfa.ps1 -RuntimeSource "
 
 启动脚本将程序部署到 `.local/mfa-generic/`，使用项目自己的 `interface.json`、Agent、Pipeline 与模板，并将 Agent 的 Python 路径写成部署时指定的解释器。MFA 窗口标题应显示 `Project SEKAI 自动化（MaaFramework）`，任务列表提供「🎶 自动演出」「🎼 单人谱面演出」「🤝 协力谱面演出」「▶️ 一键演出」和「🎯 Native 谱面校准」。脚本默认禁止任务随程序启动。需要重新部署时，先停止任务并关闭本项目 MFA。
 
+金色 TRACE 首头保护已在本机813「at」MASTER33连续四次 LIVE CLEAR 验收后默认开启，正常启动无需额外参数、环境变量或验收包装；显式 `MAAPJSK_TRACE_OPENING_HEAD_GUARD=0` 可回退。开场版本27、触控计划4、Native1.2.0保持，验收仅覆盖本机此曲单人和单人场景一键，详见[Native 与校准](docs/native-calibration.md)。
+
+
 在 MFA 中选择自己的 MuMu ADB 连接，勾选「🎶 自动演出」，设置：
 
 | 选项 | 作用 |
