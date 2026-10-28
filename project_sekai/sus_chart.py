@@ -4,7 +4,12 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from fractions import Fraction
 import math
+import os
 import re
+
+
+# 擦除片段候选仅明确1启用；按进程初始化冻结，任务中修改环境不会改变既有解析合同。
+ERASED_SLIDE_GUARD = os.environ.get('MAAPJSK_ERASED_SLIDE_GUARD') == '1'
 
 
 @dataclass(frozen=True)
@@ -159,6 +164,8 @@ def parse_sus(text: str) -> Chart:
     for nodes in slide_rows.values():
         active: list[Point] = []
         active_critical = False
+        erased_fragment = False
+        active_start_beat = Fraction(0)
         for position, lane, width, kind in sorted(nodes, key=lambda item: (item[0], 0 if item[3] == 2 else 1)):
             direction = directions.get((position, lane), 0)
             # 有短音符但没有方向的可见点只作判定；带缓动方向或没有短音符的点仍定义路径。
@@ -170,6 +177,8 @@ def parse_sus(text: str) -> Chart:
                     raise ValueError("同一滑条通道存在重叠开头")
                 active = [point]
                 active_critical = shorts.get((position, lane), (1, width))[0] in {2, 6}
+                erased_fragment = shorts.get((position, lane)) == (8, width)
+                active_start_beat = position
             elif not active:
                 raise ValueError("滑条节点没有对应的开头")
             else:
@@ -177,8 +186,19 @@ def parse_sus(text: str) -> Chart:
                 if kind == 2:
                     if point.time <= active[0].time:
                         raise ValueError("滑条持续时间必须大于零")
-                    gestures.append(Gesture(tuple(active), "slide", point.direction, active_critical))
+                    half_beat_start = Fraction(active_start_beat // Fraction(1, 2), 2)
+                    # 只排除首尾8擦除、无可判节点且严格位于同半拍格内部的装饰短链。
+                    # 跨格长条、可见节点或可判短标记仍须完整触控，不能靠缩短时间或扩触点绕过拒绝。
+                    decorative = (ERASED_SLIDE_GUARD and erased_fragment
+                                  and shorts.get((position, lane)) == (8, width) and direction == 0
+                                  and half_beat_start < active_start_beat < position < half_beat_start + Fraction(1, 2))
+                    if not decorative:
+                        gestures.append(Gesture(tuple(active), "slide", point.direction, active_critical))
                     active = []
+                else:
+                    marker = shorts.get((position, lane))
+                    erased_fragment = (erased_fragment and kind in {4, 5}
+                                       and (marker is None or marker in {(7, width), (8, width)}))
         if active:
             raise ValueError("滑条没有结束节点")
     for (position, lane), (kind, width) in shorts.items():

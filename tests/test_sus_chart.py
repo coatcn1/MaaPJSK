@@ -334,6 +334,123 @@ class SusTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compile_touches(chart)
 
+    def test_erased_slide_candidate_ignores_only_nonjudgement_fragments(self):
+        # 两条真实长条中叠加十一条1 tick擦除片段，不能把无判定装饰当作十三根手指。
+        def fragment_body(first, last):
+            return '00' * 100 + first + last + '00' * (1920 - 102)
+        rows = ['#000320:16', '#001320:26', '#000381:16', '#001381:26']
+        for lane, channel in zip('23456789abc', '23456789abc'):
+            rows.extend((f'#0003{lane}{channel}:' + fragment_body('11', '21'),
+                         f'#0001{lane}:' + fragment_body('81', '81')))
+        source = HEADER + '\n'.join(rows)
+        with patch('project_sekai.sus_chart.ERASED_SLIDE_GUARD', False, create=True):
+            with self.assertRaisesRegex(ValueError, '超过十个并发触点'):
+                compile_touches(parse_sus(source))
+        with patch('project_sekai.sus_chart.ERASED_SLIDE_GUARD', True, create=True):
+            chart = parse_sus(source)
+        events = compile_touches(chart)
+        self.assertEqual(len(chart.gestures), 2)
+        self.assertEqual(len([event for event in events if event.kind == 'down']), 2)
+        validate_touches(events)
+
+    def test_erased_slide_candidate_preserves_judgements_and_uncertain_chains(self):
+        def source(*, head=8, tail=8, start=100, end=104, internal=(), flick=0, marker_width=1):
+            def body(values):
+                tokens = ['00'] * 1920
+                for tick, token in values:
+                    tokens[tick] = token
+                return ''.join(tokens)
+            nodes = [(start, '11'), (end, '21')]
+            markers = [(start, f'{head}{marker_width}'), (end, f'{tail}1')]
+            for tick, kind, marker in internal:
+                nodes.append((tick, f'{kind}1'))
+                if marker is not None:
+                    markers.append((tick, f'{marker}1'))
+            rows = ['#0001d:11', '#000320:' + body(nodes), '#00012:' + body(markers)]
+            if flick:
+                rows.append('#00052:' + body([(end, f'{flick}1')]))
+            return HEADER + '\n'.join(rows)
+        with patch('project_sekai.sus_chart.ERASED_SLIDE_GUARD', True):
+            # 隐藏/控制点不带判定，严格同格内部时才可作为纯装饰片段排除。
+            for options in ({}, {'internal': ((101, 4, None), (102, 5, None))}):
+                with self.subTest(ignored=options):
+                    self.assertEqual(len(parse_sus(source(**options)).gestures), 1)
+            retained = [{'head': 7}, {'tail': 7}, {'tail': 6}, {'head': 2}, {'marker_width': 2},
+                        {'internal': ((101, 3, None),)}, {'flick': 3},
+                        {'start': 239, 'end': 241}, {'start': 240, 'end': 241},
+                        {'start': 100, 'end': 240}, {'end': 500},
+                        {'head': 7, 'tail': 7, 'internal': ((101, 5, 1),)}]
+            retained += [{'internal': ((101, 5, kind),)} for kind in (1, 2, 3, 5, 6)]
+            for options in retained:
+                with self.subTest(retained=options):
+                    chart = parse_sus(source(**options))
+                    self.assertEqual(len(chart.gestures), 2)
+                    self.assertEqual(sum(value.kind == 'slide' for value in chart.gestures), 1)
+                    validate_touches(compile_touches(chart))
+            for invalid in ('#000320:00001100\n#00012:00008100',
+                            '#000320:00002100\n#00012:00008100'):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    parse_sus(HEADER + '#0001d:11\n' + invalid)
+
+    def test_erased_slide_candidate_is_explicit_and_frozen_at_import(self):
+        import os
+        import subprocess
+        import sys
+        script = ("import os; from project_sekai.sus_chart import ERASED_SLIDE_GUARD; "
+                  "print(ERASED_SLIDE_GUARD); "
+                  "os.environ['MAAPJSK_ERASED_SLIDE_GUARD']='0' if ERASED_SLIDE_GUARD else '1'; "
+                  "from project_sekai.sus_chart import ERASED_SLIDE_GUARD; print(ERASED_SLIDE_GUARD)")
+        for value, expected in ((None, 'False'), ('0', 'False'), ('1', 'True'), ('true', 'False')):
+            environment = dict(os.environ)
+            environment.pop('MAAPJSK_ERASED_SLIDE_GUARD', None)
+            if value is not None:
+                environment['MAAPJSK_ERASED_SLIDE_GUARD'] = value
+            result = subprocess.run([sys.executable, '-B', '-c', script], env=environment,
+                                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.splitlines(), [expected, expected])
+
+    def test_erased_slide_semantics_use_new_touch_versions(self):
+        from project_sekai.chart_player import TOUCH_PLAN_VERSION, SLIDE_NODE_TOUCH_PLAN_VERSION
+        from project_sekai.sus_chart import ERASED_SLIDE_GUARD
+        self.assertEqual(TOUCH_PLAN_VERSION, 6 if ERASED_SLIDE_GUARD else 4)
+        self.assertEqual(SLIDE_NODE_TOUCH_PLAN_VERSION, 7 if ERASED_SLIDE_GUARD else 5)
+
+    def test_erased_slide_candidate_real_509_master_when_local_chart_exists(self):
+        import hashlib
+        from project_sekai.chart_catalog import ChartRepository
+        root = Path(__file__).resolve().parents[1] / 'resource/charts'
+        if not (root / 'manifest.json').is_file():
+            self.skipTest('未提供本地曲库，不提交游戏谱面素材')
+        repository = ChartRepository(root)
+        if 509 not in repository.songs or 'master' not in repository.songs[509]['charts']:
+            self.skipTest('本地曲库无509 MASTER')
+        source = repository.load_chart(509, 'master')
+        if hashlib.sha256(source.encode('utf-8')).hexdigest() != '132c5915d6164a404134286ce024d6ada358c80c0d9895c38debc247b7ae9fb0':
+            self.skipTest('本地509 MASTER与原失败证据哈希不同')
+        with patch('project_sekai.sus_chart.ERASED_SLIDE_GUARD', False):
+            baseline = parse_sus(source)
+        with self.assertRaisesRegex(ValueError, '超过十个并发触点'):
+            compile_touches(baseline)
+        with patch('project_sekai.sus_chart.ERASED_SLIDE_GUARD', True):
+            candidate = parse_sus(source)
+        self.assertEqual((len(baseline.gestures), len(candidate.gestures)), (1017, 994))
+        # 真实擦除首头可判尾及首尾7但内部短1的长条必须逐点保留。
+        for start in (27.53014705882353, 56.29485294117647, 70.94117647058823):
+            original = next(value for value in baseline.gestures if abs(value.start - start) < 1e-9)
+            self.assertIn(original, candidate.gestures)
+        events = compile_touches(candidate)
+        self.assertEqual(len(events), 4643)
+        active, maximum = set(), 0
+        for event in events:
+            if event.kind == 'down':
+                active.add(event.contact)
+            elif event.kind == 'up':
+                active.remove(event.contact)
+            maximum = max(maximum, len(active))
+        self.assertEqual(maximum, 8)
+        self.assertFalse(active)
+        validate_touches(events)
+
     def test_slide_node_candidate_preserves_baseline_and_samples_fast_changes(self):
         def chain(high,low):
             return Gesture(tuple(Point(t,l,3,k,d) for t,l,k,d in [
