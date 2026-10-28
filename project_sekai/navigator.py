@@ -15,6 +15,15 @@ from .ocr import LineOcr, Reading
 from .live_end import blank_transition, LIFE_HUD_AREA
 
 
+def recovery_bottles(mode: str, available: int, consumption: int) -> int:
+    if mode not in {"small", "large"}:
+        raise ValueError("自动回复必须选择小饮料或大饮料")
+    if type(available) is not int or available < 0 or type(consumption) is not int or not 0 <= consumption <= 10:
+        raise ValueError("实际体力或每局消耗无效，拒绝自动用药")
+    missing = max(0, consumption - available)
+    return missing if mode == "small" else (missing + 9) // 10
+
+
 def read_available_bonus(ocr: LineOcr, frame: np.ndarray) -> tuple[int, Reading]:
     box = (1057, 27, 1128, 59)
     raw = ocr.read(frame, box)
@@ -230,19 +239,61 @@ class Navigator:
         return self.wait("prepare")
 
     def prepare_auto(self, mode: str, count: int = 1) -> None:
+        self.auto_recovery_attempted = False
         before = self.wait("prepare")
+        if mode != "off":
+            consumption = self.current_bonus_consumption()
+            before, available = self.stable_available_bonus()
+            needed = recovery_bottles(mode, available, consumption)
+            if needed:
+                self.tap(1086, 42, "打开体力回复")
+                self.auto_recovery_attempted = True
+                self._recover_and_verify(before, mode, needed)
         try:
             self.ensure_auto(True)
             return
         except AutoEnableRejected:
-            self.log_message("AUTO 未开启，关闭提示后按设置回复体力")
+            self.log_message("AUTO 未开启，关闭提示并停止，避免按失败提示猜测体力消耗")
             self._dismiss_auto_prompt()
             if mode == "off":
                 raise RuntimeError("AUTO 未开启；自动回复体力已关闭")
-            self.tap(1086, 42, "打开体力回复")
-            self._recover_and_verify(before, mode, count)
-        # 本次规定数量全部回复后只重试一次，避免其他错误导致无限用药。
-        self.ensure_auto(True)
+            raise RuntimeError("实际体力已按本局消耗确认，AUTO 仍未开启；停止且不追加饮料")
+
+    def current_bonus_consumption(self) -> int:
+        # 复用谱面任务已验证的消耗页读取与原值保存，不猜测 AUTO 的默认消耗。
+        from .solo_live import SoloLive
+        if not hasattr(self, "bonus_ocr"):
+            self.bonus_ocr = LineOcr(Path(__file__).resolve().parent.parent / "resource/models/song_title_ocr")
+        observer = SoloLive.__new__(SoloLive)
+        observer.navigator, observer.ocr = self, self.bonus_ocr
+        observer.screenshot = lambda: self.checked_screenshot()
+        observer.pause = time.sleep
+        report = {}
+        observer.prepare_bonus("current", report, self.config_path.parent / "auto-bonus-observation",
+                               setup_playback=False, save_bonus_image=False)
+        self.auto_bonus_consumption = report["bonus"]["consumption"]
+        return self.auto_bonus_consumption
+
+    def checked_screenshot(self):
+        self._check_stop()
+        frame = self.device.screenshot()
+        self._check_title_screen(frame)
+        return frame
+
+    def stable_available_bonus(self):
+        previous = None
+        for _ in range(20):
+            frame = self.wait("prepare")
+            try:
+                value, _ = self._bonus_reader()(frame)
+            except ValueError:
+                previous = None
+            else:
+                if value == previous:
+                    return frame, value
+                previous = value
+            time.sleep(.2)
+        raise RuntimeError("实际体力未连续两帧确认，停止自动用药")
 
     def recover_bonus_from_dialog(self, mode: str, count: int = 1) -> None:
         # 同页选择整批饮料后只提交一次；不识别库存或已选数量，水晶页不在恢复路径中。
@@ -423,7 +474,7 @@ class Navigator:
 
     def wait_for_play_or_recovery(self, before: np.ndarray, mode: str, count: int = 1) -> None:
         deadline = time.monotonic() + 45
-        recovered = False
+        recovered = getattr(self, "auto_recovery_attempted", False)
         while time.monotonic() < deadline:
             self._check_stop()
             frame = self.device.screenshot()
@@ -433,6 +484,15 @@ class Navigator:
             if self.match(frame, "recovery_dialog")[0] >= self.threshold:
                 if recovered:
                     raise RuntimeError("回复体力后再次出现回复页，停止以免重复消耗")
+                if mode == "off":
+                    raise RuntimeError("游戏请求恢复体力；自动回复体力已关闭")
+                consumption = getattr(self, "auto_bonus_consumption", None)
+                if consumption is None:
+                    raise RuntimeError("本局真实消耗未确认，停止自动用药")
+                available, _ = self._bonus_reader()(before)
+                count = recovery_bottles(mode, available, consumption)
+                if count == 0:
+                    raise RuntimeError("实际体力足够却出现回复页，停止且不追加饮料")
                 before = self._recover_and_verify(before, mode, count)
                 recovered = True
                 self.ensure_auto(True)

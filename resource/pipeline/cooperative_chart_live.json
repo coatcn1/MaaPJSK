@@ -58,17 +58,6 @@
       "recovery_mode": "off"
     },
     "next": [
-      "CooperativeChartLiveRecoveryCountConfig"
-    ]
-  },
-  "CooperativeChartLiveRecoveryCountConfig": {
-    "recognition": "DirectHit",
-    "action": "Custom",
-    "custom_action": "ProjectSekaiCooperativeLiveConfig",
-    "custom_action_param": {
-      "recovery_count": 1
-    },
-    "next": [
       "CooperativeChartLiveRun"
     ]
   },

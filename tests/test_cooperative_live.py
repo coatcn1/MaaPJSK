@@ -64,7 +64,7 @@ class CooperativeTests(unittest.TestCase):
                          ["EASY", "NORMAL", "HARD", "EXPERT", "MASTER"])
         context, argv = self.configuration()
         self.assertEqual(agent._SETTINGS[41], {"room": "free", "song_mode": "current", "difficulty": "easy",
-                                             "count": 1, "recovery_mode": "off", "recovery_count": 1})
+                                             "count": 1, "recovery_mode": "off"})
         pipeline = json.loads((ROOT / "resource/pipeline/cooperative_chart_live.json").read_text(encoding="utf-8"))
         for option in task["option"]:
             specification = interface["option"][option]

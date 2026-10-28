@@ -22,7 +22,7 @@ from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from .failure_retry import FailureRetryBudget
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
-from .navigator import Navigator, read_available_bonus
+from .navigator import Navigator, read_available_bonus, recovery_bottles
 from .ocr import LineOcr, Reading
 from .performance_trace import PerformanceTrace
 from .song_identity import SongMatcher, normalize_title, write_image
@@ -434,7 +434,7 @@ class SoloLive:
             raise RuntimeError("指定歌曲与准备页实际歌曲不符，拒绝演出")
         return prepared, frame
 
-    def prepare_bonus(self, consumption: str | int, report: dict, directory: Path, *, setup_playback=True, return_page="prepare"):
+    def prepare_bonus(self, consumption: str | int, report: dict, directory: Path, *, setup_playback=True, return_page="prepare", save_bonus_image=True):
         if setup_playback:
             self.navigator.ensure_auto(False)
         self.navigator.tap(1150, 42, "打开体力消耗设置")
@@ -476,7 +476,8 @@ class SoloLive:
                 raise RuntimeError(f"未确认用户指定的 {target} 体力消耗，拒绝开演")
             readings.append(asdict(reading))
             self.pause(.12)
-        write_image(directory / "bonus.png", frame)
+        if save_bonus_image:
+            write_image(directory / "bonus.png", frame)
         report["bonus"] = {"requested_consumption": consumption, "consumption": target,
                            "confirmed": False, "readings": readings, "original_consumption": original}
         self.navigator.tap(762, 655, f"保存 {target} 体力消耗")
@@ -610,6 +611,8 @@ class SoloLive:
         if pending_batch:
             _write_json(directory / "report.json", report)
             raise RuntimeError("本任务先前已请求批量用药但到账未确认，请用户处理；不追加或重复整批")
+        # 旧配置和 CLI 的瓶数仅保留兼容参数；自动模式只补足下一局所需差额。
+        count = recovery_bottles(mode, available, consumption)
         report["recovery"] = {"mode": mode, "requested_bottles": count, "completed_bottles": 0, "available_before": available,
                               "status": "started"}
         _write_json(directory / "report.json", report)
@@ -636,8 +639,8 @@ class SoloLive:
         report["recovery"].update(available_after=after, completed_bottles=count, readings=readings, status="confirmed")
         report["bonus"]["available_after"] = after
         if after < consumption:
-            # 每次只执行用户规定的一批瓶数；不足时停止，不追加瓶数，也不降低每局消耗。
-            raise RuntimeError(f"已按设置使用 {count} 瓶饮料，当前体力 {after} 仍不足 {consumption}；请调整每次回复瓶数")
+            # 一批确认后出现异常仍停止，不自动重复请求或降低每局消耗。
+            raise RuntimeError(f"已使用 {count} 瓶饮料，当前体力 {after} 仍不足 {consumption}；请检查回复结果")
         report["bonus"]["availability"] = "recovered"
         self.navigator.ensure_auto(False)
         self.log(f"体力回复已确认：当前 {after}，继续按每局 {consumption} 体力开演")
@@ -1616,7 +1619,7 @@ class SoloLive:
         bonus_snapshot = {} if _bonus_snapshot is None else _bonus_snapshot
         reports = []
         consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
-        recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
+        recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用{'小' if recovery_mode == 'small' else '大'}饮料补足下一局所需体力"
         trace_requested = trace_opening_head_guard_requested()
         self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}；"
                  f"TRACE首头候选请求：{'开启' if trace_requested else '关闭'}")

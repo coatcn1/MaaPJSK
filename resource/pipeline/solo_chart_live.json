@@ -47,17 +47,6 @@
       "recovery_mode": "off"
     },
     "next": [
-      "SoloChartLiveRecoveryCountConfig"
-    ]
-  },
-  "SoloChartLiveRecoveryCountConfig": {
-    "recognition": "DirectHit",
-    "action": "Custom",
-    "custom_action": "ProjectSekaiSoloLiveConfig",
-    "custom_action_param": {
-      "recovery_count": 1
-    },
-    "next": [
       "SoloChartLiveRun"
     ]
   },

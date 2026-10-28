@@ -107,7 +107,7 @@ class ProjectSekaiCooperativeLive(CustomAction):
             settings = _SETTINGS.pop(task_id(argv), None)
             if context.tasker.stopping:
                 return False
-            if settings is None or set(settings) != {"room", "song_mode", "difficulty", "count", "recovery_mode", "recovery_count"}:
+            if settings is None or set(settings) - {"recovery_count"} != {"room", "song_mode", "difficulty", "count", "recovery_mode"}:
                 raise ValueError("协力配置不完整，请从任务入口重新运行")
             root = Path(__file__).resolve().parents[1]
             performance = load_performance(root)
@@ -132,7 +132,7 @@ class ProjectSekaiCooperativeLive(CustomAction):
                 pass
             workflow.run(settings["count"], settings["difficulty"], settings["song_mode"], performance.touch_offset_ms,
                          room=settings["room"], bonus_consumption=performance.bonus_consumption,
-                         recovery_mode=settings["recovery_mode"], recovery_count=settings["recovery_count"],
+                         recovery_mode=settings["recovery_mode"], recovery_count=settings.get("recovery_count", 1),
                          engine=performance.engine, game_timing_feedback=performance.cooperative_game_timing_feedback,
                          play_failure_retry_count=retry_limit)
             outcome = 'succeeded'
