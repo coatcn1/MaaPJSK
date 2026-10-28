@@ -388,10 +388,14 @@ class SoloLive:
         expected_song_id = self.resolve_specified_song(song_name, difficulty) if song_mode == 'specified' else None
         self.navigator.return_to_home()
         self.navigator.tap(1194, 649, "主页 Live")
-        self.navigator.wait("live_menu")
+        self.navigator.wait_stable_live_menu()
         self.navigator.tap(722, 235, "单人 Live")
         frame = self.navigator.wait("song_select")
         selected = self.matcher.match(frame, difficulty, "song_select") if song_mode == "current" else None
+        if song_mode == 'specified':
+            # 先确认目标歌曲，再切换该歌曲的难度组；上一首没有APPEND不能阻止有APPEND的指定目标。
+            selected = self.search_specified_song(expected_song_id, difficulty)
+            frame = self.checked_search_page()
         group = self.ocr.read(frame, (971, 529, 1059, 560))
         if group.confidence < .7 or normalize_title(group.text) not in {"hard", "append"}:
             raise RuntimeError(f"选曲页难度组未确认：{group.text!r}")
@@ -405,8 +409,6 @@ class SoloLive:
                 raise RuntimeError("选曲页未切换到请求的难度组")
         if song_mode == "random":
             self.navigator._select_random_song(frame)
-        elif song_mode == 'specified':
-            selected = self.search_specified_song(expected_song_id, difficulty)
         if difficulty == "append":
             # Append 组只显示中央一个难度按钮，与普通五难度组的坐标不同。
             self.navigator.tap(1015, 500, "Append 难度")

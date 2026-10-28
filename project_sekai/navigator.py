@@ -12,6 +12,7 @@ import numpy as np
 from .device import AdbDevice
 from .chart_catalog import _write_json
 from .ocr import LineOcr, Reading
+from .live_end import blank_transition, LIFE_HUD_AREA
 
 
 def read_available_bonus(ocr: LineOcr, frame: np.ndarray) -> tuple[int, Reading]:
@@ -92,6 +93,34 @@ class Navigator:
         if self.stop_requested():
             raise InterruptedError("用户已停止任务")
 
+    def wait_stable_live_menu(self, timeout: float = 20) -> np.ndarray:
+        deadline = time.monotonic() + timeout
+        first_seen = None
+        frame = None
+        while time.monotonic() < deadline:
+            self._check_stop()
+            frame = self.device.screenshot()
+            self._check_stop()
+            self._check_title_screen(frame)
+            safe = (not blank_transition(frame) and self.match(frame, 'live_menu')[0] >= self.threshold
+                    and not any(name in self.templates and self.match(frame, name)[0] >= self.threshold
+                                for name in ('home', 'song_select', 'prepare', 'playing'))
+                    and not ('life_hud' in self.templates
+                             and self.match(frame, 'life_hud', LIFE_HUD_AREA)[0] >= self.threshold))
+            if safe:
+                if first_seen is not None and time.monotonic() - first_seen >= .8:
+                    return frame
+                first_seen = time.monotonic()
+            else:
+                first_seen = None
+            # 菜单模板可早于可点击状态出现；在同一期限内等新帧稳定，取消保持优先，不补点入口。
+            until = min(deadline, time.monotonic() + .8)
+            while time.monotonic() < until:
+                self._check_stop()
+                time.sleep(max(0., min(.1, until - time.monotonic())))
+        self._save_failure(frame, 'stable_live_menu')
+        raise TimeoutError('单人 Live 菜单未取得间隔0.8秒的安全稳定新帧')
+
     def _check_title_screen(self, frame: np.ndarray) -> None:
         # 返回标题页后无法确认本局结果，继续 ESC 既不能登录，也不能可靠地增加完成次数。
         if "title_screen" in self.templates and self.match(frame, "title_screen")[0] >= self.threshold:
@@ -155,7 +184,7 @@ class Navigator:
         self.tap(1194, 649, "主页 Live")
         if self.dry_run:
             return
-        self.wait("live_menu")
+        self.wait_stable_live_menu()
         self.tap(722, 235, "单人 Live")
         frame = self.wait("song_select")
         if song_mode == "random":

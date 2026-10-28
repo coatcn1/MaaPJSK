@@ -1355,6 +1355,26 @@ class SoloTests(unittest.TestCase):
         self.assertIn((1015,500),points)
         self.assertNotIn((1175,504),points)
 
+    def test_specified_append_searches_target_before_switching_its_group(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.navigator, workflow.matcher, workflow.ocr = Mock(), Mock(), Mock()
+        frame = np.full((720, 1280, 3), 100, np.uint8)
+        identity = SimpleNamespace(song_id=41)
+        workflow.navigator.wait.return_value = frame
+        workflow.resolve_specified_song = Mock(return_value=41)
+        workflow.search_specified_song = Mock(return_value=identity)
+        workflow.checked_search_page = Mock(return_value=frame)
+        workflow.specified_decide_state = Mock(return_value='ready')
+        workflow.matcher.match.return_value = identity
+        workflow.ocr.read.side_effect = [Reading('HARD', .99), Reading('APPEND', .99)]
+        workflow.pause = lambda _: None
+        def tap(x, y, reason):
+            if (x, y) == (1224, 505):
+                workflow.search_specified_song.assert_called_once_with(41, 'append')
+        workflow.navigator.tap.side_effect = tap
+        workflow.select('append', 'specified', song_name='スイートマジック')
+        workflow.navigator.wait_stable_live_menu.assert_called_once()
+
     def test_bonus_adjustment_rechecks_each_step_after_ignored_first_plus(self):
         workflow=SoloLive.__new__(SoloLive)
         workflow.navigator=Mock()

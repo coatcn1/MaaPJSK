@@ -78,6 +78,7 @@ class SongSelectionTests(unittest.TestCase):
         self.navigator.threshold = 0.83
         self.navigator.stop_requested = lambda: False
         self.navigator.return_to_home = lambda: None
+        self.navigator.wait_stable_live_menu = Mock(return_value=self.before)
         self.taps: list[tuple[int, int]] = []
         self.navigator.tap = lambda x, y, _reason: self.taps.append((x, y))
 
@@ -85,6 +86,7 @@ class SongSelectionTests(unittest.TestCase):
         self.navigator.wait = lambda _name: self.before
         self.navigator.match = lambda _frame, name, _area=None: (1.0 if name == "master_selected" else 0.0, (0, 0))
         self.navigator.navigate_to_prepare("current")
+        self.navigator.wait_stable_live_menu.assert_called_once()
         self.assertEqual(self.taps, [(1194, 649), (722, 235), (1175, 493), (1007, 590)])
 
     def test_random_button_runs_before_master_and_confirm(self) -> None:
@@ -105,6 +107,61 @@ class SongSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "未确认歌曲变化"):
                 self.navigator._select_random_song(self.before)
         self.assertEqual(self.taps, [(943, 652)] * 3)
+
+
+class StableLiveMenuTests(unittest.TestCase):
+    def navigator(self, pages, *, stop_at=None):
+        navigator = Navigator.__new__(Navigator)
+        clock = SimpleNamespace(now=0.)
+        navigator.threshold = .83
+        navigator.templates = {name: None for name in ('live_menu', 'home', 'song_select', 'prepare', 'playing', 'life_hud')}
+        navigator.device = Mock()
+        frames = {name: np.full((720, 1280, 3), index + 80, np.uint8)
+                  for index, name in enumerate(('menu', 'unknown', 'hud', 'conflict'))}
+        names = {id(value): key for key, value in frames.items()}
+        iterator = iter(pages)
+        navigator.device.screenshot.side_effect = lambda: frames[next(iterator)]
+        navigator.stop_requested = lambda: stop_at is not None and clock.now >= stop_at
+        navigator._save_failure = Mock()
+        def match(frame, name, area=None):
+            page = names[id(frame)]
+            hit = name == 'live_menu' and page != 'unknown' or name == 'life_hud' and page == 'hud' or name == 'home' and page == 'conflict'
+            return (1. if hit else 0., (0, 0))
+        navigator.match = match
+        return navigator, clock, frames
+
+    def test_menu_requires_two_fresh_safe_frames_separated_by_stability_interval(self):
+        navigator, clock, frames = self.navigator(('menu', 'menu'))
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)):
+            self.assertIs(navigator.wait_stable_live_menu(), frames['menu'])
+        self.assertGreaterEqual(clock.now, .8)
+        self.assertEqual(navigator.device.screenshot.call_count, 2)
+        navigator.device.tap.assert_not_called()
+
+    def test_unknown_frame_resets_stability_and_stop_interrupts_before_input(self):
+        navigator, clock, _ = self.navigator(('menu', 'unknown', 'menu', 'menu'))
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)):
+            navigator.wait_stable_live_menu()
+        self.assertGreaterEqual(clock.now, 2.4)
+        navigator, clock, _ = self.navigator(('menu',), stop_at=.3)
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)), \
+                self.assertRaises(InterruptedError):
+            navigator.wait_stable_live_menu()
+        self.assertEqual(navigator.device.screenshot.call_count, 1)
+        navigator.device.tap.assert_not_called()
+
+    def test_hud_or_conflicting_page_never_authorizes_menu_input(self):
+        for page in ('hud', 'conflict', 'unknown'):
+            navigator, clock, _ = self.navigator((page,) * 4)
+            with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                    patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)), \
+                    self.assertRaises(TimeoutError):
+                navigator.wait_stable_live_menu(timeout=1.6)
+            navigator.device.tap.assert_not_called()
+            navigator._save_failure.assert_called_once()
 
 
 class RecoveryGuardTests(unittest.TestCase):
