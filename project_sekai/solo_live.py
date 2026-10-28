@@ -788,9 +788,12 @@ class SoloLive:
             attempt = {"samples": samples, "sample_count": len(samples), "sample_state": state,
                        "gold_tap_blue_context_guard": getattr(anchor, "gold_tap_blue_context_guard", False) is True,
                        "chart_bound_head_guard": getattr(anchor, "chart_bound_head_guard", False) is True,
-                       "trace_opening_head_guard": getattr(anchor, "trace_opening_head_guard", False) is True}
+                       "trace_opening_head_guard": getattr(anchor, "trace_opening_head_guard", False) is True,
+                       "gold_tap_mixed_context_guard": getattr(anchor, "gold_tap_mixed_context_guard", False) is True,
+                       "legacy_first_head_seed": getattr(anchor, "legacy_first_head_seed", False) is True}
             tracker_status = getattr(getattr(anchor, 'chart_bound_tracker', None), 'status', None)
-            if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']) and isinstance(tracker_status, str):
+            if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']
+                    or attempt['gold_tap_mixed_context_guard']) and isinstance(tracker_status, str):
                 attempt['chart_bound_head_status'] = tracker_status
             if failed:
                 reason = getattr(anchor, "failure_reason", None)
@@ -969,11 +972,19 @@ class SoloLive:
             frame = getattr(self, 'start_failure_frame', None)
             if frame is not None:
                 write_image(directory / 'start-failure.png', frame)
-            report['anchor_frames'] = []
+            saved_frames = []
+            # 已发布的索引与时间映射只在整批成功后替换；重入且无新帧时保持原值。
+            # 新文件避开旧索引，避免半批写入失败破坏仍被引用的证据。
+            previous_paths = {Path(item['path']).name for item in report.get('anchor_frames', [])}
+            offset = 0
             for index, (when, frame) in enumerate(getattr(self, 'anchor_frames', [])):
-                name = f'anchor-frame-{index:02d}.png'
+                while f'anchor-frame-{offset + index:02d}.png' in previous_paths:
+                    offset += 1
+                name = f'anchor-frame-{offset + index:02d}.png'
                 write_image(directory / name, frame)
-                report['anchor_frames'].append({'captured_at': when, 'path': name})
+                saved_frames.append({'captured_at': when, 'path': name})
+            if saved_frames:
+                report['anchor_frames'] = saved_frames
         except Exception as error:
             report['anchor_evidence_warning'] = f'{type(error).__name__}: {error}'
         finally:

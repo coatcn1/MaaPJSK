@@ -16,7 +16,7 @@ from .opening_head import (trace_opening_head_guard_requested, trace_head_candid
 
 TOUCH_PLAN_VERSION = 6 if ERASED_SLIDE_GUARD else 4
 SLIDE_NODE_TOUCH_PLAN_VERSION = 7 if ERASED_SLIDE_GUARD else 5
-START_ANCHOR_VERSION = 27
+START_ANCHOR_VERSION = 28
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
@@ -337,6 +337,67 @@ def gold_tap_following_context(chart, *, skip_blue_taps=False, expected_first=No
         return validated_gold_tap_followers(first, values)
     except (AttributeError, TypeError, ValueError, IndexError):
         return ()
+
+
+def gold_tap_mixed_context_guard_requested():
+    # 本机同曲单人验收后默认开启；显式0回退，两个主保护仍优先。
+    return (os.environ.get('MAAPJSK_GOLD_TAP_MIXED_CONTEXT_GUARD') != '0'
+            and os.environ.get('MAAPJSK_GOLD_TAP_HEAD_GUARD') != '0'
+            and os.environ.get('MAAPJSK_GOLD_TAP_FOLLOWERS_GUARD') != '0')
+
+
+def gold_tap_mixed_context_eligible(chart, expected_first):
+    """只接原单头已可播种、但同轨及异轨金 TAP 后继使旧上下文整份拒绝的窄族。"""
+    try:
+        if (not isinstance(chart, Chart) or chart.first is not expected_first
+                or sum(value is expected_first for value in chart.gestures) != 1):
+            return False
+
+        def ordinary(value):
+            if (not isinstance(value, Gesture) or value.kind != 'tap' or value.critical is not True
+                    or type(value.flick) is not int or value.flick != 0 or len(value.points) != 1):
+                return False
+            point = value.points[0]
+            return (isinstance(point, Point) and type(point.time) in {int, float} and math.isfinite(point.time)
+                    and type(point.kind) is int and point.kind == 2
+                    and type(point.lane) is int and type(point.width) is int
+                    and 2 <= point.lane < point.lane + point.width <= 14
+                    and type(point.direction) is int and point.direction == 0)
+
+        first = expected_first
+        if not ordinary(first):
+            return False
+        same, mixed, count = False, False, 0
+        point = first.points[0]
+        for value in chart.gestures:
+            if (not isinstance(value, Gesture) or not value.points or not isinstance(value.points[0], Point)
+                    or type(value.start) not in {int, float} or not math.isfinite(value.start)):
+                return False
+            if value is first:
+                continue
+            if value.start <= first.start + 1e-9:
+                return False
+            if value.start > first.start + 1.:
+                continue
+            # 跟踪器也比较异轨金头；整秒窗口一起限额，不能只约束首轨交集或截断后继。
+            if first_note_color(value) == 'gold':
+                count += 1
+                if count > 32:
+                    return False
+            following = value.points[0]
+            if (type(following.lane) is not int or type(following.width) is not int
+                    or not 2 <= following.lane < following.lane + following.width <= 14):
+                return False
+            if point.lane < following.lane + following.width and following.lane < point.lane + point.width:
+                if not ordinary(value):
+                    return False
+                identical = following.lane == point.lane and following.width == point.width
+                same |= identical
+                mixed |= not identical
+        return (same and mixed and not gold_tap_following_context(chart, expected_first=first)
+                and chart_bound_following_geometry(chart, first) is not None)
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return False
 
 
 class FirstHeadOutsideWindow(RuntimeError):
@@ -1303,6 +1364,13 @@ class StartAnchor:
                                              and os.environ.get("MAAPJSK_GOLD_TAP_SLIDE_FOLLOWER_GUARD") != "0")
         self.gold_tap_slide_following_gestures = validated_gold_tap_slide_follower(gesture, gold_tap_slide_following_gestures)
         self.gold_tap_slide_pair_confirmed = False
+        # 候选只扩大已由旧单头合同播种后的跟踪；首次身份不能借新测量器放宽。
+        self.gold_tap_mixed_context_guard = (gold_tap_mixed_context_guard_requested()
+            and not self.chart_bound_head_guard
+            and gold_tap_mixed_context_eligible(gold_tap_context_chart, gesture))
+        self.legacy_first_head_seed = False
+        if self.gold_tap_mixed_context_guard:
+            self.chart_bound_tracker = ChartBoundHeadTracker(gold_tap_context_chart, gesture, trace_heads=False)
         # 本局创建时冻结保护设置；明确主开关优先，兼容旧试验开关，空值不关闭默认保护。
         guard_setting = os.environ.get("MAAPJSK_START_ANCHOR_AMBIGUITY_GUARD")
         if guard_setting not in {"0", "1"}:
@@ -1337,7 +1405,31 @@ class StartAnchor:
         try:
             slide_evidence = {}
             if self.chart_bound_tracker is not None:
+                if self.gold_tap_mixed_context_guard and not self.chart_bound_tracker.motion:
+                    if self.chart_bound_tracker.lost:
+                        raise RuntimeError('真实首头播种已拒绝，禁止由后继重新播种')
+                    legacy_y = first_note_y(frame, self.gesture, self.baseline,
+                        simultaneous_gestures=self.simultaneous_gestures,
+                        dense_following_gestures=self.dense_following_gestures, reject_passed_slide=True,
+                        gold_tap_following_gestures=self.gold_tap_following_gestures,
+                        gold_tap_head_guard=self.gold_tap_head_guard, gold_slide_pair_guard=self.gold_slide_pair_guard,
+                        gold_tap_followers_guard=self.gold_tap_followers_guard,
+                        gold_tap_slide_following_gestures=self.gold_tap_slide_following_gestures,
+                        gold_tap_slide_follower_guard=self.gold_tap_slide_follower_guard,
+                        observation=self.observation)
+                    measured, unknown = self.chart_bound_tracker.measure(frame, self.baseline)
+                    if measured is not None or unknown:
+                        if (legacy_y is None or not 40 < legacy_y < 130 or measured is None
+                                or abs(legacy_y - measured) > 1e-6):
+                            self.chart_bound_tracker.lost = True
+                            self.chart_bound_tracker.status = 'legacy_first_head_seed_rejected'
+                            self.failure_reason = 'legacy_first_head_seed_rejected'
+                            raise RuntimeError('原单头合同未唯一证明同帧真实首头，拒绝由后继播种')
+                    else:
+                        return None
                 y = self.chart_bound_tracker.observe(frame, self.baseline, captured_at)
+                if self.gold_tap_mixed_context_guard and self.chart_bound_tracker.motion:
+                    self.legacy_first_head_seed = True
                 self.observation = dict(self.chart_bound_tracker.measurement)
                 self.observation['reason'] = self.chart_bound_tracker.status + ':' + self.observation.get('reason', 'unknown')
                 if self.chart_bound_tracker.lost:
@@ -1356,6 +1448,9 @@ class StartAnchor:
                 self.observation.update(reason='legacy_candidate' if y is not None else self.observation['reason'], measured_y=y)
         except FirstHeadOutsideWindow:
             self.failure_reason = "first_head_outside_window"
+            if self.gold_tap_mixed_context_guard:
+                self.chart_bound_tracker.lost = True
+                self.chart_bound_tracker.status = 'first_head_outside_window'
             raise
         if y is None:
             return None
@@ -1430,6 +1525,8 @@ class StartAnchor:
             self.fit["gold_tap_blue_context_guard"] = self.gold_tap_blue_context_guard
             self.fit['chart_bound_head_guard'] = self.chart_bound_head_guard
             self.fit['trace_opening_head_guard'] = self.trace_opening_head_guard
+            self.fit['gold_tap_mixed_context_guard'] = self.gold_tap_mixed_context_guard
+            self.fit['legacy_first_head_seed'] = self.legacy_first_head_seed
             if self.gold_tap_slide_follower_guard:
                 self.fit["gold_tap_slide_follower_guard"] = True
                 self.fit["gold_tap_slide_pair_confirmed"] = bool(self.gold_tap_slide_pair_confirmed)
@@ -1530,6 +1627,8 @@ class StartAnchor:
         self.fit["gold_tap_blue_context_guard"] = self.gold_tap_blue_context_guard
         self.fit['chart_bound_head_guard'] = self.chart_bound_head_guard
         self.fit['trace_opening_head_guard'] = self.trace_opening_head_guard
+        self.fit['gold_tap_mixed_context_guard'] = self.gold_tap_mixed_context_guard
+        self.fit['legacy_first_head_seed'] = self.legacy_first_head_seed
         if self.gold_tap_slide_follower_guard:
             self.fit["gold_tap_slide_follower_guard"] = True
             self.fit["gold_tap_slide_pair_confirmed"] = bool(self.gold_tap_slide_pair_confirmed)
