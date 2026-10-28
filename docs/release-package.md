@@ -1,8 +1,8 @@
 # Windows 便携发行包
 
-v0.8.0 面向 Windows x64、日服 MuMu 横屏 1280×720／240 DPI。完整包 `MaaPJSK-v0.8.0-win-x64.zip` 包含自包含 .NET 10 主程序、CPython 3.12.13 便携运行环境、MaaFramework 5.10.2、Native 1.2.0、离线 OCR 和必要 UI 裁剪模板。依赖版本见 `runtime-compatibility.json`，授权来源见 `THIRD-PARTY-NOTICES.md`。
+v0.9.0 面向 Windows x64、日服 MuMu 横屏 1280×720／240 DPI。完整包 `MaaPJSK-v0.9.0-win-x64.zip` 包含自包含 .NET 10 主程序、CPython 3.12.13 便携运行环境、MaaFramework 5.10.2、Native 1.2.0、离线 OCR 和必要 UI 裁剪模板。依赖版本见 `runtime-compatibility.json`，授权来源见 `THIRD-PARTY-NOTICES.md`。
 
-完整 ZIP 和 `MaaPJSK-v0.8.0-win-x64-update.zip` 都采用扁平根目录，并各附 `.sha256`。第一次使用解压完整包，运行 `MaaPJSK.cmd`。首次以 .NET SHA256 校验并解包 Python ZIP、执行 conda-unpack，成功后写就绪标记；再次启动复用运行环境。支持目录手动改名及中文／空格路径，每次启动重绑定服务路径，安装目录内的曲库随改名重定位，用户外部曲库与清单原路径保持。不要单独直接运行 EXE 绕过首启准备。
+完整 ZIP 和 `MaaPJSK-v0.9.0-win-x64-update.zip` 都采用扁平根目录，并各附 `.sha256`。第一次使用解压完整包，运行 `MaaPJSK.cmd`。首次以 .NET SHA256 校验并解包 Python ZIP、执行 conda-unpack，成功后写就绪标记；再次启动复用运行环境。支持目录手动改名及中文／空格路径，每次启动重绑定服务路径，安装目录内的曲库随改名重定位，用户外部曲库与清单原路径保持。不要单独直接运行 EXE 绕过首启准备。
 
 首次启动生成本机配置，偏移为 0，不附机器校准 Profile、不自动开始任务，发行整包更新固定使用 GitHub。发行包不含曲库；先在谱面管理页同步，连接自己的 MuMu 后由用户选择任务。发行包内没有设备端点、任务历史、日志、完整截图、用户配置或 `.pdb`。
 
@@ -18,12 +18,14 @@ v0.8.0 面向 Windows x64、日服 MuMu 横屏 1280×720／240 DPI。完整包 `
 
 同次探测还确认全新、无设备端点的 GUI 正常启动，窗口显示 MFA v2.12.0 与 Project SEKAI v0.8.0；正常关闭在十秒内退出且没有遗留新进程。该项只检查窗口句柄、标题和日志，没有启动任务或发送设备输入，不代表完整 GUI 更新交互已验收。Python 完整回归、发行定向回归及 MFA 离屏检查均通过。
 
+v0.9.0 的行为变化、未验收范围及开关回退见 [本版发行说明](release-notes-v0.9.0.md)。上面的 2026-10-08 包探测是 v0.8.0 历史证据，不代表 v0.9.0 已完成首启、更新或演出验收。
+
 构建入口：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-chart-settings.ps1 -ReleasePackage -PublishOutput .local/release-v0.8.0/mfa-self-contained
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1 -Version 0.8.0 -MfaPublish .local/release-v0.8.0/mfa-self-contained -PythonArchive .local/release-v0.8.0/maapjsk-python.zip -Output .local/release
-python scripts/check_release_package.py .local/release/MaaPJSK-v0.8.0-win-x64
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-chart-settings.ps1 -ReleasePackage -PublishOutput .local/release-v0.9.0/mfa-self-contained
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1 -Version 0.9.0 -MfaPublish .local/release-v0.9.0/mfa-self-contained -PythonArchive .local/release-v0.9.0/maapjsk-python.zip -Output .local/release
+python scripts/check_release_package.py .local/release/MaaPJSK-v0.9.0-win-x64
 ```
 
 正式构建要求干净工作树，`-AllowDirty` 只用于本地探测，不能上传该资产。构建记录仅含版本、提交及哈希，不记录私有绝对路径。模板仅复制四份本机模板 JSON 显式引用的小裁剪，模型使用固定已校验 SHA256；构建器拒绝不符内容。固定 MFA 导出在项目 `.local` 内应用 overlay，不修改邻仓。

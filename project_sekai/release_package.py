@@ -164,7 +164,7 @@ def build(source: Path, mfa: Path, python_archive: Path, output: Path, version: 
     copy(source / "packaging/MaaPJSK.cmd", target / "MaaPJSK.cmd")
     for name in ["runtime-compatibility.json", "README.md", "THIRD-PARTY-NOTICES.md"]:
         copy(source / name, target / name)
-    for name in ["release-package.md", "release-notes-v0.8.0.md"]:
+    for name in ["release-package.md", f"release-notes-v{version}.md"]:
         copy(source / "docs" / name, target / "docs" / name)
     for file in (source / "packaging/licenses").glob("*"):
         if file.is_file():
@@ -223,7 +223,7 @@ def main() -> None:
     parser.add_argument("--mfa", type=Path)
     parser.add_argument("--python-archive", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--version", default="0.8.0")
+    parser.add_argument("--version", default="0.9.0")
     parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args()
     if args.command == "bootstrap":
