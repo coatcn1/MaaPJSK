@@ -283,10 +283,10 @@ class ReleaseUpdateTests(unittest.TestCase):
                      "project_sekai/native/vendor/minitouch/LICENSE", "mfa-chart-ui/MaaPjskReleaseUpdate.cs",
                      "scripts/start-release.ps1", "scripts/apply-release-update.ps1", "scripts/update-release.py", "scripts/sync_sekai_catalog.py",
                      "packaging/MaaPJSK.cmd", "packaging/PP-OCRv5-NOTICE.md", "runtime-compatibility.json", "README.md", "THIRD-PARTY-NOTICES.md",
-                     "docs/release-package.md", "docs/release-notes-v0.8.0.md", "third_party/maabangdream/LICENSE",
+                     "docs/release-package.md", "docs/release-notes-v0.9.0.md", "third_party/maabangdream/LICENSE",
                      "packaging/licenses/MFAAvalonia-GPL-3.0.txt", "packaging/licenses/MaaFramework-LGPL-3.0.txt", "packaging/licenses/PaddleOCR-Apache-2.0.txt"]:
             put(source, name)
-        put(source, "interface.json", b'{"version":"0.8.0","agent":{"child_exec":"python"}}')
+        put(source, "interface.json", b'{"version":"0.9.0","agent":{"child_exec":"python"}}')
         put(source, "resource/pipeline/test.json", b"{}")
         model_hashes = {}
         for name in ["inference.onnx", "inference.yml"]:
@@ -306,13 +306,15 @@ class ReleaseUpdateTests(unittest.TestCase):
         runtime = Path(self.folder.name) / "python.zip"
         runtime.write_bytes(b"neutral-runtime-fixture")
         with patch.object(release_package.subprocess, "check_output", side_effect=["", "a" * 40]), patch.object(release_package, "MODEL_HASHES", model_hashes):
-            target = release_package.build(source, mfa, runtime, output, "0.8.0")
-        expected = {"MaaPJSK-v0.8.0-win-x64.zip", "MaaPJSK-v0.8.0-win-x64-update.zip"}
+            target = release_package.build(source, mfa, runtime, output, "0.9.0")
+        expected = {"MaaPJSK-v0.9.0-win-x64.zip", "MaaPJSK-v0.9.0-win-x64-update.zip"}
         self.assertEqual({p.name for p in output.glob("*.zip")}, expected)
         for name in expected:
             self.assertTrue((output / (name + ".sha256")).is_file())
-        with zipfile.ZipFile(output / "MaaPJSK-v0.8.0-win-x64-update.zip") as package:
+        with zipfile.ZipFile(output / "MaaPJSK-v0.9.0-win-x64-update.zip") as package:
             self.assertIn("resource/models/song_title_ocr/NOTICE.md", package.namelist())
+            self.assertIn("docs/release-notes-v0.9.0.md", package.namelist())
+            self.assertNotIn("docs/release-notes-v0.8.0.md", package.namelist())
             self.assertFalse(any(name.startswith(("runtime/", "config/", "profiles/", "debug/", "resource/charts/")) for name in package.namelist()))
             self.assertNotIn("docs/images/full-screenshot.png", package.namelist())
         self.assertEqual(release_package.check_package(target)["release_validation"], "passed")

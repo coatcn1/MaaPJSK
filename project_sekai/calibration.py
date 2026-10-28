@@ -11,7 +11,8 @@ from uuid import uuid4
 from .chart_catalog import _write_json
 from .diagnostics import write_json, make_directory
 from . import native_engine
-from .chart_player import START_ANCHOR_VERSION, TOUCH_PLAN_VERSION, chart_bound_head_guard_requested
+from .chart_player import (START_ANCHOR_VERSION, TOUCH_PLAN_VERSION, chart_bound_head_guard_requested,
+                           gold_tap_mixed_context_guard_requested)
 from .opening_head import trace_opening_head_guard_requested
 
 
@@ -32,6 +33,7 @@ def environment_signature(device) -> dict:
             "engine": "native", "engine_version": native_engine.module().version(),
             "touch_plan_version": TOUCH_PLAN_VERSION, "start_anchor_version": START_ANCHOR_VERSION,
             "chart_bound_head_guard": chart_bound_head_guard_requested(),
+            "gold_tap_mixed_context_guard": gold_tap_mixed_context_guard_requested(),
             "trace_opening_head_guard": trace_opening_head_guard_requested()}
 
 

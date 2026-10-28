@@ -5,11 +5,13 @@ from dataclasses import asdict
 from datetime import datetime
 import csv
 import json
+import os
 from pathlib import Path
 import re
 import time
 from uuid import uuid4
 
+import cv2
 import numpy as np
 
 from .diagnostics import write_json as _write_json, make_directory, enabled
@@ -49,6 +51,10 @@ PAGE_AREAS = {
 ENTRY_WAIT_SECONDS = 60
 ROOM_WAIT_SECONDS = 180
 PLAY_OBSERVATION_INTERVAL = 2.0
+ENTRY_NOTICE_WAIT_SECONDS = 20
+ENTRY_RECOVERY_WAIT_SECONDS = 120
+ROOM_SEARCH_WAIT_SECONDS = 20
+RUNTIME_RECOVERY_WAIT_SECONDS = 120
 COOPERATIVE_LIFE_BAR = (1008, 48, 1177, 56)
 
 
@@ -58,6 +64,14 @@ class CooperativePlaybackInterrupted(RuntimeError):
 
 class RoomIdleTimeout(RuntimeError):
     """房内连续无正向进展超过期限；清理后仅在明确安全房内页允许 ESC 恢复。"""
+
+
+class RuntimeRecoveryExhausted(RuntimeError):
+    """普通恢复已耗尽安全预算；终态不得被外层重试或报告写入重新吞回等待。"""
+
+
+class EntryRecoveryExhausted(RuntimeRecoveryExhausted):
+    """从未请求入房且无谱面输入的入口恢复耗尽，不能再次转入普通无限等待。"""
 
 
 class RoomDisbanded(RuntimeError):
@@ -91,8 +105,8 @@ def append_cooperative_result_index(root, directory, report):
     if path.is_file() and path.stat().st_size > 0:
         with path.open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
-        if any(item.get("run") == directory.name for item in rows):
-            return
+        # 同局可能先保存结算异常，再在安全回主页后确认完成；原子替换该行，不能遗留旧失败状态。
+        rows = [item for item in rows if item.get("run") != directory.name]
     temporary = path.with_suffix(".csv.tmp")
     with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(row))
@@ -141,6 +155,8 @@ class CooperativeLive(SoloLive):
         self.game_timing_config = template_config.parent / "game-timing-templates.json"
         self.game_timing_guard = None
         self.game_timing_templates = None
+        self.entry_notice_guard = os.environ.get("MAAPJSK_COOPERATIVE_ENTRY_NOTICE_GUARD") != "0"
+        self.room_search_guard = os.environ.get("MAAPJSK_COOPERATIVE_ROOM_SEARCH_GUARD") != "0"
 
     def prepare_game_timing_feedback(self, report, enabled, engine):
         self.game_timing_guard = None
@@ -395,7 +411,9 @@ class CooperativeLive(SoloLive):
             frame = self.screenshot()
             if guard:
                 self.guard_room(frame)
-            if self.score(frame, page) >= self.navigator.threshold:
+            if (self.score(frame, page) >= self.navigator.threshold
+                    and (page != "cooperative_room" or not getattr(self, "room_search_guard", False)
+                         or self.unique_room_destination(frame))):
                 return frame
             if self.score(frame, "cooperative_matching") >= self.navigator.threshold:
                 self.matched = True
@@ -423,6 +441,8 @@ class CooperativeLive(SoloLive):
         self.guard_room(frame)
         if self.score(frame, page) < self.navigator.threshold:
             raise RuntimeError(f"{reason}前页面已改变，拒绝使用过期页面点击")
+        if page == "cooperative_room" and getattr(self, "room_search_guard", False) and not self.unique_room_destination(frame):
+            raise RuntimeError("房间选择页不唯一或仍有入房前搜索，拒绝重复加入")
         if page in {"home", "live_menu"} and not self.recovery_hud_absent(frame):
             raise RuntimeError("主页入口出现演奏 HUD，拒绝点击")
         self.navigator.tap(x, y, reason)
@@ -439,10 +459,17 @@ class CooperativeLive(SoloLive):
         while True:
             self.check_runtime_stop()
             frame = self.screenshot()
+            if (getattr(self, "entry_notice_guard", False)
+                    and self.handle_entry_notice(frame, self.current_report or {}, self.current_directory)):
+                continue
+            if (getattr(self, "room_search_guard", False)
+                    and self.handle_room_search(frame, self.current_report or {}, self.current_directory)):
+                continue
             if not blank_transition(frame) and self.recovery_hud_absent(frame):
                 if self.room_destination(frame):
                     # 实际到达房间选择页才结束这次入口计时；同目标的按钮请求预算继续保留。
                     self.entry_deadline = None
+                    self.entry_notice_disqualified = True
                     return frame
                 if time.monotonic() >= self.entry_deadline:
                     raise TimeoutError("主页到多人房间选择超过 60 秒，保留本局等待安全恢复")
@@ -459,6 +486,303 @@ class CooperativeLive(SoloLive):
                 raise TimeoutError("协力入口未在 60 秒内确认，保留本局等待安全恢复")
             self.pause(.25)
 
+    def entry_notice_scope(self, report):
+        playback = report.get("playback")
+        return (getattr(self, "entry_notice_guard", False)
+                and not getattr(self, "entry_notice_disqualified", False)
+                and getattr(self, "join_request_count", 0) == 0
+                and not getattr(self, "matched", False) and not getattr(self, "room_progress", None)
+                and not report.get("attempts")
+                and report.get("bonus", {}).get("availability") != "insufficient"
+                and report.get("recovery", {}).get("status") != "started"
+                and not getattr(self, "resume_selection", False) and not getattr(self, "resume_stage", None)
+                and not any(report.get(key) for key in
+                            ("joined_room", "ready_confirmed", "skipped_after_input", "death_confirmed", "cancelled"))
+                and report.get("phase") not in {"playing", "settlement"}
+                and getattr(self, "pending_native_player", None) is None
+                and (playback is None or (playback.get("sent_actions", 0) == 0
+                     and playback.get("executed_actions", 0) == 0 and release_finished(report))))
+
+    def entry_notice_state(self, report):
+        # 状态属于真实入口事件，报告重建、截图失败和失败回执均不得刷新预算。
+        if not hasattr(self, "entry_notice_recovery"):
+            self.entry_notice_recovery = {"requests": 0, "closed": False}
+        report["entry_notice_recovery"] = self.entry_notice_recovery
+        return self.entry_notice_recovery
+
+    def observe_entry_scope(self, frame, report):
+        if not self.entry_notice_scope(report):
+            return
+        if (self.room_destination(frame) or not self.recovery_hud_absent(frame)
+                or any(self.score(frame, page) >= self.navigator.threshold for page in
+                       ("cooperative_matching", "cooperative_select", "cooperative_shuffle",
+                        "cooperative_ready", "cooperative_cancel"))):
+            # 房间选择正向到达后入口已完成；后续资源等待及用户手动进房均沿原生命周期。
+            self.entry_notice_disqualified = True
+
+    def check_entry_recovery_deadline(self, report, error):
+        if not self.entry_notice_scope(report):
+            return
+        self.check_runtime_stop()
+        state = self.entry_notice_state(report)
+        deadline = state.setdefault("recovery_deadline", time.monotonic() + ENTRY_RECOVERY_WAIT_SECONDS)
+        if time.monotonic() >= deadline:
+            report.setdefault("error", f"{type(error).__name__}: {error}")
+            report["entry_recovery_error"] = "未曾请求入房且零谱面输入的协力入口恢复超过 120 秒，已停止任务，请处理当前页面后重新开始"
+            raise EntryRecoveryExhausted(report["entry_recovery_error"])
+
+    def handle_entry_notice(self, frame, report, directory):
+        self.observe_entry_scope(frame, report)
+        if not self.entry_notice_scope(report):
+            return False
+        state = self.entry_notice_state(report)
+        if state["closed"]:
+            return False
+        login = getattr(self, "entry_notice_login", None)
+        if login is None:
+            login = self.entry_notice_login = GameLogin(
+                self.device, self.navigator, self.report_root, stop_requested=self.stop_requested,
+                log_message=self.safe_log, ocr=getattr(self, "ocr", None))
+
+        def notice(image):
+            return (not blank_transition(image) and self.recovery_hud_absent(image)
+                    and self.score(image, "title_screen") < self.navigator.threshold
+                    and self.clear_navigation_overlay(image) and login.known_notice(image))
+
+        def home(image):
+            return (not blank_transition(image) and self.recovery_hud_absent(image)
+                    and self.score(image, "home") >= self.navigator.threshold
+                    and all(self.score(image, page) < self.navigator.threshold for page in
+                            (set(PAGE_AREAS) - {"home"}) | {"live_menu", "song_select", "prepare", "recovery_dialog"})
+                    and not login.known_notice(image))
+
+        # 请求回执不证明公告关闭；必须两张明确且唯一的主页，并重新通过环境预检。
+        if state["requests"] and home(frame):
+            self.pause(.25)
+            fresh = self.device.screenshot()
+            self.check_runtime_stop()
+            self.observe_entry_scope(fresh, report)
+            if self.entry_notice_scope(report) and home(fresh):
+                if not login.foreground():
+                    return False
+                self.device.preflight()
+                self.check_runtime_stop()
+                state.update(closed=True, closed_at=time.monotonic(), home_confirmation_frames=2)
+                self.entry_deadline = time.monotonic() + ENTRY_WAIT_SECONDS
+                self.recovery_state(report, directory, "entry_notice_closed")
+                return True
+            return False
+        if not notice(frame):
+            return False
+        deadline = state.setdefault("deadline", time.monotonic() + ENTRY_NOTICE_WAIT_SECONDS)
+        now = time.monotonic()
+        if now >= deadline or state["requests"] >= 3:
+            return False
+        if now - state.get("last_request", float("-inf")) < 1:
+            self.pause(.25)
+            return True
+        self.check_runtime_stop()
+        # 证据和日志可能阻塞；所有写入完成后重新取帧，不能沿用写入前的公告输入。
+        if enabled():
+            try:
+                write_image(directory / f"entry-notice-{state['requests'] + 1}.png", frame)
+            except OSError as evidence_error:
+                state["evidence_error"] = str(evidence_error)
+        self.recovery_state(report, directory, "waiting_entry_notice")
+        self.safe_log("协力入口确认お知らせ公告，准备有限 BACK；尚未入房且无谱面输入")
+        self.check_runtime_stop()
+        if not login.foreground():
+            return False
+        fresh = self.device.screenshot()
+        self.observe_entry_scope(fresh, report)
+        if not self.entry_notice_scope(report) or not notice(fresh) or not login.foreground():
+            return False
+        self.check_runtime_stop()
+        if time.monotonic() >= deadline or not self.entry_notice_scope(report):
+            return False
+        state["requests"] += 1
+        state["last_request"] = time.monotonic()
+        # 先消耗请求预算，ACK 异常也不能重复请求；原始恢复错误由上层保留。
+        self.device.back()
+        self.pause(.25)
+        return True
+
+    def room_search_scope(self, report, *, initial=False):
+        playback = report.get("playback")
+        joins = getattr(self, "join_request_count", 0)
+        state = getattr(self, "room_search_recovery", None) or {}
+        active = (joins > 0 and getattr(self, "join_deadline", None) is not None
+                  or joins == 0 and not report.get("attempts") and (initial or state.get("inherited_search")))
+        return (getattr(self, "room_search_guard", False)
+                and active
+                and not getattr(self, "matched", False) and not getattr(self, "room_progress", None)
+                and not getattr(self, "resume_selection", False) and not getattr(self, "resume_stage", None)
+                and getattr(self, "pending_native_player", None) is None
+                and report.get("bonus", {}).get("availability") != "insufficient"
+                and report.get("recovery", {}).get("status") != "started"
+                and not any(report.get(key) for key in
+                            ("joined_room", "ready_confirmed", "skipped_after_input", "death_confirmed", "cancelled"))
+                and not any(attempt.get("join_confirmed_page") is not None for attempt in report.get("attempts", []))
+                and report.get("phase") not in {"playing", "settlement"}
+                and (playback is None or (playback.get("sent_actions", 0) == 0
+                     and playback.get("executed_actions", 0) == 0 and release_finished(report))))
+
+    def room_search_visible(self, frame):
+        if (not getattr(self, "room_search_guard", False) or frame.shape[:2] != (720, 1280)
+                or blank_transition(frame) or not self.recovery_hud_absent(frame)
+                or any(self.score(frame, page) >= self.navigator.threshold
+                       for page in (set(PAGE_AREAS) - {"cooperative_room", "playing"}) | {"live_menu", "song_select"})):
+            return False
+        labels = (((638, 95, 840, 136), "SELECTROOM"),
+                  ((508, 223, 775, 263), "ルームを探しています…"),
+                  ((579, 436, 704, 477), "キャンセル"))
+        for box, expected in labels:
+            reading = self.ocr.read(frame, box)
+            text = re.sub(r"\s+", "", reading.text)
+            if box == labels[1][0] and text.endswith("..."):
+                text = text[:-3] + "…"
+            if reading.confidence < .85 or text != expected:
+                return False
+        # 白色圆角胶囊须来自原位置的真实连通轮廓；文字或亮度均值不能构造取消按钮。
+        hsv = cv2.cvtColor(frame[412:501, 505:775], cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 0, 220), (179, 35, 255))
+        buttons = []
+        for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            x, y, width, height = cv2.boundingRect(contour)
+            if (190 <= width <= 235 and 45 <= height <= 63
+                    and 625 <= 505 + x + width / 2 <= 655
+                    and 446 <= 412 + y + height / 2 <= 467
+                    and .88 <= cv2.contourArea(contour) / (width * height) <= .97):
+                buttons.append(contour)
+        return len(buttons) == 1
+
+    def room_search_state(self, report):
+        state = getattr(self, "room_search_recovery", None)
+        if state is None:
+            state = self.room_search_recovery = {"requests": 0, "search_cancel_confirmed": False,
+                                                "join_request": getattr(self, "join_request_count", 0)}
+        report["room_search_recovery"] = state
+        state["remaining_join_requests"] = max(0, 1 + getattr(self, "max_rematches", 3)
+                                                - getattr(self, "join_request_count", 0))
+        return state
+
+    def runtime_recovery_exempt(self, report):
+        return (getattr(self, "pending_native_player", None) is not None
+                or report.get("playback") is not None and not release_finished(report)
+                or report.get("death_confirmed") or report.get("cancelled")
+                or (report.get("bonus", {}).get("availability") == "insufficient"
+                    and not report.get("runtime_resource_ready"))
+                or report.get("recovery", {}).get("status") == "started")
+
+    def runtime_terminal(self, report, reason):
+        self.check_runtime_stop()
+        if self.runtime_recovery_exempt(report):
+            return
+        report.update(completed=False, runtime_recovery_error=reason, task_state="runtime_recovery_exhausted")
+        raise RuntimeRecoveryExhausted(reason)
+
+    def check_runtime_recovery_deadline(self, report, error, *, enforce=True):
+        if not getattr(self, "room_search_guard", False):
+            return
+        self.check_runtime_stop()
+        now = time.monotonic()
+        state = getattr(self, "runtime_recovery_episode", None)
+        if self.runtime_recovery_exempt(report):
+            if state is not None:
+                state.setdefault("suspended_at", now)
+            return
+        progress = getattr(self, "room_progress", {})
+        rank = {"matching": 0, "select": 1, "shuffle": 2, "ready": 3, "cancel": 4}.get(progress.get("stage"), -1)
+        joins = getattr(self, "join_request_count", 0)
+        # 报告重建和同阶段反复失败不是新进展；只有真实新入房请求或严格前进的房内阶段开新窗口。
+        if state is None or joins > state["join_request"] or rank > state["stage_rank"]:
+            state = self.runtime_recovery_episode = {"started_at": now, "deadline": now + RUNTIME_RECOVERY_WAIT_SECONDS,
+                                                     "join_request": joins, "stage_rank": rank}
+        if "suspended_at" in state:
+            state["deadline"] += now - state.pop("suspended_at")
+        report["runtime_recovery_episode"] = state
+        report.setdefault("error", f"{type(error).__name__}: {error}")
+        # 原房内无进展时钟及其有限 ESC 窗口先完成，不能被共同 120 秒抢先截断。
+        if progress.get("stage") == "matching" and now < progress.get("deadline", 0) + ROOM_SEARCH_WAIT_SECONDS:
+            return
+        login = getattr(self, "settlement_login", None)
+        if login is not None and not getattr(self, "settlement_login_completed", False):
+            login_deadline = getattr(self, "settlement_login_budget_deadline", getattr(login, "_deadline", None))
+            if isinstance(login_deadline, (int, float)) and now < login_deadline:
+                return
+        if enforce and now >= state["deadline"]:
+            self.runtime_terminal(report, "协力普通恢复连续 120 秒没有新的安全进展，已停止任务，请处理当前页面后重新开始")
+
+    def unique_room_destination(self, frame):
+        return (self.room_destination(frame)
+                and all(self.score(frame, page) < self.navigator.threshold
+                        for page in (set(PAGE_AREAS) - {"cooperative_room", "playing"}) | {"live_menu", "song_select"}))
+
+    def handle_room_search(self, frame, report, directory):
+        if (not self.room_search_scope(report) and self.room_search_scope(report, initial=True)
+                and self.room_search_visible(frame)):
+            # 新任务可能继承用户停止后仍存在的搜索；记录外来事件，不伪造本次入房请求或重建其等待期。
+            state = self.room_search_state(report)
+            state.update(inherited_search=True, observed_on_start=True, observed_at=time.monotonic())
+            self.entry_notice_disqualified = True
+        if not self.room_search_scope(report):
+            return False
+        state = self.room_search_state(report)
+        if state["search_cancel_confirmed"]:
+            return False
+        login = GameLogin(self.device, self.navigator, self.report_root,
+                          stop_requested=self.stop_requested, log_message=self.safe_log)
+        if "observed_at" in state and self.unique_room_destination(frame):
+            self.pause(.25)
+            fresh = self.device.screenshot()
+            self.check_runtime_stop()
+            if self.room_search_scope(report) and self.unique_room_destination(fresh) and login.foreground():
+                self.device.preflight()
+                self.check_runtime_stop()
+                if not self.room_search_scope(report):
+                    return False
+                state.update(search_cancel_confirmed=True, confirmed_at=time.monotonic(), room_confirmation_frames=2)
+                self.join_deadline = None
+                self.recovery_state(report, directory, "search_cancel_confirmed")
+                return True
+            return False
+        if not self.room_search_visible(frame):
+            return False
+        state.setdefault("observed_at", time.monotonic())
+        report["entry_search_observed"] = True
+        # 正向搜索只记观察；不能确认入房，也不能刷新原来的 60 秒。
+        if not state.get("inherited_search") and time.monotonic() < self.join_deadline:
+            return False
+        deadline = state.setdefault("deadline", time.monotonic() + ROOM_SEARCH_WAIT_SECONDS)
+        if time.monotonic() >= deadline or state["requests"] >= 3:
+            self.runtime_terminal(report, "入房前搜索取消的三次请求或 20 秒期限已耗尽，未确认安全返回，已停止任务")
+            return False
+        if time.monotonic() - state.get("last_request", float("-inf")) < 1:
+            self.pause(.25)
+            return True
+        if enabled():
+            try:
+                write_image(directory / f"room-search-{state['requests'] + 1}.png", frame)
+            except OSError as evidence_error:
+                state["evidence_error"] = str(evidence_error)
+        self.recovery_state(report, directory, "waiting_room_search")
+        reason = "新任务检测到遗留搜索" if state.get("inherited_search") else "入房前搜索已超过 60 秒"
+        self.safe_log(f"{reason}，准备 ESC 取消 {state['requests'] + 1}/3；剩余入房请求 {state['remaining_join_requests']}")
+        self.check_runtime_stop()
+        if not login.foreground():
+            return False
+        fresh = self.device.screenshot()
+        if not self.room_search_scope(report) or not self.room_search_visible(fresh) or not login.foreground():
+            return False
+        self.check_runtime_stop()
+        if time.monotonic() >= deadline or not self.room_search_scope(report):
+            return False
+        state["requests"] += 1
+        state["last_request"] = time.monotonic()
+        self.device.back()
+        self.pause(.25)
+        return True
+
     def safe_log(self, message):
         # 日志 IPC 不是游戏状态证据，失效时仍保留可取消的恢复流程。
         try:
@@ -471,7 +795,18 @@ class CooperativeLive(SoloLive):
             raise InterruptedError("用户已停止协力")
         self.navigator._check_stop()
 
-    def recovery_state(self, report, directory, state, error=None):
+    def recovery_state(self, report, directory, state, error=None, *, destination=None):
+        if state == "ready" and getattr(self, "room_search_guard", False):
+            self.check_runtime_recovery_deadline(report, error or report.get("error", "普通恢复"), enforce=False)
+            episode = getattr(self, "runtime_recovery_episode", None)
+            if episode is not None:
+                returned = episode.setdefault("returned_destinations", [])
+                if destination in returned:
+                    self.check_runtime_recovery_deadline(report, error or report.get("error", "同阶段恢复"))
+                elif destination is not None:
+                    returned.append(destination)
+        if state not in {"ready", "entry_notice_closed", "search_cancel_confirmed"}:
+            self.check_runtime_recovery_deadline(report, error or report.get("error", "普通恢复"))
         previous = report.setdefault("runtime_recovery", {})
         detail = str(error) if error is not None else None
         if previous.get("state") == state and previous.get("detail") == detail:
@@ -485,13 +820,16 @@ class CooperativeLive(SoloLive):
                   "waiting_page": "等待安全页面", "waiting_room": "等待房间安全恢复",
                   "waiting_persistence": "等待结果文件可写", "waiting_resource": "等待用户补充体力或处理回复",
                   "waiting_login": "等待结算后标题登录或用户返回主页",
+                  "waiting_entry_notice": "等待入口公告关闭", "entry_notice_closed": "入口公告已确认关闭",
+                  "waiting_room_search": "等待入房前搜索取消", "search_cancel_confirmed": "入房前搜索已确认取消",
                   "ready": "已恢复准备"}
         try:
             self.safe_log(f"协力恢复：{labels.get(state, '等待恢复')}；{detail or '保留当前状态'}；本局未增加完成次数")
         except Exception:
             pass
         try:
-            _write_json(directory / "report.json", report)
+            if enabled():
+                _write_json(directory / "report.json", report)
         except OSError as persistence_error:
             report["persistence_error"] = str(persistence_error)
 
@@ -515,6 +853,8 @@ class CooperativeLive(SoloLive):
     def recover_runtime_failure(self, report, directory, error):
         self.current_report = self.last_report = report
         try:
+            # 先建立预算，截止时仍须给这轮新帧一次确认真实目的页或房内进展的机会。
+            self.check_runtime_recovery_deadline(report, error, enforce=False)
             while True:
                 try:
                     if report.get("death_confirmed"):
@@ -523,22 +863,37 @@ class CooperativeLive(SoloLive):
                         self.persist_runtime_report(report, directory)
                         raise LifeDepleted("恢复等待中确认演出死亡，触点释放后结束协力整批")
                     return self.wait_runtime_destination(report, directory, error)
-                except (InterruptedError, LifeDepleted):
+                except (InterruptedError, LifeDepleted, RuntimeRecoveryExhausted):
                     raise
                 except Exception as recovery_error:
+                    self.check_entry_recovery_deadline(report, error)
+                    self.check_runtime_recovery_deadline(report, error)
                     state = "waiting_connection" if isinstance(recovery_error, OSError) else "waiting_page"
                     self.recovery_state(report, directory, state, recovery_error)
                     self.check_runtime_stop()
                     self.pause(2.)
+        except RuntimeRecoveryExhausted:
+            self.persist_recovery_terminal_report(report, directory)
+            raise
         except InterruptedError:
             # 截图、恢复或退避中的新停止都经过同一审计出口；保留原失败原因。
             report["cancelled"] = True
             report["stopped_at"] = datetime.now().astimezone().isoformat()
             try:
-                _write_json(directory / "report.json", report)
+                if enabled():
+                    _write_json(directory / "report.json", report)
             except (OSError, ValueError):
                 pass
             raise
+
+    def settlement_completion_candidate(self, report):
+        end = report.get("end_detection", {})
+        return (report.get("phase") == "settlement" and input_finished(report)
+                and not report.get("death_confirmed") and not report.get("cancelled")
+                and end.get("method") == "cooperative_settlement_confirmed"
+                and end.get("confirmation_frames", 0) >= 2
+                and end.get("input_and_release_complete") is True
+                and end.get("settlement_page") in {"team_result", "personal_result"})
 
     def wait_runtime_destination(self, report, directory, error):
         # 诊断禁写时路径对外为空，恢复事件仍须独立存在；目录只作内存标识，不要求落盘。
@@ -549,7 +904,11 @@ class CooperativeLive(SoloLive):
         title_streak = 0
         while True:
             self.check_runtime_stop()
-            if report.get("playback") is not None and not release_finished(report):
+            if self.entry_notice_scope(report):
+                self.entry_notice_state(report).setdefault(
+                    "recovery_deadline", time.monotonic() + ENTRY_RECOVERY_WAIT_SECONDS)
+            if (getattr(self, "pending_native_player", None) is not None
+                    or report.get("playback") is not None and not release_finished(report)):
                 # 连接恢复、主页截图或新的 Native 进程都不能替代上一轮 reset 的释放证明。
                 title_streak = 0
                 self.recovery_state(report, directory, "waiting_release", error)
@@ -559,10 +918,22 @@ class CooperativeLive(SoloLive):
             try:
                 frame = self.device.screenshot()
             except Exception as connection_error:
+                self.check_entry_recovery_deadline(report, error)
                 title_streak = 0
                 self.recovery_state(report, directory, "waiting_connection", connection_error)
                 self.pause(1.)
                 continue
+            # 截止这轮的新帧可能已进入房内或演奏；先撤销入口权限，再决定能否有限终止。
+            self.observe_entry_scope(frame, report)
+            self.check_entry_recovery_deadline(report, error)
+            if self.handle_entry_notice(frame, report, directory):
+                continue
+            if self.handle_room_search(frame, report, directory):
+                # 取消回执不证明完成；确认双帧房间选择后才可沿原任务重新准备。
+                if report.get("room_search_recovery", {}).get("search_cancel_confirmed"):
+                    frame = self.device.screenshot()
+                else:
+                    continue
             if (report.get("skipped_after_input") or report.get("joined_room")
                     or report.get("ready_confirmed")) and time.monotonic() - last_death_sample >= PLAY_OBSERVATION_INTERVAL:
                 last_death_sample = time.monotonic()
@@ -589,6 +960,7 @@ class CooperativeLive(SoloLive):
                     if not login_active:
                         # 启动登录的期限已经结束；本次结算独立建服务，普通恢复沿袭同一实例。
                         self.settlement_login = login = factory()
+                        self.settlement_login_budget_deadline = time.monotonic() + 60
                         self.settlement_login_source = source_report
                         self.settlement_login_episodes = set()
                         self.settlement_login_completed = False
@@ -610,10 +982,12 @@ class CooperativeLive(SoloLive):
                         continue
                     self.settlement_login_completed = True
                     report["settlement_login"].update(status="home_confirmed", report=outcome)
-                    # 回主页仍重新取帧通过原体力、入口和重匹配门禁；原失败局不补计。
+                    # 登录回执不等于本局完成，下一张安全主页和 preflight 才能确认返回。
                     title_streak = 0
                     continue
             if report.get("rematch_limit_reached"):
+                if getattr(self, "room_search_guard", False):
+                    self.runtime_terminal(report, "当前演出的三次重匹配预算已耗尽，已停止任务")
                 self.recovery_state(report, directory, "waiting_room", error)
                 self.pause(2.)
                 continue
@@ -639,6 +1013,8 @@ class CooperativeLive(SoloLive):
                     if time.monotonic() >= progress["deadline"]:
                         if (matching_recovery.get("exit_requests", matching_recovery.get("exit_clicks", 0)) >= 3
                                 or time.monotonic() >= matching_recovery.get("exit_deadline", float("inf"))):
+                            if getattr(self, "room_search_guard", False):
+                                self.runtime_terminal(report, "房内 ESC 恢复的三次请求或 20 秒期限已耗尽，已停止任务")
                             self.recovery_state(report, directory, "waiting_room", "房内 ESC 请求或 20 秒期限已耗尽，等待安全返回")
                             self.pause(2.)
                             continue
@@ -649,7 +1025,7 @@ class CooperativeLive(SoloLive):
                             self.resume_selection = stage == "select"
                             self.entry_deadline = None
                             self.device.preflight()
-                            self.recovery_state(report, directory, "ready")
+                            self.recovery_state(report, directory, "ready", destination=stage)
                             return
                         frame = self.device.screenshot()
                         hud_absent = self.recovery_hud_absent(frame) and not blank_transition(frame)
@@ -658,7 +1034,7 @@ class CooperativeLive(SoloLive):
                         self.resume_selection = stage == "select"
                         self.entry_deadline = None
                         self.device.preflight()
-                        self.recovery_state(report, directory, "ready")
+                        self.recovery_state(report, directory, "ready", destination=stage)
                         return
                     else:
                         self.recovery_state(report, directory, "waiting_room", "仍在原房间 180 秒无进展等待期内，不提前退房")
@@ -666,13 +1042,31 @@ class CooperativeLive(SoloLive):
                         continue
                 if hud_absent and self.clear_navigation_overlay(frame) and (self.room_destination(frame)
                         or any(self.score(frame, page) >= self.navigator.threshold for page in ("home", "live_menu"))):
+                    if (self.settlement_completion_candidate(report)
+                            and self.score(frame, "home") >= self.navigator.threshold
+                            and all(self.score(frame, page) < self.navigator.threshold
+                                    for page in (set(PAGE_AREAS) - {"home"}) | {"live_menu", "song_select", "prepare", "recovery_dialog"})):
+                        # 原结算的双帧证据与本轮执行证明仍成立，恢复后只补确认主页，不重演或扣重匹配。
+                        self.device.preflight()
+                        self.check_runtime_stop()
+                        report.update(returned_home=True, performance_completed=True,
+                                      completed=report.get("judgements", {}).get("total_matches_chart") is True)
+                        report["settlement_recovered"] = True
+                        if not report["completed"]:
+                            report.setdefault("settlement_warning", "个人判定未完整读取或音数未匹配，保留实际数据并继续下一曲")
+                        self.recovery_state(report, directory, "ready", destination="settlement_home")
+                        return
                     if self.room_destination(frame):
                         self.entry_deadline = None
+                        self.entry_notice_disqualified = True
                         if (getattr(self, "join_deadline", None) is not None
                                 and time.monotonic() >= self.join_deadline):
                             self.recovery_state(report, directory, "waiting_room", "入房确认 60 秒已耗尽，未见实际房内页，不重复加入")
                             self.pause(2.)
                             continue
+                        if (getattr(self, "room_search_guard", False)
+                                and getattr(self, "join_request_count", 0) >= 1 + getattr(self, "max_rematches", 3)):
+                            self.runtime_terminal(report, "当前目标的入房请求总预算已耗尽，已停止任务")
                     if ((getattr(self, "entry_deadline", None) is not None
                          and time.monotonic() >= self.entry_deadline
                          and self.score(frame, "cooperative_room") < self.navigator.threshold)
@@ -687,8 +1081,12 @@ class CooperativeLive(SoloLive):
                         try:
                             available, _ = self.read_available_bonus(frame)
                             consumption = bonus.get("consumption")
+                            if (type(consumption) is int and type(available) is int
+                                    and 0 <= available < consumption <= 10):
+                                report.pop("runtime_resource_ready", None)
                             if type(consumption) is not int or available < consumption:
                                 raise ValueError("等待用户补充体力或完成回复处理，不追加另一批饮料")
+                            report["runtime_resource_ready"] = True
                         except ValueError as resource_error:
                             self.recovery_state(report, directory, "waiting_resource", resource_error)
                             self.pause(1.)
@@ -697,6 +1095,8 @@ class CooperativeLive(SoloLive):
                     if report.get("joined_room") and not report.get("rematch_budget_consumed"):
                         if getattr(self, "round_rematches", 0) >= getattr(self, "max_rematches", 3):
                             report["rematch_limit_reached"] = True
+                            if getattr(self, "room_search_guard", False):
+                                self.runtime_terminal(report, "当前演出的三次重匹配预算已耗尽，已停止任务")
                             self.recovery_state(report, directory, "waiting_room", "当前演出的三次重匹配已耗尽")
                             self.pause(2.)
                             continue
@@ -707,7 +1107,8 @@ class CooperativeLive(SoloLive):
                         report["rematch_budget_consumed"] = True
                     if getattr(self, "recovery_sample_frames", None):
                         self.persist_runtime_report(report, directory)
-                    self.recovery_state(report, directory, "ready")
+                    self.recovery_state(report, directory, "ready", destination=("room" if self.room_destination(frame)
+                                        else "home" if self.score(frame, "home") >= self.navigator.threshold else "live_menu"))
                     return
                 # 结算必须有明确正向标签；标题、开场、加载、未知页和演奏页不能盲按 BACK。
                 settlement = self.settlement_page(frame)
@@ -732,7 +1133,7 @@ class CooperativeLive(SoloLive):
     def room_destination(self, frame):
         return (not blank_transition(frame) and self.recovery_hud_absent(frame)
                 and self.score(frame, "cooperative_room") >= self.navigator.threshold
-                and self.clear_navigation_overlay(frame))
+                and self.clear_navigation_overlay(frame) and not self.room_search_visible(frame))
 
     def recovery_hud_absent(self, frame):
         return (self.score(frame, "playing") < self.navigator.threshold
@@ -890,6 +1291,10 @@ class CooperativeLive(SoloLive):
         self.entry_deadline = self.join_deadline = None
         self.resume_selection, self.resume_stage, self.matched = False, None, False
         self.room_progress = {}
+        self.entry_notice_recovery = {"requests": 0, "closed": False}
+        self.entry_notice_disqualified = False
+        self.room_search_recovery = None
+        self.runtime_recovery_episode = None
         self.safe_log(f'协力真实死亡后已重启登录；累计失败 {budget.failure_count} 次，'
                       f'重试 {budget.retries_used}/{budget.limit}，继续剩余演出')
         return True
@@ -906,6 +1311,9 @@ class CooperativeLive(SoloLive):
             report["recovery_observation"]["samples"] = [sample for sample, _ in frames]
 
     def persist_runtime_report(self, report, directory):
+        if report.get("runtime_recovery_error") or report.get("entry_recovery_error"):
+            self.persist_recovery_terminal_report(report, directory)
+            return
         if not enabled():
             report["persistence_confirmed"] = False
             report["task_state"] = "completed_in_memory" if report.get("completed") else "observed_in_memory"
@@ -932,9 +1340,34 @@ class CooperativeLive(SoloLive):
                 report["persistence_error"] = f"{type(error).__name__}: {error}"
                 if report.get("cancelled"):
                     return
+                if report.get("error") and (self.entry_notice_scope(report) or getattr(self, "room_search_guard", False)):
+                    try:
+                        self.check_entry_recovery_deadline(report, error)
+                        self.check_runtime_recovery_deadline(report, error)
+                    except RuntimeRecoveryExhausted:
+                        self.persist_recovery_terminal_report(report, directory)
+                        raise
                 self.recovery_state(report, directory, "waiting_persistence", error)
                 self.check_runtime_stop()
                 self.pause(1.)
+
+    def persist_entry_terminal_report(self, report, directory):
+        return self.persist_recovery_terminal_report(report, directory)
+
+    def persist_recovery_terminal_report(self, report, directory):
+        # 此处没有完成输入或计数可保护；终态写入失败只能明确告知，不能再次永久等待。
+        report.update(completed=False, task_state=("entry_recovery_exhausted" if report.get("entry_recovery_error")
+                                                   else "runtime_recovery_exhausted"), persistence_confirmed=False)
+        if not enabled():
+            report["diagnostics_disabled"] = True
+            return
+        for action in (lambda: _write_json(directory / "report.json", report),
+                       lambda: append_cooperative_result_index(self.report_root, directory, report)):
+            try:
+                action()
+            except (OSError, UnicodeError, csv.Error, ValueError, KeyError, TypeError) as persistence_error:
+                report["persistence_error"] = f"{type(persistence_error).__name__}: {persistence_error}"
+                self.safe_log(f"协力恢复已停止；原始错误保留在内存，报告未能完整保存：{persistence_error}")
 
     def room_stage(self, frame):
         if blank_transition(frame) or not self.recovery_hud_absent(frame):
@@ -1019,6 +1452,17 @@ class CooperativeLive(SoloLive):
                     self.pause(1.)
                     continue
             self.pause(.15)
+        if getattr(self, "room_search_guard", False):
+            # 最后再取一张真实画面，截止帧的安全返回或严格正向进展优先于终态。
+            frame = self.screenshot()
+            if self.room_destination(frame):
+                recovery["returned_to_room"] = True
+                return None
+            stage = self.observe_room_progress(frame, enforce=False)
+            if stage is not None and original is not None and rank[stage] > rank[original]:
+                recovery["progress_arrived"] = stage
+                return frame, stage
+            self.runtime_terminal(current, "房内 ESC 恢复的 20 秒／三次请求已耗尽，已停止任务")
         raise TimeoutError("房内 ESC 恢复的 20 秒／三次请求已耗尽，等待安全页面或用户处理")
 
     def confirm_room_join(self, attempt):
@@ -1029,6 +1473,12 @@ class CooperativeLive(SoloLive):
             self.check_runtime_stop()
             frame = self.screenshot()
             self.guard_room(frame)
+            if self.room_search_visible(frame):
+                attempt["entry_search_observed"] = True
+                attempt.setdefault("entry_search_observed_at", time.monotonic())
+                current = self.current_report
+                if current is not None:
+                    self.room_search_state(current).setdefault("observed_at", time.monotonic())
             stage = self.room_stage(frame)
             if stage is not None:
                 page = "cooperative_" + stage
@@ -1058,11 +1508,14 @@ class CooperativeLive(SoloLive):
             if getattr(self, "join_deadline", None) is not None and time.monotonic() >= self.join_deadline:
                 raise TimeoutError("同次入房确认 60 秒已耗尽，不重复加入")
             if getattr(self, "join_request_count", 0) >= 1 + getattr(self, "max_rematches", 3):
+                if getattr(self, "room_search_guard", False):
+                    self.runtime_terminal(report, "当前目标的入房请求总预算已耗尽，已停止任务")
                 raise TimeoutError("当前目标的入房请求预算已耗尽，等待用户处理")
             if getattr(self, "join_deadline", None) is None:
                 self.join_deadline = time.monotonic() + ENTRY_WAIT_SECONDS
             attempt.setdefault("join_deadline", self.join_deadline)
             self.join_request_count = getattr(self, "join_request_count", 0) + 1
+            self.room_search_recovery = None
             self.room_progress = {}
             self.tap_page("cooperative_room", 920, 245 if room == "free" else 431,
                           "匹配自由房间" if room == "free" else "匹配资深房间")
@@ -1534,6 +1987,10 @@ class CooperativeLive(SoloLive):
         self.resume_stage = None
         self.room_progress = {}
         self.join_request_count = 0
+        self.entry_notice_recovery = {"requests": 0, "closed": False}
+        self.entry_notice_disqualified = False
+        self.room_search_recovery = None
+        self.runtime_recovery_episode = None
         self.max_rematches = max_rematches
         bonus_snapshot = {}
         login_completed = False
@@ -1714,7 +2171,7 @@ class CooperativeLive(SoloLive):
                                            and report.get("judgements", {}).get("total_matches_chart") is True)
             except Exception as error:
                 report["completed"] = False
-                report["error"] = f"{type(error).__name__}: {error}"
+                report.setdefault("error", f"{type(error).__name__}: {error}")
                 report["cancelled"] = self.stop_requested() or isinstance(error, InterruptedError)
                 report["death_confirmed"] = (report.get("death_confirmed", False) or isinstance(error, LifeDepleted)
                                              or self.life_guard.zero_confirmed)
@@ -1740,8 +2197,6 @@ class CooperativeLive(SoloLive):
                 report["finished_at"] = datetime.now().astimezone().isoformat()
                 self.persist_runtime_report(report, directory)
             # JSON、CSV 与释放证据全部落盘后才更新进度；写入失败不能伪装成完成。
-            if report["completed"]:
-                self.completed_rounds += 1
             reports.append(report)
             if report.get('death_confirmed') and not report.get('cancelled'):
                 if self.retry_dead_performance(report, directory):
@@ -1749,13 +2204,20 @@ class CooperativeLive(SoloLive):
             if report.get("cancelled") or report.get("death_confirmed"):
                 raise runtime_error or InterruptedError("用户已停止协力")
             if runtime_error is not None:
+                if isinstance(runtime_error, RuntimeRecoveryExhausted):
+                    raise runtime_error
                 try:
                     self.recover_runtime_failure(report, directory, runtime_error)
                 except LifeDepleted:
                     if self.retry_dead_performance(report, directory):
                         continue
                     raise
-                continue
+                if not report.get("performance_completed"):
+                    continue
+                # 恢复后的 JSON 和同 run CSV 更新成功才计数；禁日志沿用相同内存完成门槛。
+                self.persist_runtime_report(report, directory)
+            if report["completed"]:
+                self.completed_rounds += 1
             if report.get("performance_completed"):
                 self.performed_rounds += 1
                 self.round_rematches = 0
@@ -1764,7 +2226,11 @@ class CooperativeLive(SoloLive):
                 self.join_deadline = None
                 self.join_request_count = 0
                 self.room_progress = {}
-            self.safe_log(f"协力谱面演出：已完成 {self.completed_rounds} / 总数 {count}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
+                self.entry_notice_recovery = {"requests": 0, "closed": False}
+                self.entry_notice_disqualified = False
+                self.room_search_recovery = None
+                self.runtime_recovery_episode = None
+            self.safe_log(f"协力谱面演出：已完成 {self.performed_rounds} / 总数 {count}；完整成绩 {self.completed_rounds}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
             if report.get("settlement_warning"):
                 self.safe_log(f"{report['settlement_warning']}；已演出 {round_index}/{count}，完整记录 {self.completed_rounds}")
             if report.get("judgements"):

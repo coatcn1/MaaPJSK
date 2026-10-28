@@ -1355,6 +1355,26 @@ class SoloTests(unittest.TestCase):
         self.assertIn((1015,500),points)
         self.assertNotIn((1175,504),points)
 
+    def test_specified_append_searches_target_before_switching_its_group(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.navigator, workflow.matcher, workflow.ocr = Mock(), Mock(), Mock()
+        frame = np.full((720, 1280, 3), 100, np.uint8)
+        identity = SimpleNamespace(song_id=41)
+        workflow.navigator.wait.return_value = frame
+        workflow.resolve_specified_song = Mock(return_value=41)
+        workflow.search_specified_song = Mock(return_value=identity)
+        workflow.checked_search_page = Mock(return_value=frame)
+        workflow.specified_decide_state = Mock(return_value='ready')
+        workflow.matcher.match.return_value = identity
+        workflow.ocr.read.side_effect = [Reading('HARD', .99), Reading('APPEND', .99)]
+        workflow.pause = lambda _: None
+        def tap(x, y, reason):
+            if (x, y) == (1224, 505):
+                workflow.search_specified_song.assert_called_once_with(41, 'append')
+        workflow.navigator.tap.side_effect = tap
+        workflow.select('append', 'specified', song_name='スイートマジック')
+        workflow.navigator.wait_stable_live_menu.assert_called_once()
+
     def test_bonus_adjustment_rechecks_each_step_after_ignored_first_plus(self):
         workflow=SoloLive.__new__(SoloLive)
         workflow.navigator=Mock()
@@ -1556,11 +1576,11 @@ class SoloTests(unittest.TestCase):
         workflow.adjust_bonus_count.assert_not_called()
         self.assertEqual(report['bonus']['consumption'],5)
 
-    def test_recovery_uses_exact_user_type_and_bottles_and_keeps_auto_off(self):
-        for mode, bottles, after in [('small',3,6),('large',2,23)]:
+    def test_recovery_automatically_covers_next_round_and_ignores_legacy_bottles(self):
+        for mode, bottles, after in [('small',3,5),('large',1,12)]:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                workflow,report = self._availability_workflow([3,after])
-                workflow.ensure_bonus_available(mode,bottles,report,Path(directory))
+                workflow,report = self._availability_workflow([2,after])
+                workflow.ensure_bonus_available(mode,99,report,Path(directory))
                 self.assertEqual(workflow.navigator._recover_and_verify.call_args.args[1:],(mode,bottles))
                 workflow.navigator.ensure_auto.assert_called_once_with(False)
                 self.assertEqual(report['recovery']['completed_bottles'],bottles)
@@ -1587,9 +1607,9 @@ class SoloTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'完成提示'):
                 workflow.ensure_bonus_available('small',5,report,Path(directory))
             saved = json.loads((Path(directory)/'report.json').read_text(encoding='utf-8'))
-        self.assertEqual(saved['recovery']['completed_bottles'],5)
+        self.assertEqual(saved['recovery']['completed_bottles'],3)
         self.assertEqual(saved['recovery']['available_after'],7)
-        self.assertEqual(saved['recovery']['requested_bottles'],5)
+        self.assertEqual(saved['recovery']['requested_bottles'],3)
         self.assertEqual(saved['recovery']['status'],'credited')
         workflow.navigator._recover_and_verify.assert_called_once()
         workflow.navigator.ensure_auto.assert_not_called()
@@ -1697,7 +1717,7 @@ class SoloTests(unittest.TestCase):
             self.assertTrue(agent.ProjectSekaiSoloLiveConfig().run(context,argv))
             node = pipeline[node]['next'][0]
         self.assertEqual(agent._SETTINGS.pop(31),{'difficulty':'easy','song_mode':'current','count':1,
-                                               'recovery_mode':'off','recovery_count':1})
+                                               'recovery_mode':'off'})
 
     def test_successful_batch_retains_user_consumption_without_restoring_old_value(self):
         workflow = SoloLive.__new__(SoloLive)

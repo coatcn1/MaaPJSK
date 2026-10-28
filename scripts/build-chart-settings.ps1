@@ -185,7 +185,7 @@ Copy-Item -LiteralPath (Join-Path $buildRoot 'MFAAvalonia.Core.dll') -Destinatio
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputRoot 'compatibility.json') -Encoding UTF8
 Write-Host '谱面管理设置页已生成，下次部署 MaaPJSK 时自动应用。'
 if ($ReleasePackage) {
-    if (-not $PublishOutput) { $PublishOutput = Join-Path $projectRoot '.local\release-v0.8.0\mfa-self-contained' }
+    if (-not $PublishOutput) { $PublishOutput = Join-Path $projectRoot '.local\release-v0.9.0\mfa-self-contained' }
     $desktopProject = Join-Path $sourceRoot 'MFAAvalonia.Desktop\MFAAvalonia.Desktop.csproj'
     $desktop = [IO.File]::ReadAllText($desktopProject)
     $branding = @'

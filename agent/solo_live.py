@@ -127,10 +127,10 @@ class ProjectSekaiSoloLive(CustomAction):
             if context.tasker.stopping:
                 return False
             settings = _SETTINGS.pop(task_id(argv))
-            expected_keys = {"difficulty", "song_mode", "count", "recovery_mode", "recovery_count"}
+            expected_keys = {"difficulty", "song_mode", "count", "recovery_mode"}
             if settings.get("song_mode") == "specified":
                 expected_keys.add("song_name")
-            if set(settings) != expected_keys:
+            if set(settings) - {"recovery_count"} != expected_keys:
                 raise ValueError("单人谱面任务配置不完整")
             root = Path(__file__).resolve().parents[1]
             performance = load_performance(root)
@@ -151,7 +151,7 @@ class ProjectSekaiSoloLive(CustomAction):
             visible_log(context, f"演奏设置：{performance.engine}；实际触控偏移 {offset} ms；{'已加载校准配置' if profile else '使用手动偏移'}")
             workflow.run(settings["count"], settings["difficulty"], settings["song_mode"], offset,
                          bonus_consumption=performance.bonus_consumption, recovery_mode=settings["recovery_mode"],
-                         recovery_count=settings["recovery_count"], engine=performance.engine,
+                         recovery_count=settings.get("recovery_count", 1), engine=performance.engine,
                          latency_offsets=profile.get("latency_offsets", {}) if profile else None,
                          calibration_profile=profile,
                          play_failure_retry_count=retry_limit,

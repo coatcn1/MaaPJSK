@@ -11,6 +11,7 @@ import numpy as np
 
 from agent import auto_live
 from project_sekai.navigator import Navigator
+from project_sekai.ocr import Reading
 
 
 def argument(task_id: int, parameters: dict) -> SimpleNamespace:
@@ -31,7 +32,7 @@ class AutoLiveConfigurationTests(unittest.TestCase):
                          ["AutoLive", "SoloChartLive", "CooperativeChartLive", "OneShotChartLive", "SoloChartCalibration", "AdRewards"])
         self.assertEqual(
             next(task for task in interface["task"] if task["name"] == "AutoLive")["option"],
-            ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode", "AutoLiveRecoveryCount"],
+            ["AutoLiveSongMode", "AutoLiveCount", "AutoLiveRecoveryMode"],
         )
         self.assertEqual(interface["option"]["AutoLiveSongMode"]["default_case"], "Current")
         self.assertEqual(
@@ -78,6 +79,7 @@ class SongSelectionTests(unittest.TestCase):
         self.navigator.threshold = 0.83
         self.navigator.stop_requested = lambda: False
         self.navigator.return_to_home = lambda: None
+        self.navigator.wait_stable_live_menu = Mock(return_value=self.before)
         self.taps: list[tuple[int, int]] = []
         self.navigator.tap = lambda x, y, _reason: self.taps.append((x, y))
 
@@ -85,6 +87,7 @@ class SongSelectionTests(unittest.TestCase):
         self.navigator.wait = lambda _name: self.before
         self.navigator.match = lambda _frame, name, _area=None: (1.0 if name == "master_selected" else 0.0, (0, 0))
         self.navigator.navigate_to_prepare("current")
+        self.navigator.wait_stable_live_menu.assert_called_once()
         self.assertEqual(self.taps, [(1194, 649), (722, 235), (1175, 493), (1007, 590)])
 
     def test_random_button_runs_before_master_and_confirm(self) -> None:
@@ -105,6 +108,61 @@ class SongSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "未确认歌曲变化"):
                 self.navigator._select_random_song(self.before)
         self.assertEqual(self.taps, [(943, 652)] * 3)
+
+
+class StableLiveMenuTests(unittest.TestCase):
+    def navigator(self, pages, *, stop_at=None):
+        navigator = Navigator.__new__(Navigator)
+        clock = SimpleNamespace(now=0.)
+        navigator.threshold = .83
+        navigator.templates = {name: None for name in ('live_menu', 'home', 'song_select', 'prepare', 'playing', 'life_hud')}
+        navigator.device = Mock()
+        frames = {name: np.full((720, 1280, 3), index + 80, np.uint8)
+                  for index, name in enumerate(('menu', 'unknown', 'hud', 'conflict'))}
+        names = {id(value): key for key, value in frames.items()}
+        iterator = iter(pages)
+        navigator.device.screenshot.side_effect = lambda: frames[next(iterator)]
+        navigator.stop_requested = lambda: stop_at is not None and clock.now >= stop_at
+        navigator._save_failure = Mock()
+        def match(frame, name, area=None):
+            page = names[id(frame)]
+            hit = name == 'live_menu' and page != 'unknown' or name == 'life_hud' and page == 'hud' or name == 'home' and page == 'conflict'
+            return (1. if hit else 0., (0, 0))
+        navigator.match = match
+        return navigator, clock, frames
+
+    def test_menu_requires_two_fresh_safe_frames_separated_by_stability_interval(self):
+        navigator, clock, frames = self.navigator(('menu', 'menu'))
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)):
+            self.assertIs(navigator.wait_stable_live_menu(), frames['menu'])
+        self.assertGreaterEqual(clock.now, .8)
+        self.assertEqual(navigator.device.screenshot.call_count, 2)
+        navigator.device.tap.assert_not_called()
+
+    def test_unknown_frame_resets_stability_and_stop_interrupts_before_input(self):
+        navigator, clock, _ = self.navigator(('menu', 'unknown', 'menu', 'menu'))
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)):
+            navigator.wait_stable_live_menu()
+        self.assertGreaterEqual(clock.now, 2.4)
+        navigator, clock, _ = self.navigator(('menu',), stop_at=.3)
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)), \
+                self.assertRaises(InterruptedError):
+            navigator.wait_stable_live_menu()
+        self.assertEqual(navigator.device.screenshot.call_count, 1)
+        navigator.device.tap.assert_not_called()
+
+    def test_hud_or_conflicting_page_never_authorizes_menu_input(self):
+        for page in ('hud', 'conflict', 'unknown'):
+            navigator, clock, _ = self.navigator((page,) * 4)
+            with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                    patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)), \
+                    self.assertRaises(TimeoutError):
+                navigator.wait_stable_live_menu(timeout=1.6)
+            navigator.device.tap.assert_not_called()
+            navigator._save_failure.assert_called_once()
 
 
 class RecoveryGuardTests(unittest.TestCase):
@@ -180,6 +238,7 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.navigator.log_message = self.messages.append
         self.navigator._save_failure = Mock()
         self.navigator.navigate_to_prepare = Mock()
+        self.navigator.current_bonus_consumption = Mock(return_value=5)
         self.navigator.wait = lambda _name, **_kwargs: self.frame
         self.navigator.match = self.match
         self.navigator.tap = self.tap
@@ -206,8 +265,8 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         with patch("project_sekai.navigator.time.sleep"):
             self.navigator.auto_live_loop(1, recovery_mode="large")
         self.navigator.recover_bonus_from_dialog.assert_called_once_with("large", 1)
-        self.assertEqual(self.taps, [(565, 669), (1086, 42), (565, 669)])
-        self.assertEqual(self.navigator.device.back.call_count, 2)
+        self.assertEqual(self.taps, [(1086, 42), (565, 669)])
+        self.assertEqual(self.navigator.device.back.call_count, 1)
         self.navigator.start_and_collect.assert_called_once_with(
             recovery_mode="large", recovery_count=1)
         self.assertEqual(self.navigator.completed_rounds, 1)
@@ -228,14 +287,55 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.navigator.start_and_collect.assert_called_once_with(
             recovery_mode="large", recovery_count=1)
 
+    def test_auto_uses_actual_deficit_and_ignores_legacy_quantity(self):
+        for mode, expected in [('small', 3), ('large', 1)]:
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.empty[25:60, 1045:1120] = 2
+                with patch('project_sekai.navigator.time.sleep'):
+                    self.navigator.auto_live_loop(1, recovery_mode=mode, recovery_count=99)
+                self.navigator.recover_bonus_from_dialog.assert_called_once_with(mode, expected)
+
+    def test_auto_reads_current_consumption_through_verified_settings_without_changing_it(self):
+        self.navigator.current_bonus_consumption = Navigator.current_bonus_consumption.__get__(self.navigator)
+        self.navigator.templates = {}
+        self.navigator.config_path = Path('unused-config.json')
+        self.navigator.bonus_ocr = Mock()
+        self.navigator.bonus_ocr.read.side_effect = [Reading('ライブボーナス消費', .99),
+            Reading('消費量を設定します', .99), Reading('7', .99), Reading('7', .99), Reading('7', .99)]
+        with patch('project_sekai.navigator.time.sleep'):
+            self.assertEqual(self.navigator.current_bonus_consumption(), 7)
+        self.assertEqual(self.navigator.auto_bonus_consumption, 7)
+        self.assertEqual(self.taps, [(1150, 42), (470, 42), (762, 655)])
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_auto_does_not_save_or_recover_when_consumption_confirmation_disagrees(self):
+        self.navigator.current_bonus_consumption = Navigator.current_bonus_consumption.__get__(self.navigator)
+        self.navigator.templates = {}
+        self.navigator.config_path = Path('unused-config.json')
+        self.navigator.bonus_ocr = Mock()
+        self.navigator.bonus_ocr.read.side_effect = [Reading('ライブボーナス消費', .99),
+            Reading('消費量を設定します', .99), Reading('7', .99), Reading('6', .99)]
+        with patch('project_sekai.navigator.time.sleep'), self.assertRaisesRegex(RuntimeError, '未确认用户指定'):
+            self.navigator.current_bonus_consumption()
+        self.assertNotIn((762, 655), self.taps)
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+
+    def test_zero_consumption_never_uses_drinks_when_auto_is_rejected(self):
+        self.navigator.current_bonus_consumption.return_value = 0
+        with patch('project_sekai.navigator.time.sleep'), self.assertRaisesRegex(RuntimeError, 'AUTO 仍未开启'):
+            self.navigator.auto_live_loop(1, recovery_mode='small')
+        self.navigator.recover_bonus_from_dialog.assert_not_called()
+        self.navigator.start_and_collect.assert_not_called()
+
     def test_recovery_without_bonus_change_never_starts(self) -> None:
         self.navigator.recover_bonus_from_dialog.side_effect = lambda _mode, _count: None
         with patch("project_sekai.navigator.time.sleep"), patch(
                 "project_sekai.navigator.time.monotonic", side_effect=range(30)):
             with self.assertRaisesRegex(RuntimeError, "体力未确认足额变化"):
                 self.navigator.auto_live_loop(1, recovery_mode="large")
-        self.assertEqual(self.taps, [(565, 669), (1086, 42)])
-        self.navigator.device.back.assert_called_once()
+        self.assertEqual(self.taps, [(1086, 42)])
+        self.navigator.device.back.assert_not_called()
         self.navigator.start_and_collect.assert_not_called()
 
     def test_bonus_update_can_arrive_after_ok_dialog_closes(self) -> None:
@@ -399,7 +499,7 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.assertEqual(self.navigator.start_and_collect.call_count, 2)
         self.assertEqual(self.navigator.completed_rounds, 2)
 
-    def test_specified_quantity_is_consumed_before_auto_retry(self) -> None:
+    def test_legacy_quantity_is_ignored_and_next_round_deficit_is_consumed(self) -> None:
         def recover_one(_mode: str, count: int) -> None:
             self.filled = self.frame.copy()
             self.filled[25:60, 1045:1120] += 60
@@ -407,17 +507,17 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.navigator.recover_bonus_from_dialog.side_effect = recover_one
         with patch("project_sekai.navigator.time.sleep"):
             self.navigator.auto_live_loop(1, recovery_mode="small", recovery_count=3)
-        self.navigator.recover_bonus_from_dialog.assert_called_once_with("small",3)
+        self.navigator.recover_bonus_from_dialog.assert_called_once_with("small",5)
         self.navigator.start_and_collect.assert_called_once_with(
             recovery_mode="small", recovery_count=3)
         self.assertEqual(self.taps.count((1086, 42)), 1)
         self.assertEqual(self.taps[-1], (565, 669))
-        self.assertEqual(self.navigator.device.back.call_count, 2)
+        self.assertEqual(self.navigator.device.back.call_count, 1)
 
     def test_rejected_again_after_recovery_does_not_consume_more(self) -> None:
         self.navigator.tap = lambda x, y, _reason: self.taps.append((x, y))
         with patch("project_sekai.navigator.time.sleep"):
-            with self.assertRaisesRegex(RuntimeError, "点击 AUTO 后未开启"):
+            with self.assertRaisesRegex(RuntimeError, "AUTO 仍未开启"):
                 self.navigator.auto_live_loop(1, recovery_mode="large")
         self.navigator.recover_bonus_from_dialog.assert_called_once_with("large", 1)
         self.navigator.start_and_collect.assert_not_called()
@@ -435,7 +535,7 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.navigator.device.back = Mock(side_effect=lambda: modal.__setitem__(0, False))
         with patch("project_sekai.navigator.time.sleep"):
             self.navigator.auto_live_loop(1, recovery_mode="large")
-        self.assertEqual(self.navigator.device.back.call_count, 2)
+        self.assertEqual(self.navigator.device.back.call_count, 1)
         self.assertNotIn((1279, 719), self.taps)
 
     def test_stop_before_notice_dismissal_never_sends_back(self) -> None:
@@ -458,7 +558,7 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.navigator.tap = tap
         with patch("project_sekai.navigator.time.sleep"):
             self.navigator.auto_live_loop(1, recovery_mode="large")
-        self.assertEqual(events, ["auto", "esc", "recover", "esc", "auto"])
+        self.assertEqual(events, ["recover", "esc", "auto"])
 
 
 class ProgressTests(unittest.TestCase):

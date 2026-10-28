@@ -3,7 +3,7 @@
   "interface_version": 2,
   "name": "MaaPJSK",
   "label": "Project SEKAI 自动化（MaaFramework）",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "mfa_min_version": "2.12.0",
   "mfa_max_version": "2.12.0",
   "github": "https://github.com/coatcn1/MaaPJSK",
@@ -37,13 +37,12 @@
     {
       "name": "AutoLive",
       "label": "🎶 自动演出",
-      "description": "通过游戏内 AUTO LIVE 按指定次数循环。每次 AUTO 开启失败时关闭提示，按指定种类和每次瓶数回复，再返回开启 AUTO。",
+      "description": "通过游戏内 AUTO LIVE 按指定次数循环。按实际单局消耗与当前体力的差额，使用选定饮料补足下一局后开启 AUTO。",
       "entry": "AutoLive",
       "option": [
         "AutoLiveSongMode",
         "AutoLiveCount",
-        "AutoLiveRecoveryMode",
-        "AutoLiveRecoveryCount"
+        "AutoLiveRecoveryMode"
       ]
     },
     {
@@ -51,13 +50,12 @@
       "label": "🎼 单人谱面演出",
       "entry": "SoloChartLive",
       "default_check": false,
-      "description": "匹配准备页与开场封面，按本地 SUS 谱面演奏并记录判定。引擎、谱面触控偏移和每局体力在 MFA 设置 → 演奏设置中保存；不足时按任务指定种类和瓶数自动用药。",
+      "description": "匹配准备页与开场封面，按本地 SUS 谱面演奏并记录判定。引擎、谱面触控偏移和每局体力在 MFA 设置 → 演奏设置中保存；不足时按任务指定种类自动补足下一局所需体力。",
       "option": [
         "SoloChartLiveSongMode",
         "SoloChartLiveDifficulty",
         "SoloChartLiveCount",
-        "SoloChartLiveRecoveryMode",
-        "SoloChartLiveRecoveryCount"
+        "SoloChartLiveRecoveryMode"
       ]
     },
     {
@@ -71,8 +69,7 @@
         "CooperativeChartLiveSongMode",
         "CooperativeChartLiveDifficulty",
         "CooperativeChartLiveCount",
-        "CooperativeChartLiveRecoveryMode",
-        "CooperativeChartLiveRecoveryCount"
+        "CooperativeChartLiveRecoveryMode"
       ]
     },
     {
@@ -269,27 +266,6 @@
         }
       ]
     },
-    "AutoLiveRecoveryCount": {
-      "type": "input",
-      "label": "每次回复饮料数量",
-      "inputs": [
-        {
-          "name": "RecoveryCount",
-          "label": "每次瓶数",
-          "default": "1",
-          "pipeline_type": "int",
-          "verify": "^[1-9][0-9]?$",
-          "pattern_msg": "请输入 1 到 99 的整数"
-        }
-      ],
-      "pipeline_override": {
-        "AutoLiveRecoveryCountConfig": {
-          "custom_action_param": {
-            "count": "{RecoveryCount}"
-          }
-        }
-      }
-    },
     "SoloChartLiveSongMode": {
       "type": "select",
       "label": "选曲方式",
@@ -469,27 +445,6 @@
           }
         }
       ]
-    },
-    "SoloChartLiveRecoveryCount": {
-      "type": "input",
-      "label": "每次回复饮料数量",
-      "inputs": [
-        {
-          "name": "Value",
-          "label": "每次瓶数",
-          "default": "1",
-          "pipeline_type": "int",
-          "verify": "^[1-9][0-9]?$",
-          "pattern_msg": "请输入 1 到 99 的整数"
-        }
-      ],
-      "pipeline_override": {
-        "SoloChartLiveRecoveryCountConfig": {
-          "custom_action_param": {
-            "recovery_count": "{Value}"
-          }
-        }
-      }
     },
     "SoloChartCalibrationDifficulty": {
       "type": "select",
@@ -744,27 +699,6 @@
           }
         }
       ]
-    },
-    "CooperativeChartLiveRecoveryCount": {
-      "type": "input",
-      "label": "每次回复饮料数量",
-      "inputs": [
-        {
-          "name": "Value",
-          "label": "每次瓶数",
-          "default": "1",
-          "pipeline_type": "int",
-          "verify": "^[1-9][0-9]?$",
-          "pattern_msg": "请输入 1 到 99 的整数"
-        }
-      ],
-      "pipeline_override": {
-        "CooperativeChartLiveRecoveryCountConfig": {
-          "custom_action_param": {
-            "recovery_count": "{Value}"
-          }
-        }
-      }
     },
     "CooperativeChartLiveRoom": {
       "type": "select",

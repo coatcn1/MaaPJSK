@@ -64,7 +64,7 @@ class CooperativeTests(unittest.TestCase):
                          ["EASY", "NORMAL", "HARD", "EXPERT", "MASTER"])
         context, argv = self.configuration()
         self.assertEqual(agent._SETTINGS[41], {"room": "free", "song_mode": "current", "difficulty": "easy",
-                                             "count": 1, "recovery_mode": "off", "recovery_count": 1})
+                                             "count": 1, "recovery_mode": "off"})
         pipeline = json.loads((ROOT / "resource/pipeline/cooperative_chart_live.json").read_text(encoding="utf-8"))
         for option in task["option"]:
             specification = interface["option"][option]
@@ -115,6 +115,16 @@ class CooperativeTests(unittest.TestCase):
                 recovery_mode="off", recovery_count=1, engine="native", game_timing_feedback=False, play_failure_retry_count=0)
         self.assertEqual(performance.bonus_consumption, 5)
         self.assertIn("FAST / LATE 微调（试验）：关", log.call_args.args[1])
+
+    def test_agent_invalid_run_logs_zero_before_progress_attributes_exist(self):
+        context, argv = self.configuration()
+        performance = SimpleNamespace(engine="legacy", use_calibration_profile=False, touch_offset_ms=0,
+                                      bonus_consumption=5, cooperative_game_timing_feedback=False)
+        workflow = SimpleNamespace(run=Mock(side_effect=ValueError('无效任务参数')))
+        with patch.object(agent, "load_performance", return_value=performance), \
+                patch.object(agent, "create_workflow", return_value=workflow), patch.object(agent, "visible_log") as log:
+            self.assertFalse(agent.ProjectSekaiCooperativeLive().run(context, argv))
+        self.assertIn('已完成 0 / 总数 1；无效任务参数', log.call_args.args[1])
 
     def test_agent_initial_log_ipc_failure_does_not_abort_workflow(self):
         context, argv = self.configuration()
@@ -1240,6 +1250,64 @@ class CooperativeTests(unittest.TestCase):
         with patch("project_sekai.cooperative_live.parse_sus", return_value=SimpleNamespace(duration=1)), \
                 patch("project_sekai.cooperative_live.compile_touches", return_value=(1, 2)):
             return workflow.run(count, "easy", "current", **kwargs)
+
+    def test_settlement_title_recovery_counts_four_performances_without_fifth_play(self):
+        for complete_result in (True, False):
+            with self.subTest(complete_result=complete_result), tempfile.TemporaryDirectory() as directory:
+                workflow = self.run_workflow(Path(directory))
+                ui, clock, frames = self.ui_workflow(["home"])
+                workflow.navigator = ui.navigator
+                workflow.device.screenshot.side_effect = ui.screenshot
+                workflow.pause = clock.advance
+                workflow.recover_runtime_failure = CooperativeLive.recover_runtime_failure.__get__(workflow)
+                original_collect = workflow.collect.side_effect
+
+                def collect(report, target):
+                    original_collect(report, target)
+                    if workflow.collect.call_count == 1:
+                        report.pop("returned_home")
+                        report.update(end_detection={"method": "cooperative_settlement_confirmed",
+                            "confirmation_frames": 2, "input_and_release_complete": True,
+                            "settlement_page": "team_result"})
+                        if not complete_result:
+                            report.pop("judgements")
+                            report["result_status"] = "incomplete"
+                        raise RuntimeError("结算已返回标题页")
+
+                workflow.collect.side_effect = collect
+                reports = self.execute(workflow, count=4)
+                self.assertEqual(workflow.play.call_count, 4)
+                self.assertEqual(workflow.performed_rounds, 4)
+                self.assertEqual(workflow.completed_rounds, 4 if complete_result else 3)
+                self.assertTrue(reports[0]["performance_completed"])
+                self.assertTrue(reports[0]["returned_home"])
+                self.assertIn("标题页", reports[0]["error"])
+                self.assertNotIn("rematch_budget_consumed", reports[0])
+                with (Path(directory) / "results.csv").open(encoding="utf-8-sig") as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 4)
+                self.assertEqual(rows[0]["completed"], str(complete_result))
+
+    def test_recovered_completion_is_not_counted_before_persistence_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = self.run_workflow(Path(directory))
+            workflow.collect.side_effect = RuntimeError('结算回标题')
+            workflow.recover_runtime_failure = lambda report, *_: report.update(
+                performance_completed=True, returned_home=True, completed=True)
+            original_persist = workflow.persist_runtime_report
+            persisted = [0]
+            def persist(report, target):
+                persisted[0] += 1
+                if persisted[0] == 2:
+                    self.assertEqual(workflow.performed_rounds, 0)
+                    self.assertEqual(workflow.completed_rounds, 0)
+                    raise InterruptedError('结果不可写时停止')
+                original_persist(report, target)
+            workflow.persist_runtime_report = persist
+            with self.assertRaisesRegex(InterruptedError, '结果不可写'):
+                self.execute(workflow)
+            self.assertEqual(workflow.performed_rounds, 0)
+            self.assertEqual(workflow.completed_rounds, 0)
 
     def test_native_rounds_continue_through_pause_mismatch_with_complete_execution_and_release(self):
         with tempfile.TemporaryDirectory() as directory:

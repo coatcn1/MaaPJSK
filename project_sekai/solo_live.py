@@ -22,7 +22,7 @@ from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from .failure_retry import FailureRetryBudget
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
-from .navigator import Navigator, read_available_bonus
+from .navigator import Navigator, read_available_bonus, recovery_bottles
 from .ocr import LineOcr, Reading
 from .performance_trace import PerformanceTrace
 from .song_identity import SongMatcher, normalize_title, write_image
@@ -388,10 +388,14 @@ class SoloLive:
         expected_song_id = self.resolve_specified_song(song_name, difficulty) if song_mode == 'specified' else None
         self.navigator.return_to_home()
         self.navigator.tap(1194, 649, "主页 Live")
-        self.navigator.wait("live_menu")
+        self.navigator.wait_stable_live_menu()
         self.navigator.tap(722, 235, "单人 Live")
         frame = self.navigator.wait("song_select")
         selected = self.matcher.match(frame, difficulty, "song_select") if song_mode == "current" else None
+        if song_mode == 'specified':
+            # 先确认目标歌曲，再切换该歌曲的难度组；上一首没有APPEND不能阻止有APPEND的指定目标。
+            selected = self.search_specified_song(expected_song_id, difficulty)
+            frame = self.checked_search_page()
         group = self.ocr.read(frame, (971, 529, 1059, 560))
         if group.confidence < .7 or normalize_title(group.text) not in {"hard", "append"}:
             raise RuntimeError(f"选曲页难度组未确认：{group.text!r}")
@@ -405,8 +409,6 @@ class SoloLive:
                 raise RuntimeError("选曲页未切换到请求的难度组")
         if song_mode == "random":
             self.navigator._select_random_song(frame)
-        elif song_mode == 'specified':
-            selected = self.search_specified_song(expected_song_id, difficulty)
         if difficulty == "append":
             # Append 组只显示中央一个难度按钮，与普通五难度组的坐标不同。
             self.navigator.tap(1015, 500, "Append 难度")
@@ -432,7 +434,7 @@ class SoloLive:
             raise RuntimeError("指定歌曲与准备页实际歌曲不符，拒绝演出")
         return prepared, frame
 
-    def prepare_bonus(self, consumption: str | int, report: dict, directory: Path, *, setup_playback=True, return_page="prepare"):
+    def prepare_bonus(self, consumption: str | int, report: dict, directory: Path, *, setup_playback=True, return_page="prepare", save_bonus_image=True):
         if setup_playback:
             self.navigator.ensure_auto(False)
         self.navigator.tap(1150, 42, "打开体力消耗设置")
@@ -474,7 +476,8 @@ class SoloLive:
                 raise RuntimeError(f"未确认用户指定的 {target} 体力消耗，拒绝开演")
             readings.append(asdict(reading))
             self.pause(.12)
-        write_image(directory / "bonus.png", frame)
+        if save_bonus_image:
+            write_image(directory / "bonus.png", frame)
         report["bonus"] = {"requested_consumption": consumption, "consumption": target,
                            "confirmed": False, "readings": readings, "original_consumption": original}
         self.navigator.tap(762, 655, f"保存 {target} 体力消耗")
@@ -608,6 +611,8 @@ class SoloLive:
         if pending_batch:
             _write_json(directory / "report.json", report)
             raise RuntimeError("本任务先前已请求批量用药但到账未确认，请用户处理；不追加或重复整批")
+        # 旧配置和 CLI 的瓶数仅保留兼容参数；自动模式只补足下一局所需差额。
+        count = recovery_bottles(mode, available, consumption)
         report["recovery"] = {"mode": mode, "requested_bottles": count, "completed_bottles": 0, "available_before": available,
                               "status": "started"}
         _write_json(directory / "report.json", report)
@@ -634,8 +639,8 @@ class SoloLive:
         report["recovery"].update(available_after=after, completed_bottles=count, readings=readings, status="confirmed")
         report["bonus"]["available_after"] = after
         if after < consumption:
-            # 每次只执行用户规定的一批瓶数；不足时停止，不追加瓶数，也不降低每局消耗。
-            raise RuntimeError(f"已按设置使用 {count} 瓶饮料，当前体力 {after} 仍不足 {consumption}；请调整每次回复瓶数")
+            # 一批确认后出现异常仍停止，不自动重复请求或降低每局消耗。
+            raise RuntimeError(f"已使用 {count} 瓶饮料，当前体力 {after} 仍不足 {consumption}；请检查回复结果")
         report["bonus"]["availability"] = "recovered"
         self.navigator.ensure_auto(False)
         self.log(f"体力回复已确认：当前 {after}，继续按每局 {consumption} 体力开演")
@@ -788,9 +793,12 @@ class SoloLive:
             attempt = {"samples": samples, "sample_count": len(samples), "sample_state": state,
                        "gold_tap_blue_context_guard": getattr(anchor, "gold_tap_blue_context_guard", False) is True,
                        "chart_bound_head_guard": getattr(anchor, "chart_bound_head_guard", False) is True,
-                       "trace_opening_head_guard": getattr(anchor, "trace_opening_head_guard", False) is True}
+                       "trace_opening_head_guard": getattr(anchor, "trace_opening_head_guard", False) is True,
+                       "gold_tap_mixed_context_guard": getattr(anchor, "gold_tap_mixed_context_guard", False) is True,
+                       "legacy_first_head_seed": getattr(anchor, "legacy_first_head_seed", False) is True}
             tracker_status = getattr(getattr(anchor, 'chart_bound_tracker', None), 'status', None)
-            if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']) and isinstance(tracker_status, str):
+            if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']
+                    or attempt['gold_tap_mixed_context_guard']) and isinstance(tracker_status, str):
                 attempt['chart_bound_head_status'] = tracker_status
             if failed:
                 reason = getattr(anchor, "failure_reason", None)
@@ -969,11 +977,19 @@ class SoloLive:
             frame = getattr(self, 'start_failure_frame', None)
             if frame is not None:
                 write_image(directory / 'start-failure.png', frame)
-            report['anchor_frames'] = []
+            saved_frames = []
+            # 已发布的索引与时间映射只在整批成功后替换；重入且无新帧时保持原值。
+            # 新文件避开旧索引，避免半批写入失败破坏仍被引用的证据。
+            previous_paths = {Path(item['path']).name for item in report.get('anchor_frames', [])}
+            offset = 0
             for index, (when, frame) in enumerate(getattr(self, 'anchor_frames', [])):
-                name = f'anchor-frame-{index:02d}.png'
+                while f'anchor-frame-{offset + index:02d}.png' in previous_paths:
+                    offset += 1
+                name = f'anchor-frame-{offset + index:02d}.png'
                 write_image(directory / name, frame)
-                report['anchor_frames'].append({'captured_at': when, 'path': name})
+                saved_frames.append({'captured_at': when, 'path': name})
+            if saved_frames:
+                report['anchor_frames'] = saved_frames
         except Exception as error:
             report['anchor_evidence_warning'] = f'{type(error).__name__}: {error}'
         finally:
@@ -1603,7 +1619,7 @@ class SoloLive:
         bonus_snapshot = {} if _bonus_snapshot is None else _bonus_snapshot
         reports = []
         consumption_label = "沿用游戏设置" if bonus_consumption == "current" else f"每局 {bonus_consumption} 体力"
-        recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用 {recovery_count} 瓶{'小' if recovery_mode == 'small' else '大'}饮料"
+        recovery_label = "自动用药关闭" if recovery_mode == "off" else f"不足时使用{'小' if recovery_mode == 'small' else '大'}饮料补足下一局所需体力"
         trace_requested = trace_opening_head_guard_requested()
         self.log(f"单人谱面演出：已完成 0 / 总数 {count}；{difficulty.upper()}；{consumption_label}；{recovery_label}；"
                  f"TRACE首头候选请求：{'开启' if trace_requested else '关闭'}")
