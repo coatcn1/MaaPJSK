@@ -142,7 +142,7 @@ class ProjectSekaiCooperativeLive(CustomAction):
             return False
         except Exception as error:
             if not context.tasker.stopping:
-                completed = workflow.completed_rounds if workflow else 0
+                completed = getattr(workflow, "performed_rounds", 0) if workflow else 0
                 count = settings.get("count", 0) if settings else 0
                 try:
                     visible_log(context, f"协力谱面演出中止：已完成 {completed} / 总数 {count}；{error}")

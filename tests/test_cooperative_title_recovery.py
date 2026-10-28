@@ -94,6 +94,48 @@ class SettlementTitleRecoveryTests(unittest.TestCase):
         self.assertEqual(report['settlement_login']['source_report'],
                          None if self.diagnostics_disabled else str(Path(root) / 'report.json'))
 
+    def test_proven_settlement_title_login_home_confirms_performance_without_rematch(self):
+        workflow, clock, report, service = self.setup_workflow(['title_screen', 'title_screen', 'home'])
+        report.update(engine='native', end_detection={'method': 'cooperative_settlement_confirmed',
+            'confirmation_frames': 2, 'input_and_release_complete': True, 'settlement_page': 'team_result'},
+            judgements={'total_matches_chart': True})
+        report['playback'].update(executed_actions=2, release={
+            'reset_executed': True, 'release_proof': 'current-reset-jlog-and-cleanup'})
+        with tempfile.TemporaryDirectory() as root, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock[0]):
+            workflow.wait_runtime_destination(report, Path(root), RuntimeError('原结算失败'))
+        service.run.assert_called_once_with(wait_for_home=True, resume=True)
+        workflow.device.preflight.assert_called_once()
+        self.assertTrue(report['returned_home'])
+        self.assertTrue(report['performance_completed'])
+        self.assertTrue(report['completed'])
+        self.assertEqual(report['error'], '原结算失败')
+        self.assertNotIn('rematch_budget_consumed', report)
+
+    def test_completion_candidate_requires_current_execution_settlement_and_no_stop_or_death(self):
+        workflow, _, report, _ = self.setup_workflow(['home'])
+        report.update(engine='native', end_detection={'method': 'cooperative_settlement_confirmed',
+            'confirmation_frames': 2, 'input_and_release_complete': True, 'settlement_page': 'team_result'})
+        report['playback'].update(executed_actions=2, release={
+            'reset_executed': True, 'release_proof': 'current-reset-jlog-and-cleanup'})
+        self.assertTrue(workflow.settlement_completion_candidate(report))
+        for key, value in [('end_detection', {}), ('phase', 'playing'), ('death_confirmed', True),
+                           ('cancelled', True), ('playback_error', '真实输入异常')]:
+            with self.subTest(key=key):
+                self.assertFalse(workflow.settlement_completion_candidate(dict(report, **{key: value})))
+        for key, value in [('sent_actions', 1), ('executed_actions', 1), ('release', {}), ('release_confirmed', False)]:
+            with self.subTest(playback=key):
+                self.assertFalse(workflow.settlement_completion_candidate(dict(report, playback=dict(report['playback'], **{key: value}))))
+
+    def test_home_conflicting_with_live_menu_never_confirms_performance(self):
+        workflow, clock, report, _ = self.setup_workflow(['home'])
+        report['end_detection'] = {'method': 'cooperative_settlement_confirmed', 'confirmation_frames': 2,
+                                  'input_and_release_complete': True, 'settlement_page': 'team_result'}
+        workflow.score = lambda frame, page: float(page in {'home', 'live_menu'})
+        with tempfile.TemporaryDirectory() as root, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock[0]):
+            workflow.wait_runtime_destination(report, Path(root), RuntimeError('矛盾主页'))
+        self.assertFalse(report.get('performance_completed', False))
+        self.assertFalse(report['completed'])
+
     def test_completed_episode_does_not_restart_but_next_run_can_login(self):
         workflow, clock, report, service = self.setup_workflow(['title_screen', 'title_screen', 'home'])
         report['run_id'] = 'first-run'
