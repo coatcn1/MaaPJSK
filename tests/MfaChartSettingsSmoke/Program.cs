@@ -520,6 +520,76 @@ sys.exit(2 if mode == 'partial' else 0)
         performance.BonusIndex = 12; performance.SaveCommand.Execute(null);
         Require(savedBefore.SequenceEqual(File.ReadAllBytes(savedPerformance)), "越界体力数量不能写入配置");
         performance.BonusIndex = 6;
+        performance.SaveCommand.Execute(null);
+        var beforeRefresh = File.ReadAllBytes(savedPerformance);
+        performance.RefreshCommand.Execute(null);
+        Dispatcher.UIThread.RunJobs();
+        Require(beforeRefresh.SequenceEqual(File.ReadAllBytes(savedPerformance)), "初始化读取不能触发保存");
+        performanceControl.GetVisualDescendants().OfType<TextBox>().First().Text = "-";
+        Dispatcher.UIThread.RunJobs();
+        Require(performance.TouchOffsetText == "-", "数值文本编辑必须立即同步，不能等失焦提交");
+        Require(!PerformanceSettingsUserControlModel.FlushBeforeTaskStart()
+            && beforeRefresh.SequenceEqual(File.ReadAllBytes(savedPerformance)), "未输入完成的数值必须阻止启动且保留配置");
+        performance.TouchOffsetText = "-24";
+        Require(PerformanceSettingsUserControlModel.FlushBeforeTaskStart()
+            && JObject.Parse(File.ReadAllText(savedPerformance)).Value<int>("touch_offset_ms") == -24,
+            "立即启动必须保存尚未经过防抖的文本编辑");
+        var extended = JObject.Parse(File.ReadAllText(savedPerformance));
+        extended["future_setting"] = "preserved";
+        File.WriteAllText(savedPerformance, extended.ToString());
+        performance.RetryCountText = "3";
+        using (var debounceLoop = new CancellationTokenSource(1200))
+            Dispatcher.UIThread.MainLoop(debounceLoop.Token);
+        Require(JObject.Parse(File.ReadAllText(savedPerformance)).Value<int>("play_failure_retry_count") == 3
+            && JObject.Parse(File.ReadAllText(savedPerformance)).Value<string>("future_setting") == "preserved",
+            "防抖自动保存必须真实写入并保留扩展字段");
+        Require(MaaPjskMaintenance.TryBegin(), "自动保存占用测试进入维护");
+        try
+        {
+            performance.TouchOffsetText = "-25";
+            Require(!performance.FlushPending() && performance.StatusText.Contains("未保存"), "维护占用保留未保存状态");
+        }
+        finally { MaaPjskMaintenance.End(); }
+        Require(PerformanceSettingsUserControlModel.FlushBeforeTaskStart(), "维护结束后启动边界应重试待保存值");
+        var preserved = File.ReadAllBytes(savedPerformance);
+        File.Delete(savedPerformance);
+        Directory.CreateDirectory(savedPerformance);
+        try
+        {
+            performance.TouchOffsetText = "-26";
+            Require(!performance.FlushPending() && performance.StatusText.Contains("失败"), "写入失败必须可见且阻止启动");
+        }
+        finally { Directory.Delete(savedPerformance); File.WriteAllBytes(savedPerformance, preserved); }
+        Require(performance.FlushPending(), "修复写入条件后应可重试保存");
+        performance.TouchOffsetText = "-";
+        performance.Deactivate();
+        GC.Collect();
+        var reopenedPerformance = new PerformanceSettingsUserControl();
+        Require(ReferenceEquals(reopenedPerformance.DataContext, performance)
+            && ((PerformanceSettingsUserControlModel)reopenedPerformance.DataContext!).TouchOffsetText == "-",
+            "重新打开设置页须显示同一未保存编辑，不保留不可修复的隐藏旧实例");
+        Require(!PerformanceSettingsUserControlModel.FlushBeforeTaskStart(), "切页后未保存的无效编辑仍须阻止启动");
+        performance.TouchOffsetText = "-23";
+        Require(PerformanceSettingsUserControlModel.FlushBeforeTaskStart(), "切页后的有效待保存值仍能由启动边界保存");
+        performance.Activate();
+        performance.Activate();
+        performance.Deactivate();
+        performance.TouchOffsetText = "-";
+        Require(!PerformanceSettingsUserControlModel.FlushBeforeTaskStart(), "另一窗口卸载后共享编辑器仍必须参与启动保存门禁");
+        performance.TouchOffsetText = "-23";
+        performance.FlushPending();
+        performance.Activate();
+        var validBeforeLoadFailure = File.ReadAllBytes(savedPerformance);
+        File.WriteAllText(savedPerformance, "{broken");
+        performance.RefreshCommand.Execute(null);
+        performance.SaveCommand.Execute(null);
+        Require(File.ReadAllText(savedPerformance) == "{broken" && performance.StatusText.Contains("读取失败"),
+            "读取失败后的手动保存不能覆盖损坏配置");
+        File.WriteAllBytes(savedPerformance, validBeforeLoadFailure);
+        performance.RefreshCommand.Execute(null);
+        performance.TouchOffsetText = "-23";
+        performance.RetryCountText = "0";
+        performance.FlushPending();
         FailureRetrySmoke.Run(Require, operation => Wait(operation));
         AvaloniaHeadlessPlatform.ForceRenderTimerTick();
         using var performanceBitmap = performanceWindow.CaptureRenderedFrame() ?? throw new InvalidOperationException("演奏设置未渲染");

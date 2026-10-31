@@ -14,8 +14,7 @@
                     <ComboBoxItem Content="Native 设备端定时演奏" />
                 </ComboBox>
                 <TextBlock Grid.Row="1" Text="谱面触控偏移（ms）" VerticalAlignment="Center" />
-                <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding TouchOffsetMs, Mode=TwoWay}"
-                               Minimum="-300" Maximum="300" Increment="1" FormatString="0" />
+                <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding TouchOffsetText, Mode=TwoWay}" Watermark="-300 到 300 的整数" />
                 <TextBlock Grid.Row="2" Text="每局体力消耗检测" VerticalAlignment="Center" />
                 <ComboBox Grid.Row="2" Grid.Column="1" SelectedIndex="{Binding BonusIndex, Mode=TwoWay}">
                     <ComboBoxItem Content="沿用游戏当前数量" />
@@ -26,8 +25,7 @@
                 </ComboBox>
             </Grid>
             <TextBlock Text="中途失败重试次数（整次任务共用，0 关闭）" />
-            <NumericUpDown Value="{Binding PlayFailureRetryCount, Mode=TwoWay}"
-                           Minimum="0" Maximum="99" Increment="1" FormatString="0" />
+            <TextBox Text="{Binding RetryCountText, Mode=TwoWay}" Watermark="0 到 99 的整数" />
             <TextBlock Text="仅普通单人／协力的真实演出死亡可重试，失败局不计目标，成功不重置预算。单人退出游戏主页后继续；协力切出后关闭并重新登录日服游戏。任务结束或手动停止时显示累计失败次数；校准、一键和 AUTO 不使用此设置。" TextWrapping="Wrap" />
             <CheckBox Content="自动使用当前设备、难度已通过验证的 Native 校准配置"
                       IsChecked="{Binding UseCalibrationProfile, Mode=TwoWay}" />
@@ -40,10 +38,10 @@
             <TextBlock Text="Native 校准按上方体力数量完成一局排练和一局正式验证，校准期间关闭用药。以实际 FAST 与 LATE（SLOW）接近平衡为目标，不因 MISS 等其他判定单独拒绝；仍要求 LIVE CLEAR、音数匹配、完整输入与释放。通过后保存当前设备和难度的配置。"
                        TextWrapping="Wrap" />
             <CheckBox Content="不写入任何日志" IsChecked="{Binding DisableLogging, Mode=TwoWay}" />
-            <TextBlock Text="关闭截图、成绩、演奏与框架文件日志。界面进度继续显示；设置、校准配置、谱面及用药状态仍会保存。停止所有任务与维护后才能保存。" TextWrapping="Wrap" />
+            <TextBlock Text="关闭截图、成绩、演奏与框架文件日志。界面进度继续显示；设置、校准配置、谱面及用药状态仍会保存。修改会自动保存；演出或维护期间的修改须停止后重试。" TextWrapping="Wrap" />
             <TextBlock Text="{Binding CalibrationText}" TextWrapping="Wrap" />
             <WrapPanel>
-                <Button Content="保存演奏设置" Command="{Binding SaveCommand}" Margin="0,0,12,8" />
+                <Button Content="立即保存／重试" Command="{Binding SaveCommand}" Margin="0,0,12,8" />
                 <Button Content="刷新设置与校准状态" Command="{Binding RefreshCommand}" Margin="0,0,0,8" />
             </WrapPanel>
             <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" />
