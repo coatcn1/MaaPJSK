@@ -10,6 +10,8 @@ import re
 
 # 擦除片段候选仅明确1启用；按进程初始化冻结，任务中修改环境不会改变既有解析合同。
 ERASED_SLIDE_GUARD = os.environ.get('MAAPJSK_ERASED_SLIDE_GUARD') == '1'
+# 隐藏首尾片段使用独立候选合同，默认关闭；运行中不重新读取开关。
+HIDDEN_SLIDE_FRAGMENT_GUARD = os.environ.get('MAAPJSK_HIDDEN_SLIDE_FRAGMENT_GUARD') == '1'
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,7 @@ def parse_sus(text: str) -> Chart:
         return tempo_seconds[index] + float(position - tempo_beats[index]) * 60 / tempos[tempo_beats[index]] - wave_offset
 
     shorts: dict[tuple[Fraction, int], tuple[int, int]] = {}
+    short_conflicts: set[tuple[Fraction, int]] = set()
     directions: dict[tuple[Fraction, int], int] = {}
     slide_rows: dict[str, list[tuple[Fraction, int, int, int]]] = {}
     for measure, channel, body in rows:
@@ -150,6 +153,9 @@ def parse_sus(text: str) -> Chart:
             if channel[0] == "1":
                 if kind not in range(1, 9):
                     raise ValueError(f"未知短音符类型：{kind}")
+                # 保留旧覆盖语义，但冲突来源不能被新候选当作明确隐藏标记。
+                if (position, lane) in shorts and shorts[position, lane] != (kind, width):
+                    short_conflicts.add((position, lane))
                 shorts[position, lane] = (kind, width)
             elif channel[0] == "5":
                 if kind not in range(1, 7):
@@ -165,6 +171,7 @@ def parse_sus(text: str) -> Chart:
         active: list[Point] = []
         active_critical = False
         erased_fragment = False
+        hidden_fragment = False
         active_start_beat = Fraction(0)
         for position, lane, width, kind in sorted(nodes, key=lambda item: (item[0], 0 if item[3] == 2 else 1)):
             direction = directions.get((position, lane), 0)
@@ -178,6 +185,8 @@ def parse_sus(text: str) -> Chart:
                 active = [point]
                 active_critical = shorts.get((position, lane), (1, width))[0] in {2, 6}
                 erased_fragment = shorts.get((position, lane)) == (8, width)
+                hidden_fragment = ((position, lane) not in short_conflicts
+                                   and shorts.get((position, lane)) in {(7, width), (8, width)})
                 active_start_beat = position
             elif not active:
                 raise ValueError("滑条节点没有对应的开头")
@@ -189,15 +198,25 @@ def parse_sus(text: str) -> Chart:
                     half_beat_start = Fraction(active_start_beat // Fraction(1, 2), 2)
                     # 只排除首尾8擦除、无可判节点且严格位于同半拍格内部的装饰短链。
                     # 跨格长条、可见节点或可判短标记仍须完整触控，不能靠缩短时间或扩触点绕过拒绝。
-                    decorative = (ERASED_SLIDE_GUARD and erased_fragment
+                    decorative = (not HIDDEN_SLIDE_FRAGMENT_GUARD and ERASED_SLIDE_GUARD and erased_fragment
                                   and shorts.get((position, lane)) == (8, width) and direction == 0
                                   and half_beat_start < active_start_beat < position < half_beat_start + Fraction(1, 2))
+                    # 7/8隐藏首尾与4/5非判定节点都得到确认，且整链不经过全局半拍tick才可忽略。
+                    # 首点direction仍是路径缓动元数据；只用尾点direction排除flick判定。
+                    decorative |= (HIDDEN_SLIDE_FRAGMENT_GUARD and hidden_fragment
+                                   and (position, lane) not in short_conflicts
+                                   and shorts.get((position, lane)) in {(7, width), (8, width)}
+                                   and direction == 0
+                                   and half_beat_start < active_start_beat < position < half_beat_start + Fraction(1, 2))
                     if not decorative:
                         gestures.append(Gesture(tuple(active), "slide", point.direction, active_critical))
                     active = []
                 else:
                     marker = shorts.get((position, lane))
                     erased_fragment = (erased_fragment and kind in {4, 5}
+                                       and (marker is None or marker in {(7, width), (8, width)}))
+                    hidden_fragment = (hidden_fragment and kind in {4, 5}
+                                       and (position, lane) not in short_conflicts
                                        and (marker is None or marker in {(7, width), (8, width)}))
         if active:
             raise ValueError("滑条没有结束节点")

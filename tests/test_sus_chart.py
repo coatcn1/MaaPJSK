@@ -334,6 +334,7 @@ class SusTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compile_touches(chart)
 
+    @patch('project_sekai.sus_chart.HIDDEN_SLIDE_FRAGMENT_GUARD', False)
     def test_erased_slide_candidate_ignores_only_nonjudgement_fragments(self):
         # 两条真实长条中叠加十一条1 tick擦除片段，不能把无判定装饰当作十三根手指。
         def fragment_body(first, last):
@@ -353,6 +354,7 @@ class SusTests(unittest.TestCase):
         self.assertEqual(len([event for event in events if event.kind == 'down']), 2)
         validate_touches(events)
 
+    @patch('project_sekai.sus_chart.HIDDEN_SLIDE_FRAGMENT_GUARD', False)
     def test_erased_slide_candidate_preserves_judgements_and_uncertain_chains(self):
         def source(*, head=8, tail=8, start=100, end=104, internal=(), flick=0, marker_width=1):
             def body(values):
@@ -411,10 +413,11 @@ class SusTests(unittest.TestCase):
 
     def test_erased_slide_semantics_use_new_touch_versions(self):
         from project_sekai.chart_player import TOUCH_PLAN_VERSION, SLIDE_NODE_TOUCH_PLAN_VERSION
-        from project_sekai.sus_chart import ERASED_SLIDE_GUARD
-        self.assertEqual(TOUCH_PLAN_VERSION, 6 if ERASED_SLIDE_GUARD else 4)
-        self.assertEqual(SLIDE_NODE_TOUCH_PLAN_VERSION, 7 if ERASED_SLIDE_GUARD else 5)
+        from project_sekai.sus_chart import ERASED_SLIDE_GUARD, HIDDEN_SLIDE_FRAGMENT_GUARD
+        self.assertEqual(TOUCH_PLAN_VERSION, 8 if HIDDEN_SLIDE_FRAGMENT_GUARD else 6 if ERASED_SLIDE_GUARD else 4)
+        self.assertEqual(SLIDE_NODE_TOUCH_PLAN_VERSION, 9 if HIDDEN_SLIDE_FRAGMENT_GUARD else 7 if ERASED_SLIDE_GUARD else 5)
 
+    @patch('project_sekai.sus_chart.HIDDEN_SLIDE_FRAGMENT_GUARD', False)
     def test_erased_slide_candidate_real_509_master_when_local_chart_exists(self):
         import hashlib
         from project_sekai.chart_catalog import ChartRepository

@@ -10,12 +10,12 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .sus_chart import Chart, Gesture, Point, slide_x, ERASED_SLIDE_GUARD
+from .sus_chart import Chart, Gesture, Point, slide_x, ERASED_SLIDE_GUARD, HIDDEN_SLIDE_FRAGMENT_GUARD
 from .opening_head import (trace_opening_head_guard_requested, trace_head_candidates, trace_head_geometry,
                            trace_source_proof, TracePhaseContext, trace_core_mask, trace_projection_scale)
 
-TOUCH_PLAN_VERSION = 6 if ERASED_SLIDE_GUARD else 4
-SLIDE_NODE_TOUCH_PLAN_VERSION = 7 if ERASED_SLIDE_GUARD else 5
+TOUCH_PLAN_VERSION = 8 if HIDDEN_SLIDE_FRAGMENT_GUARD else 6 if ERASED_SLIDE_GUARD else 4
+SLIDE_NODE_TOUCH_PLAN_VERSION = 9 if HIDDEN_SLIDE_FRAGMENT_GUARD else 7 if ERASED_SLIDE_GUARD else 5
 START_ANCHOR_VERSION = 28
 
 
