@@ -148,6 +148,11 @@ public void StartTask()
             ToastHelper.Warn("资源维护中", "请等待谱面同步或发行更新结束后，再开始演出任务。");
             return;
         }
+        if (!MFAAvalonia.ViewModels.UsersControls.Settings.PerformanceSettingsUserControlModel.FlushBeforeTaskStart())
+        {
+            ToastHelper.Warn("演奏设置未保存", "请检查演奏设置中的数值或保存错误，保存成功后再启动任务。");
+            return;
+        }
         MaaPjskDiagnostics.ApplyFramework();
 '@
 [IO.File]::WriteAllText($taskPath, [regex]::Replace($taskSource, $pattern, $guard), [Text.UTF8Encoding]::new($false))

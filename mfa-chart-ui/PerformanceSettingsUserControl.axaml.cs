@@ -7,9 +7,10 @@ public partial class PerformanceSettingsUserControl : UserControl
 {
     public PerformanceSettingsUserControl()
     {
-        var model = new PerformanceSettingsUserControlModel();
+        var model = PerformanceSettingsUserControlModel.Shared;
         DataContext = model;
         InitializeComponent();
-        Loaded += (_, _) => model.RefreshCommand.Execute(null);
+        Loaded += (_, _) => model.Activate();
+        Unloaded += (_, _) => model.Deactivate();
     }
 }
