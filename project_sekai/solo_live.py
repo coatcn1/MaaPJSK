@@ -816,6 +816,7 @@ class SoloLive:
             self.anchor_frames = retained_anchor_frames()
 
         frame = None
+        previous_opening_request = None
         while time.monotonic() < (opening_deadline_provider() if final is None and opening_deadline_provider is not None else deadline):
             before = time.perf_counter()
             hud_playing = False
@@ -830,6 +831,22 @@ class SoloLive:
                     frame = self.check_observation_frame(frame)
             else:
                 frame = self.screenshot()
+            if final is not None:
+                screenshot_returned = time.perf_counter()
+                timing = report.setdefault("opening_capture_timing", {"frames": 0, "slowest_capture_and_checks_ms": 0.0,
+                                                                       "longest_gap_ms": 0.0})
+                timing["frames"] += 1
+                request_ms = (screenshot_returned - before) * 1000
+                if request_ms > timing["slowest_capture_and_checks_ms"]:
+                    timing.update(slowest_capture_and_checks_ms=request_ms, slowest_capture_at=before)
+                if previous_opening_request is not None:
+                    previous_at, previous_returned = previous_opening_request
+                    gap_ms = (before - previous_at) * 1000
+                    if gap_ms > timing["longest_gap_ms"]:
+                        timing.update(longest_gap_ms=gap_ms, longest_gap_after=previous_at,
+                                      gap_capture_and_checks_ms=(previous_returned - previous_at) * 1000,
+                                      gap_after_return_ms=(before - previous_returned) * 1000)
+                previous_opening_request = (before, screenshot_returned)
             self.observe_preplay_life(frame, before, report)
             if frame_guard is not None:
                 frame_guard(frame)
