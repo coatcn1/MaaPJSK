@@ -159,6 +159,23 @@ public void StartTask()
 
 & (Join-Path $PSScriptRoot 'patch-mfa-diagnostics.ps1') -SourceRoot $sourceRoot -ProjectRoot $projectRoot
 
+# 暂停任务期间的主动内存回收；.NET 自行触发的 GC 仍由运行时管理。
+$memoryPath = Join-Path $sourceRoot 'MFAAvalonia\Helper\AvaloniaMemoryCracker.cs'
+$memorySource = [IO.File]::ReadAllText($memoryPath)
+$memoryShouldCleanup = 'var shouldCleanup = ShouldPerformCleanup(currentMemory, memoryInfo);'
+$memoryExecute = 'var result = ExecuteGcOnDedicatedThread(request);'
+foreach ($contract in @($memoryShouldCleanup, $memoryExecute)) {
+    if ($memorySource.Split(@($contract), [StringSplitOptions]::None).Count -ne 2) {
+        throw "上游主动内存清理入口不匹配：$contract"
+    }
+}
+$memorySource = $memorySource.Replace($memoryShouldCleanup, 'var shouldCleanup = !MaaPjskMaintenance.HasExecuting && !MaaPjskMaintenance.IsBusy && ShouldPerformCleanup(currentMemory, memoryInfo);')
+$memorySource = $memorySource.Replace($memoryExecute, @'
+var result = default(GcResult);
+                    MaaPjskMaintenance.TryRunIdleMemoryCleanup(() => result = ExecuteGcOnDedicatedThread(request));
+'@)
+[IO.File]::WriteAllText($memoryPath, $memorySource, [Text.UTF8Encoding]::new($false))
+
 # 真实队列和停止回调都必须连到同一作用域桥，不能只编译出一个未被调用的弹窗工具。
 $patchedProcessor = [IO.File]::ReadAllText($processorPath)
 foreach ($contract in @(

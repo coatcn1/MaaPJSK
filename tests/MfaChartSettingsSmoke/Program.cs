@@ -72,6 +72,29 @@ internal static partial class Program
         _checks++;
     }
 
+    private static void CheckIdleMemoryCleanup()
+    {
+        var calls = 0;
+        var cleanup = () => { calls++; };
+        using var memoryCracker = new AvaloniaMemoryCracker();
+        using (MaaPjskMaintenance.BeginExecution())
+        {
+            Require(!MaaPjskMaintenance.TryRunIdleMemoryCleanup(cleanup), "任务期间不能执行主动 GC");
+            // 直接提交工作线程请求，覆盖轮询通过后任务先于清理取得租约的情况。
+            var requestMethod = typeof(AvaloniaMemoryCracker).GetMethod("RequestGcAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var light = Enum.Parse(requestMethod.GetParameters()[0].ParameterType, "Light");
+            var request = (Task)requestMethod.Invoke(memoryCracker, [light, false])!;
+            Wait(request);
+            var result = request.GetType().GetProperty("Result")!.GetValue(request)!;
+            Require(!(bool)result.GetType().GetProperty("Success")!.GetValue(result)!, "已排队 GC 请求须在工作线程重新检查任务租约");
+        }
+        Require(calls == 0, "活动任务阻止工作线程执行已排队清理");
+        Require(MaaPjskMaintenance.TryBegin(), "维护测试应取得租约");
+        try { Require(!MaaPjskMaintenance.TryRunIdleMemoryCleanup(cleanup), "维护期间不执行主动 GC"); }
+        finally { MaaPjskMaintenance.End(); }
+        Require(MaaPjskMaintenance.TryRunIdleMemoryCleanup(cleanup) && calls == 1, "空闲时继续主动回收");
+    }
+
     private static void Wait(Task operation, int seconds = 10)
     {
         var deadline = DateTime.UtcNow.AddSeconds(seconds);
@@ -153,6 +176,7 @@ internal static partial class Program
             new ServiceCollection().AddSingleton(tabBar).AddSingleton(smokeRoot).AddSingleton<ISukiToastManager, SukiToastManager>()
                 .AddSingleton<ISukiDialogManager, SukiDialogManager>().BuildServiceProvider());
         if (firstSyncProbe) return FirstSyncProbe(args[1], args[2], args[3]);
+        CheckIdleMemoryCleanup();
 
         var reservation = (MaaProcessor)RuntimeHelpers.GetUninitializedObject(typeof(MaaProcessor));
         var reserve = typeof(MaaProcessor).GetMethod("ReserveProjectExecution", BindingFlags.Instance | BindingFlags.NonPublic)!;

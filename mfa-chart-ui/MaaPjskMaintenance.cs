@@ -54,6 +54,17 @@ public static class MaaPjskMaintenance
         }
         return new Scope(() => { lock (Sync) _executing--; });
     }
+
+    public static bool TryRunIdleMemoryCleanup(Action cleanup)
+    {
+        // 在 GC 工作线程上复核，并与任务执行租约互斥；已入队的清理也不能跨进新任务。
+        lock (Sync)
+        {
+            if (_executing != 0 || _maintenance) return false;
+            cleanup();
+            return true;
+        }
+    }
     private sealed class Scope(Action release) : IDisposable
     {
         private Action? _release = release;

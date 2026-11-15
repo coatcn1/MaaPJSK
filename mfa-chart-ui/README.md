@@ -21,3 +21,7 @@ dotnet run --project tests/MfaSleepSmoke/MfaSleepSmoke.csproj -c Release -r win-
 ```
 
 该检查证明任务与系统唤醒请求的生命周期；它不替代长时间游戏演奏验收。
+
+## 主动内存清理
+
+固定上游的内存清理器仅在没有任务执行租约、没有谱面或缓存维护时主动执行 GC。工作线程再次检查同一租约，避免空闲时排队的请求进入新任务；空闲时恢复原清理策略。.NET 自行触发的 GC 仍由运行时管理。`MfaChartSettingsSmoke` 检查任务、维护、空闲三种状态，并向真实清理线程注入一次任务期请求，核对它被跳过。
