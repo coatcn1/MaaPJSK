@@ -2378,6 +2378,36 @@ class CooperativeTests(unittest.TestCase):
             workflow.collect.assert_not_called()
             self.assertEqual(workflow.completed_rounds, 0)
 
+    def test_opening_repairs_require_actual_native_handoff_margin_before_play(self):
+        evidence = ({"start_anchor": {"fit": {"gold_tap_pair_guard": True}}},
+                    {"identity_checks": {"opening": [{"initial_title": {"text": "误读"}}]}})
+        for opening in evidence:
+            with self.subTest(opening=opening), tempfile.TemporaryDirectory() as directory:
+                workflow = self.run_workflow(Path(directory))
+
+                def start(chart, identity, report, directory, **kwargs):
+                    report.update(opening)
+                    return 100.120
+
+                workflow.start.side_effect = start
+                player = Mock()
+                player.report = {"planned_actions": 2, "sent_actions": 0, "executed_actions": 0,
+                                 "release_confirmed": True,
+                                 "release": {"release_proof": "no-touch-possible-and-cleanup"}}
+                events = (SimpleNamespace(time=-.018), SimpleNamespace(time=.024))
+                with (patch("project_sekai.native_player.NativePlayer", return_value=player),
+                      patch("project_sekai.cooperative_live.parse_sus", return_value=SimpleNamespace(duration=1)),
+                      patch("project_sekai.cooperative_live.compile_touches", return_value=events),
+                      patch("project_sekai.solo_live.time.perf_counter", return_value=100.),
+                      self.assertRaises(InterruptedError)):
+                    workflow.run(1, "easy", "current", engine="native", offset_ms=-51)
+                player.play.assert_not_called()
+                player.close.assert_called_once()
+                handoff = workflow.last_report["startup_handoff"]
+                self.assertFalse(handoff["accepted"])
+                self.assertAlmostEqual(handoff["remaining_ms"], 51.)
+                self.assertIn("首音实际启动余量不足", workflow.last_report["error"])
+
     def test_native_release_failure_blocks_all_navigation_and_keeps_failure_report(self):
         with tempfile.TemporaryDirectory() as directory:
             workflow = self.run_workflow(Path(directory))

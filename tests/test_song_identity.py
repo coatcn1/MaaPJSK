@@ -71,6 +71,49 @@ class SongIdentityTests(unittest.TestCase):
         self.assertFalse(matcher.last_evidence["chart_available"])
         self.assertEqual(actual.level, 0)
 
+    def test_cooperative_title_retry_reads_exact_title_and_still_confirms_actual_badge(self):
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        for badge in (Reading("EASY", .99), Reading("NORMAL", .99), Reading("", 0.)):
+            with self.subTest(badge=badge):
+                matcher = self.matcher((.75, .22))
+                matcher.cooperative_title_grayscale = True
+                matcher.repository.songs[520]["title"] = "ボトルケーキ"
+                matcher.registered_cover = Mock(return_value={"confirmed": False})
+                matcher.read_opening_text = Mock(side_effect=[
+                    Reading("ポトルケーキ", .96), Reading("ボトルケーキ", .96), badge])
+                with patch("project_sekai.song_identity.thumbnail", return_value=np.array([1, 0])):
+                    if badge.text == "EASY":
+                        identity = matcher.match(frame, "easy", "cooperative_final")
+                        self.assertEqual(identity.song_id, 520)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "实际难度不一致"):
+                            matcher.match(frame, "easy", "cooperative_final")
+                self.assertTrue(matcher.read_opening_text.call_args_list[1].kwargs["preserve_grayscale"])
+                self.assertEqual(matcher.last_evidence["initial_title"]["text"], "ポトルケーキ")
+
+    def test_cooperative_title_retry_cannot_accept_another_song_or_an_inexact_reading(self):
+        for alternate in ("限りなく灰色へ", "ボトルクーキ", "ボトル ケーキ"):
+            with self.subTest(alternate=alternate):
+                matcher = self.matcher((.75, .22))
+                matcher.cooperative_title_grayscale = True
+                matcher.repository.songs[520]["title"] = "ボトルケーキ"
+                if alternate == "ボトル ケーキ":
+                    matcher.repository.songs[90]["title"] = alternate
+                matcher.registered_cover = Mock(return_value={"confirmed": False})
+                matcher.read_opening_text = Mock(side_effect=[Reading("ポトルケーキ", .96), Reading(alternate, .99)])
+                with patch("project_sekai.song_identity.thumbnail", return_value=np.array([1, 0])):
+                    with self.assertRaisesRegex(ValueError, "均未确认"):
+                        matcher.match(np.zeros((720, 1280, 3), np.uint8), "easy", "cooperative_final")
+
+    def test_grayscale_opening_retry_preserves_glyph_tones_inside_title_bounds(self):
+        matcher = self.matcher((.75, .22))
+        frame = np.full((40, 80, 3), 64, np.uint8)
+        frame[10:24, 12:24] = 220
+        frame[16:20, 16:20] = 180
+        matcher.read_opening_text(frame, (0, 0, 80, 40), preserve_grayscale=True)
+        processed = matcher.ocr.read.call_args.args[0]
+        self.assertEqual(set(np.unique(processed)), {35, 75, 255})
+
     def test_one_shot_opening_uses_task_difficulty_without_reading_the_badge(self):
         matcher = self.matcher((.95, .45))
         matcher.repository.songs[520]["charts"]["master"] = {"play_level": 31}

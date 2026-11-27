@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
+from itertools import groupby
 import math
 import os
 import time
@@ -10,21 +11,90 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .sus_chart import Chart, Gesture, Point, slide_x, ERASED_SLIDE_GUARD, HIDDEN_SLIDE_FRAGMENT_GUARD
+from .sus_chart import (Chart, Gesture, Point, slide_x, ERASED_SLIDE_GUARD, HIDDEN_SLIDE_FRAGMENT_GUARD,
+                        SUS_EASING_DIRECTION_GUARD, NONJUDGEMENT_SLIDE_GUARD)
 from .opening_head import (trace_opening_head_guard_requested, trace_head_candidates, trace_head_geometry,
                            trace_source_proof, TracePhaseContext, trace_core_mask, trace_projection_scale)
 
-TOUCH_PLAN_VERSION = 8 if HIDDEN_SLIDE_FRAGMENT_GUARD else 6 if ERASED_SLIDE_GUARD else 4
-SLIDE_NODE_TOUCH_PLAN_VERSION = 9 if HIDDEN_SLIDE_FRAGMENT_GUARD else 7 if ERASED_SLIDE_GUARD else 5
-START_ANCHOR_VERSION = 28
+# 隐藏、缓动与接触链合同分别占用版本区间，避免混用旧校准。
+TRACE_CONTACT_CHAIN_GUARD = os.environ.get('MAAPJSK_TRACE_CONTACT_CHAIN_GUARD') == '1'
+TOUCH_PLAN_VERSION = ((10 if NONJUDGEMENT_SLIDE_GUARD else 8 if HIDDEN_SLIDE_FRAGMENT_GUARD
+                       else 6 if ERASED_SLIDE_GUARD else 4) + (8 if SUS_EASING_DIRECTION_GUARD else 0)
+                      + (32 if TRACE_CONTACT_CHAIN_GUARD else 0))
+SLIDE_NODE_TOUCH_PLAN_VERSION = TOUCH_PLAN_VERSION + 1
+GOLD_TAP_PAIR_GUARD = (os.environ.get('MAAPJSK_GOLD_TAP_PAIR_GUARD') == '1'
+                      and os.environ.get('MAAPJSK_GOLD_TAP_HEAD_GUARD') != '0'
+                      and os.environ.get('MAAPJSK_GOLD_TAP_FOLLOWERS_GUARD') != '0')
+GOLD_TAP_SINGLE_FOLLOWER_GUARD = GOLD_TAP_PAIR_GUARD and os.environ.get('MAAPJSK_GOLD_TAP_SINGLE_FOLLOWER_GUARD') == '1'
+START_ANCHOR_VERSION = 30 if GOLD_TAP_SINGLE_FOLLOWER_GUARD else 29 if GOLD_TAP_PAIR_GUARD else 28
+
+
+def _trace_flick_start(gesture: Gesture, busy_until: float, first: Gesture, continuation: bool) -> float:
+    when = max(gesture.end, busy_until + (.001 if continuation else 0))
+    if (continuation and first.kind == 'tap') or (not continuation and first.kind == 'trace'):
+        when = max(when, first.start + .024)
+    return when
+
+
+def _trace_chain_ready_at(chain: list[Gesture]) -> float:
+    busy_until = chain[0].start
+    for index, gesture in enumerate(chain):
+        busy_until = (_trace_flick_start(gesture, busy_until, chain[0], bool(index)) + .024
+                      if gesture.flick else max(busy_until, gesture.end))
+    return busy_until
+
+
+def _trace_contact_owner(chains: list[list[Gesture]], gesture: Gesture) -> list[Gesture] | None:
+    point = gesture.points[0]
+    candidates = []
+    for chain in chains:
+        previous = chain[-1]
+        gap = gesture.start - previous.end
+        if gap < -1e-9 or gap > .125 or (previous.kind == 'trace' and gap <= 1e-9):
+            continue
+        if previous.kind == 'slide' and gap > .035:
+            continue
+        if previous.flick:
+            # 仅连续无方向 TRACE flick 可反向接续；定向滑键及长条尾滑不借用旧触点。
+            if (previous.kind != 'trace' or previous.flick != 1 or gesture.flick != 1
+                    or gap < .024 + 1e-9):
+                continue
+        last = previous.points[-1]
+        if gap <= 1e-9 and round(last.x) != round(point.x):
+            continue
+        local = abs(last.x - point.x) < min(last.width, point.width) * 1000 / 24 - 1
+        cross_lane = ((previous.kind in {'tap', 'trace'} and not previous.flick and not gesture.flick
+                       and gap > .035)
+                      or not local and previous.kind == 'trace' and previous.flick == gesture.flick == 1
+                      and _trace_chain_ready_at(chain) + .001 <= gesture.start)
+        if not (local or cross_lane) or previous.kind not in {'tap', 'trace', 'slide'}:
+            continue
+        first = chain[0]
+        if (first.kind == 'tap' and gesture.start < first.start + .024
+                and round(point.x) != round(first.points[0].x)):
+            continue
+        candidates.append(chain)
+    if not candidates:
+        return None
+    if gesture.flick:
+        return min(candidates, key=lambda chain: (gesture.start - chain[-1].end,
+                                                 abs(point.x - chain[-1].points[-1].x)))
+    return min(candidates, key=lambda chain: gesture.start - chain[-1].end
+               + abs(point.x - chain[-1].points[-1].x) / 5000)
 
 
 def touch_chains(chart: Chart) -> list[list[Gesture]]:
-    gestures = sorted(chart.gestures, key=lambda value: value.start)
+    gestures = sorted(chart.gestures, key=lambda value: (value.start, value.kind == 'trace')
+                      if TRACE_CONTACT_CHAIN_GUARD else (value.start, False))
     chains: list[list[Gesture]] = []
     for index, gesture in enumerate(gestures):
         previous = None
         if gesture.kind == "trace":
+            if TRACE_CONTACT_CHAIN_GUARD:
+                previous = _trace_contact_owner(chains, gesture)
+                if previous is not None:
+                    previous.append(gesture)
+                    continue
             x = gesture.points[0].x
             conflict = False
             for future in gestures[index + 1:]:
@@ -35,7 +105,7 @@ def touch_chains(chart: Chart) -> list[list[Gesture]]:
                         <= point.x + point.width * 1000 / 24):
                     conflict = True
                     break
-            if conflict:
+            if conflict and previous is None:
                 # 轨迹不能用新 DOWN 提前击中下一颗蓝键；延续已经按下的前一触点再移动过去。
                 candidates = [chain for chain in chains if chain[-1].kind in {"tap", "trace"}
                               and not chain[-1].flick and .035 < gesture.start - chain[-1].end <= .35]
@@ -59,7 +129,74 @@ class Touch:
     y: int = 570
 
 
+def _compile_trace_contacts(chart: Chart, *, sample_slide_nodes: bool) -> tuple[Touch, ...]:
+    planned = []
+    for chain in touch_chains(chart):
+        first, last = chain[0], chain[-1]
+        start = first.start - (.018 if first.flick and first.kind == 'tap' else 0)
+        x, y = round(first.points[0].x), 570
+        actions = [(start, 2, 'down', x, y)]
+        busy_until = start
+        tap_dwell_until = first.start + .024 if first.kind == 'tap' else start
+        for index, gesture in enumerate(chain):
+            if gesture.kind == 'slide':
+                count = max(1, math.ceil((gesture.end - gesture.start) / .020))
+                times = [gesture.start + (gesture.end - gesture.start) * step / count for step in range(1, count + 1)]
+                if sample_slide_nodes:
+                    for point in gesture.points:
+                        if (gesture.start < point.time < gesture.end and point.path_node and point.kind != 4
+                                and all(abs(when - point.time) > 1e-9 for when in times)):
+                            times.append(point.time)
+                for when in sorted(times):
+                    x = round(slide_x(gesture.points, when))
+                    actions.append((when, 1, 'move', x, 570))
+                busy_until = gesture.end
+            elif index:
+                target = round(gesture.points[0].x)
+                when = max(gesture.start, busy_until, tap_dwell_until)
+                # 近同刻 TAP 已覆盖 TRACE 时先保留原位置和停留，不在 TAP 尚未完成时移走。
+                if gesture.flick:
+                    # 首段滑动直接进入本音位置，不在同刻插入会被排序到滑动后的回正 MOVE。
+                    x = target
+                elif target != x and when <= gesture.start + 1e-9:
+                    actions.append((when, 1, 'move', target, y))
+                    x = target
+            if gesture.flick:
+                # 独立触点须先稳定接触；1ms会被Native取整和成本补偿吞掉，不能作为游戏采样间隔。
+                when = _trace_flick_start(gesture, busy_until, first, bool(index))
+                base_x, base_y = x, y
+                direction = -1 if gesture.flick in {3, 5} else 1 if gesture.flick in {4, 6} else 0
+                # 无方向连续滑键在原接触范围内交替上下移动，不重按或插入额外回正滑动。
+                vertical = 1 if gesture.flick in {2, 5, 6} or gesture.flick == 1 and base_y < 570 else -1
+                for step in range(1, 4):
+                    x = max(130, min(1150, round(base_x + direction * 35 * step)))
+                    y = base_y + vertical * 28 * step
+                    actions.append((when + .012 * (step - 1), 1, 'move', x, y))
+                busy_until = when + .024
+            else:
+                busy_until = max(busy_until, gesture.end)
+        end = max(last.end + (.050 if last.flick else .030 if last.kind == 'trace' else .024),
+                  busy_until + (.026 if last.flick else 0), tap_dwell_until)
+        actions.append((end, 0, 'up', 0, 570))
+        planned.append((start, end, actions))
+
+    events = []
+    free_after = [-math.inf] * 10
+    for start, end, actions in sorted(planned, key=lambda item: item[0]):
+        possible = [i for i, released in enumerate(free_after) if released < start - .004]
+        if not possible:
+            raise ValueError('谱面需要超过十个并发触点，拒绝开演')
+        contact = min(possible, key=lambda i: free_after[i])
+        free_after[contact] = end
+        events.extend(Touch(when, order, contact, kind, x, y) for when, order, kind, x, y in actions)
+    result = tuple(sorted(events))
+    validate_touches(result)
+    return result
+
+
 def compile_touches(chart: Chart, *, sample_slide_nodes: bool = False) -> tuple[Touch, ...]:
+    if TRACE_CONTACT_CHAIN_GUARD:
+        return _compile_trace_contacts(chart, sample_slide_nodes=sample_slide_nodes)
     events: list[Touch] = []
     free_after = [-math.inf] * 10
     for chain in sorted(touch_chains(chart), key=lambda values: (values[0].start - (.018 if values[0].flick and values[0].kind != "slide" else 0))):
@@ -346,26 +483,26 @@ def gold_tap_mixed_context_guard_requested():
             and os.environ.get('MAAPJSK_GOLD_TAP_FOLLOWERS_GUARD') != '0')
 
 
+def _ordinary_gold_tap(value):
+    if (not isinstance(value, Gesture) or value.kind != 'tap' or value.critical is not True
+            or type(value.flick) is not int or value.flick != 0 or len(value.points) != 1):
+        return False
+    point = value.points[0]
+    return (isinstance(point, Point) and type(point.time) in {int, float} and math.isfinite(point.time)
+            and type(point.kind) is int and point.kind == 2
+            and type(point.lane) is int and type(point.width) is int
+            and 2 <= point.lane < point.lane + point.width <= 14
+            and type(point.direction) is int and point.direction == 0)
+
+
 def gold_tap_mixed_context_eligible(chart, expected_first):
     """只接原单头已可播种、但同轨及异轨金 TAP 后继使旧上下文整份拒绝的窄族。"""
     try:
         if (not isinstance(chart, Chart) or chart.first is not expected_first
                 or sum(value is expected_first for value in chart.gestures) != 1):
             return False
-
-        def ordinary(value):
-            if (not isinstance(value, Gesture) or value.kind != 'tap' or value.critical is not True
-                    or type(value.flick) is not int or value.flick != 0 or len(value.points) != 1):
-                return False
-            point = value.points[0]
-            return (isinstance(point, Point) and type(point.time) in {int, float} and math.isfinite(point.time)
-                    and type(point.kind) is int and point.kind == 2
-                    and type(point.lane) is int and type(point.width) is int
-                    and 2 <= point.lane < point.lane + point.width <= 14
-                    and type(point.direction) is int and point.direction == 0)
-
         first = expected_first
-        if not ordinary(first):
+        if not _ordinary_gold_tap(first):
             return False
         same, mixed, count = False, False, 0
         point = first.points[0]
@@ -389,7 +526,7 @@ def gold_tap_mixed_context_eligible(chart, expected_first):
                     or not 2 <= following.lane < following.lane + following.width <= 14):
                 return False
             if point.lane < following.lane + following.width and following.lane < point.lane + point.width:
-                if not ordinary(value):
+                if not _ordinary_gold_tap(value):
                     return False
                 identical = following.lane == point.lane and following.width == point.width
                 same |= identical
@@ -398,6 +535,109 @@ def gold_tap_mixed_context_eligible(chart, expected_first):
                 and chart_bound_following_geometry(chart, first) is not None)
     except (AttributeError, TypeError, ValueError, IndexError):
         return False
+
+
+@dataclass(frozen=True)
+class GoldTapPairContext:
+    delay: float
+    competing_delays: tuple[float, ...]
+    follower_lane: int | None = None
+
+
+def _attached_green_slide(slide, taps):
+    if slide.kind != 'slide' or slide.critical is not False or type(slide.flick) is not int or slide.flick != 0:
+        return False
+    for index, point in enumerate(slide.points):
+        kinds = {1} if index == 0 else {2} if index == len(slide.points) - 1 else {3, 4, 5}
+        if (not isinstance(point, Point) or type(point.time) not in {int, float} or not math.isfinite(point.time)
+                or index and point.time <= slide.points[index - 1].time
+                or type(point.kind) is not int or point.kind not in kinds
+                or type(point.lane) is not int or type(point.width) is not int
+                or not 2 <= point.lane < point.lane + point.width <= 14
+                or type(point.direction) is not int or point.direction not in range(7)):
+            return False
+    if len(slide.points) < 2 or slide.points[0].direction != 0 or slide.points[-1].direction != 0:
+        return False
+    head = slide.points[0]
+    return any(1e-9 < head.time - tap.time <= .02 and (head.lane, head.width) == (tap.lane, tap.width)
+               for tap in taps)
+
+
+def _gold_tap_single_follower_context(ordered, first, left, right):
+    # 仅认一秒内的单个同形金 TAP；同轨紧随的普通绿长条不充当金色后继。
+    following = [g for g in ordered if first.start + 1e-9 < g.start <= first.start + 1.]
+    gold = [g for g in following if _ordinary_gold_tap(g)]
+    if len(gold) != 1 or len(following) <= 1:
+        return None
+    rear = gold[0].points[0]
+    shape = {(left.lane, left.width), (right.lane, right.width)}
+    if (rear.lane, rear.width) not in shape or not all(
+            g is gold[0] or _attached_green_slide(g, (left, right, rear)) for g in following):
+        return None
+    same_time = {}
+    rear_times = []
+    for note in ordered:
+        if first_note_color(note) == 'gold':
+            point = note.points[0]
+            same_time.setdefault(point.time, set()).add((point.lane, point.width))
+            if (point.lane, point.width) == (rear.lane, rear.width):
+                rear_times.append(point.time)
+    alternatives = set()
+    for when, lanes in same_time.items():
+        if when <= first.start + 1e-9 or not shape <= lanes:
+            continue
+        start = bisect_right(rear_times, when + 1e-9)
+        end = bisect_right(rear_times, when + 1.)
+        alternatives.update(rear_times[index] - when for index in range(start, end))
+        if len(alternatives) > 32:
+            return None
+    return GoldTapPairContext(rear.time - first.start, tuple(sorted(alternatives)), rear.lane)
+
+
+def _gold_tap_pair_context(chart, first):
+    # 两个真实时刻各有两颗分离金 TAP，且第二组重复轨道和宽度，才可证明多芯属于后继。
+    try:
+        if not isinstance(chart, Chart) or chart.first is not first:
+            return None
+        ordered = sorted(chart.gestures, key=lambda gesture: gesture.start)
+        opening = ordered[:5]
+        if len(opening) < 3 or not all(_ordinary_gold_tap(gesture) for gesture in opening[:2]):
+            return None
+        left, right = sorted((gesture.points[0] for gesture in opening[:2]), key=lambda point: point.lane)
+        if abs(left.time - right.time) > 1e-9 or left.lane + left.width >= right.lane or opening[2].start <= right.time + 1e-9:
+            return None
+        if len(opening) < 4 or not all(_ordinary_gold_tap(gesture) for gesture in opening[2:4]):
+            if GOLD_TAP_SINGLE_FOLLOWER_GUARD:
+                return _gold_tap_single_follower_context(ordered, first, left, right)
+            return None
+        rear_left, rear_right = sorted((gesture.points[0] for gesture in opening[2:4]), key=lambda point: point.lane)
+        delay = rear_left.time - first.start
+        if (not 1e-9 < delay <= 1. or abs(rear_left.time - rear_right.time) > 1e-9
+                or len(opening) == 5 and not opening[4].start > rear_left.time + 1e-9):
+            return None
+        shape = {(left.lane, left.width), (right.lane, right.width)}
+        if shape != {(rear_left.lane, rear_left.width), (rear_right.lane, rear_right.width)}:
+            return None
+        # 整谱后段的同形重复也可能解释画面，不能仅用首后一秒内的后继排除它。
+        pair_times = []
+        for when, notes in groupby(ordered, key=lambda gesture: gesture.start):
+            if when <= first.start + 1e-9:
+                continue
+            lanes = {(note.points[0].lane, note.points[0].width) for note in notes if _ordinary_gold_tap(note)}
+            if shape <= lanes:
+                pair_times.append(when)
+        competing_delays = set()
+        for index, when in enumerate(pair_times):
+            for later in range(index + 1, len(pair_times)):
+                interval = pair_times[later] - when
+                if interval > 1.:
+                    break
+                competing_delays.add(interval)
+                if len(competing_delays) > 32:
+                    return None
+        return GoldTapPairContext(delay, tuple(sorted(competing_delays)))
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return None
 
 
 class FirstHeadOutsideWindow(RuntimeError):
@@ -854,8 +1094,11 @@ def chart_bound_following_geometry(chart, first, *, trace_heads=False):
 class ChartBoundHeadTracker:
     """候选只产生真实首头测量；未知不回旧检测器，跨帧不保存source label。"""
 
-    def __init__(self, chart, first, *, trace_heads=False):
+    def __init__(self, chart, first, *, trace_heads=False, pair_context=None):
         self.trace_heads = trace_heads
+        self.pair_context = pair_context
+        self.repeated_pair_y = None
+        self.repeated_pair_confirmed = False
         self.groups = chart_bound_head_groups(chart, first, include_trace=trace_heads)
         self.primary = next((index for index, group in enumerate(self.groups)
                              if any(value is first for value in group)), 0)
@@ -900,6 +1143,7 @@ class ChartBoundHeadTracker:
 
     def measure(self, frame, baseline):
         self.current_heads = ()
+        self.repeated_pair_y = None
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         original = cv2.cvtColor(baseline, cv2.COLOR_BGR2HSV).astype(np.int16)
         hue = np.abs(hsv[:, :, 0].astype(np.int16) - original[:, :, 0])
@@ -1095,7 +1339,7 @@ class ChartBoundHeadTracker:
                        if any(abs(a[0] - b[0]) > max(3, 2 * max(a[1], b[1])) for a in depths for b in depths)}
         unknown.extend(record['y'] for record in records if record['source'] in bad_sources)
         records = [record for record in records if record['source'] not in bad_sources]
-        fronts = []
+        fronts, rears = [], {}
         for index, group in enumerate(self.groups):
             rows = []
             for record in sorted((value for value in records if value['group'] == index), key=lambda value: value['y']):
@@ -1131,14 +1375,38 @@ class ChartBoundHeadTracker:
                     25, 2 * max(complete[-1]['height'], complete[-2]['height'])):
                 return None, unknown
             fronts.append(complete[-1])
+            if self.pair_context is not None and len(complete) == 2:
+                rears[index] = complete[0]
         if any(abs(value['y'] - fronts[self.primary]['y']) > 3 for value in fronts):
             return None, unknown
         # 有间隙的子组必须来自独立真实分量；不能将跨间隙的连线当成宽横头。
         if any(left['sources'] & right['sources'] for index, left in enumerate(fronts) for right in fronts[index + 1:]):
             return None, unknown
+        if rears:
+            sources = set().union(*(row['sources'] for row in (*fronts, *rears.values())))
+            lane = self.pair_context.follower_lane
+            if lane is None and len(rears) == 2 and len(sources) == 4 and abs(rears[0]['y'] - rears[1]['y']) <= 3:
+                self.repeated_pair_y = rears[self.primary]['y']
+            elif lane is not None and len(rears) == 1 and len(sources) == 3:
+                index, rear = next(iter(rears.items()))
+                if self.groups[index][0].points[0].lane == lane:
+                    self.repeated_pair_y = rear['y']
         self.current_heads = tuple(value for front in fronts for value in front['heads'])
         self.measurement['measured_y'] = fronts[self.primary]['y']
         return fronts[self.primary]['y'], unknown
+
+    def _repeat_matches(self, captured_at, delay):
+        # 只用真实首头历史核对后组时差。超出已知轨迹时，只能用单调性排除竞争，不能补认。
+        earlier_at = captured_at - delay
+        index = bisect_left(self.motion, (earlier_at, -math.inf))
+        if index == 0:
+            return False if self.repeated_pair_y > self.motion[0][1] + 3 else None
+        if index == len(self.motion):
+            return False if self.repeated_pair_y < self.motion[-1][1] - 3 else None
+        left_time, left_y = self.motion[index - 1]
+        right_time, right_y = self.motion[index]
+        expected_y = left_y + (right_y - left_y) * (earlier_at - left_time) / (right_time - left_time)
+        return abs(self.repeated_pair_y - expected_y) <= 3
 
     def observe(self, frame, baseline, captured_at):
         if not self.groups or self.lost:
@@ -1277,6 +1545,9 @@ class ChartBoundHeadTracker:
                     # 身份暂不唯一只等待新证据；不采样、不续期，持续歧义仍由原连续性期限拒绝。
                     self.status = 'motion_identity_ambiguous'
                     return None
+        if self.motion and self.repeated_pair_y is not None and not self.repeated_pair_confirmed:
+            self.repeated_pair_confirmed = (self._repeat_matches(captured_at, self.pair_context.delay) is True
+                and all(self._repeat_matches(captured_at, other) is False for other in self.pair_context.competing_delays))
         self.motion.append((captured_at, y))
         self.status = 'tracking'
         return y
@@ -1369,6 +1640,18 @@ class StartAnchor:
             and not self.chart_bound_head_guard
             and gold_tap_mixed_context_eligible(gold_tap_context_chart, gesture))
         self.legacy_first_head_seed = False
+        self.gold_tap_pair_guard = False
+        self.gold_tap_single_follower_guard = False
+        if (GOLD_TAP_PAIR_GUARD and self.gold_tap_head_guard and self.gold_tap_followers_guard
+                and not self.gold_tap_mixed_context_guard and self.chart_bound_tracker is None
+                and not self.gold_tap_following_gestures):
+            pair_context = _gold_tap_pair_context(gold_tap_context_chart, gesture)
+            if pair_context is not None:
+                tracker = ChartBoundHeadTracker(gold_tap_context_chart, gesture, pair_context=pair_context)
+                if len(tracker.groups) == 2 and tracker.following_geometry is not None and len(tracker.following_geometry) <= 32:
+                    self.chart_bound_tracker = tracker
+                    self.gold_tap_pair_guard = True
+                    self.gold_tap_single_follower_guard = pair_context.follower_lane is not None
         if self.gold_tap_mixed_context_guard:
             self.chart_bound_tracker = ChartBoundHeadTracker(gold_tap_context_chart, gesture, trace_heads=False)
         # 本局创建时冻结保护设置；明确主开关优先，兼容旧试验开关，空值不关闭默认保护。
@@ -1404,8 +1687,9 @@ class StartAnchor:
             raise RuntimeError("首音轨迹未通过同步门槛且等待超时，拒绝从歌曲中途开始")
         try:
             slide_evidence = {}
+            legacy_seed_required = self.gold_tap_mixed_context_guard or self.gold_tap_pair_guard
             if self.chart_bound_tracker is not None:
-                if self.gold_tap_mixed_context_guard and not self.chart_bound_tracker.motion:
+                if legacy_seed_required and not self.chart_bound_tracker.motion:
                     if self.chart_bound_tracker.lost:
                         raise RuntimeError('真实首头播种已拒绝，禁止由后继重新播种')
                     legacy_y = first_note_y(frame, self.gesture, self.baseline,
@@ -1428,7 +1712,7 @@ class StartAnchor:
                     else:
                         return None
                 y = self.chart_bound_tracker.observe(frame, self.baseline, captured_at)
-                if self.gold_tap_mixed_context_guard and self.chart_bound_tracker.motion:
+                if legacy_seed_required and self.chart_bound_tracker.motion:
                     self.legacy_first_head_seed = True
                 self.observation = dict(self.chart_bound_tracker.measurement)
                 self.observation['reason'] = self.chart_bound_tracker.status + ':' + self.observation.get('reason', 'unknown')
@@ -1448,7 +1732,7 @@ class StartAnchor:
                 self.observation.update(reason='legacy_candidate' if y is not None else self.observation['reason'], measured_y=y)
         except FirstHeadOutsideWindow:
             self.failure_reason = "first_head_outside_window"
-            if self.gold_tap_mixed_context_guard:
+            if self.gold_tap_mixed_context_guard or self.gold_tap_pair_guard:
                 self.chart_bound_tracker.lost = True
                 self.chart_bound_tracker.status = 'first_head_outside_window'
             raise
@@ -1476,6 +1760,8 @@ class StartAnchor:
                 # 小幅倒退不是向下运动，也不延长候选期限；已建立轨迹始终不能重置。
                 return None
         self.samples.append((captured_at, y))
+        if self.gold_tap_pair_guard and not self.chart_bound_tracker.repeated_pair_confirmed:
+            return None
         if slide_context_active:
             self.gold_tap_slide_pair_confirmed |= bool(slide_evidence.get("pair_confirmed"))
             # 初始迟到只看到后继时不能假定它是首 TAP；完整双芯关系成立前只积累原轨迹。
@@ -1526,6 +1812,10 @@ class StartAnchor:
             self.fit['chart_bound_head_guard'] = self.chart_bound_head_guard
             self.fit['trace_opening_head_guard'] = self.trace_opening_head_guard
             self.fit['gold_tap_mixed_context_guard'] = self.gold_tap_mixed_context_guard
+            if self.gold_tap_pair_guard:
+                self.fit['gold_tap_pair_guard'] = True
+                if self.gold_tap_single_follower_guard:
+                    self.fit['gold_tap_single_follower_guard'] = True
             self.fit['legacy_first_head_seed'] = self.legacy_first_head_seed
             if self.gold_tap_slide_follower_guard:
                 self.fit["gold_tap_slide_follower_guard"] = True
@@ -1628,6 +1918,10 @@ class StartAnchor:
         self.fit['chart_bound_head_guard'] = self.chart_bound_head_guard
         self.fit['trace_opening_head_guard'] = self.trace_opening_head_guard
         self.fit['gold_tap_mixed_context_guard'] = self.gold_tap_mixed_context_guard
+        if self.gold_tap_pair_guard:
+            self.fit['gold_tap_pair_guard'] = True
+            if self.gold_tap_single_follower_guard:
+                self.fit['gold_tap_single_follower_guard'] = True
         self.fit['legacy_first_head_seed'] = self.legacy_first_head_seed
         if self.gold_tap_slide_follower_guard:
             self.fit["gold_tap_slide_follower_guard"] = True

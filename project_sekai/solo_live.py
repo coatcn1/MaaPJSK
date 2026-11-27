@@ -38,6 +38,18 @@ SEARCH_NATIVE_QUERY_BOX = (12, 642, 460, 696)
 
 def settlement_loading(frame):
     # 固定八槽转圈可出现在暗色 TIPS 和白蓝渐变上；文字散点不能仅凭数量冒充加载。
+def confirm_native_startup_margin(epoch, first_time, offset_ms, report):
+    # 按实际首条触控和当前时钟检查交接，计入首 Flick 提前量和冻结的手动偏移。
+    first_target = float(epoch + first_time + offset_ms / 1000)
+    checked_at = time.perf_counter()
+    remaining = float(first_target - checked_at)
+    report["startup_handoff"] = {"first_target_s": first_target, "checked_at_s": checked_at,
+                                 "remaining_ms": remaining * 1000, "required_margin_ms": 80.,
+                                 "accepted": remaining >= .080}
+    if remaining < .080:
+        raise RuntimeError("首音实际启动余量不足，拒绝从歌曲中途开始")
+
+
     crop = cv2.cvtColor(frame[618:710, 1185:1269], cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(crop, (0, 0, 235), (179, 50, 255))
     slots = ((36, 15), (56, 23), (64, 43), (56, 63),
@@ -798,7 +810,7 @@ class SoloLive:
                        "legacy_first_head_seed": getattr(anchor, "legacy_first_head_seed", False) is True}
             tracker_status = getattr(getattr(anchor, 'chart_bound_tracker', None), 'status', None)
             if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']
-                    or attempt['gold_tap_mixed_context_guard']) and isinstance(tracker_status, str):
+                    or attempt['gold_tap_mixed_context_guard'] or attempt['gold_tap_pair_guard']) and isinstance(tracker_status, str):
                 attempt['chart_bound_head_status'] = tracker_status
             if failed:
                 reason = getattr(anchor, "failure_reason", None)
@@ -813,6 +825,8 @@ class SoloLive:
 
         def save_anchor_frames():
             # 开场尚未释放Native；这里只冻结引用，统一由run清理后的证据阶段编码。
+                       "gold_tap_pair_guard": getattr(anchor, "gold_tap_pair_guard", False) is True,
+                       "gold_tap_single_follower_guard": getattr(anchor, "gold_tap_single_follower_guard", False) is True,
             self.anchor_frames = retained_anchor_frames()
 
         frame = None
@@ -937,17 +951,12 @@ class SoloLive:
                     self.anchor_frames = retained_anchor_frames()
                     if native_start_target is not None:
                         first_time, frozen_offset_ms = native_start_target
-                        first_target = float(epoch + first_time + frozen_offset_ms / 1000)
-                        checked_at = time.perf_counter()
-                        # 拟合可能返回 NumPy 标量；正式报告须保留 JSON 可序列化的 Python 数值和布尔值。
-                        remaining = float(first_target - checked_at)
-                        report["startup_handoff"] = {"first_target_s": first_target, "checked_at_s": checked_at,
-                            "remaining_ms": remaining * 1000, "required_margin_ms": 80., "accepted": bool(remaining >= .080)}
-                        # 拟合时的请求开始时间不能证明当前仍可启动；负偏移及首 Flick 提前量都包含在真实首条目标中。
-                        if remaining < .080:
+                        try:
+                            confirm_native_startup_margin(epoch, first_time, frozen_offset_ms, report)
+                        except RuntimeError:
                             anchor.failure_reason = "native_start_handoff_margin"
                             update_anchor_attempt(failed=True)
-                            raise RuntimeError("首音实际启动余量不足，拒绝从歌曲中途开始")
+                            raise
                     # MFA 日志的嵌套任务会阻塞调度；开场临界区只写进程日志和报告。
                     print(f"第一音锚点已建立，按本地谱面派发 {len(chart.gestures)} 个手势", flush=True)
                     return epoch
