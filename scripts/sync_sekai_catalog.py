@@ -20,6 +20,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--no-fallback", action="store_true", help="仅使用主源资源，关闭主源缺失时的 Sbuga 备用下载")
     refresh_mode = parser.add_mutually_exclusive_group()
     refresh_mode.add_argument("--check-recent", action="store_true", help="联网检查近三个月的资源，未变资源使用 HTTP 条件缓存")
     refresh_mode.add_argument("--force", action="store_true", help="显式强制重新获取所有资源，包括三个月以前的资源，不使用条件缓存")
@@ -40,6 +41,7 @@ def main() -> int:
     try:
         manifest = sync_catalog(args.output_root, client=HttpClient(timeout=args.timeout, retries=args.retries),
                                 workers=args.workers, force=args.force, check_recent=args.check_recent,
+                                use_fallback=not args.no_fallback,
                                 difficulties=tuple(args.difficulties),
                                 song_ids=tuple(args.song_ids) if args.song_ids else None,
                                 progress=lambda message: print(message, flush=True))

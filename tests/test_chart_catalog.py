@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from project_sekai.chart_catalog import (
-    ASSET_ROOT, GIT_REFS_URL, MASTER_ROOT, ChartRepository, HttpClient, HttpResult,
+    ASSET_ROOT, FALLBACK_ASSET_ROOT, GIT_REFS_URL, MASTER_ROOT, ChartRepository, HttpClient, HttpResult,
     _write_atomic, catalog_lock, sync_catalog, validate_sus,
 )
 
@@ -64,7 +64,7 @@ class FakeClient:
     def get(self, url: str, *, etag: str = "", **_kwargs) -> HttpResult:
         with self.lock:
             self.requests.append((url, etag))
-            resource = self.resources[url]
+            resource = self.resources.get(url, HTTPError(url, 404, "missing", {}, None))
         if isinstance(resource, Exception):
             raise resource
         body, content_type, remote_etag = resource
@@ -85,6 +85,12 @@ class ChartCatalogTests(unittest.TestCase):
     def sync(self, **kwargs):
         return sync_catalog(self.root, client=self.client, workers=2, **kwargs)
 
+    def missing_with_fallback(self, url: str, *, code: int = 404) -> str:
+        fallback = FALLBACK_ASSET_ROOT + url.removeprefix(ASSET_ROOT)
+        self.client.resources[fallback] = self.client.resources[url]
+        self.client.resources[url] = HTTPError(url, code, "missing", {}, None)
+        return fallback
+
     def test_full_catalog_only_fetches_published_existing_difficulties_from_one_revision(self) -> None:
         manifest = self.sync()
         summary = manifest["summary"]
@@ -95,6 +101,208 @@ class ChartCatalogTests(unittest.TestCase):
         self.assertFalse(any("append.txt" in url or "0003_01" in url for url, _ in self.client.requests))
         self.assertTrue(any("jacket_s_009/jacket_s_009.png" in url for url, _ in self.client.requests))
         self.assertTrue(any("0001_01/master.txt" in url for url, _ in self.client.requests))
+        self.assertFalse(any(url.startswith(FALLBACK_ASSET_ROOT) for url, _ in self.client.requests))
+        self.assertEqual(summary["fallback_assets"], 0)
+
+    def test_missing_chart_and_gone_jacket_use_validated_fallback_with_actual_source(self) -> None:
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        jacket = f"{ASSET_ROOT}/music/jacket/jacket_s_009/jacket_s_009.png"
+        fallback_jacket = self.missing_with_fallback(jacket, code=410)
+        manifest = self.sync()
+        self.assertEqual(manifest["source"]["fallback_asset_roots"], [FALLBACK_ASSET_ROOT])
+        self.assertEqual(manifest["summary"]["recoverable_errors"], 0)
+        self.assertEqual(manifest["summary"]["fallback_assets"], 2)
+        song = manifest["songs"][0]
+        self.assertEqual(song["charts"]["master"]["source_url"], fallback)
+        self.assertEqual(song["jacket"]["source_url"], fallback_jacket)
+        self.assertEqual(song["jacket"]["width"], 16)
+        for source, backup in [(primary, fallback), (jacket, fallback_jacket)]:
+            self.assertLess(self.client.requests.index((source, "")), self.client.requests.index((backup, "")))
+        with patch("project_sekai.chart_catalog.urlopen", side_effect=AssertionError("离线读取不能联网")):
+            self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), SUS.decode())
+
+    def test_fallback_warm_incremental_does_not_request_read_or_rewrite_assets(self) -> None:
+        self.missing_with_fallback(self.client.chart_url(1))
+        self.sync()
+        self.client.requests.clear()
+        read_bytes = Path.read_bytes
+        replace = os.replace
+
+        def read(path):
+            self.assertNotIn(path.suffix, {".sus", ".png"})
+            return read_bytes(path)
+
+        def write(source, target):
+            self.assertNotEqual(Path(target).parent.name, ".cache")
+            return replace(source, target)
+
+        with patch.object(Path, "read_bytes", read), patch("project_sekai.chart_catalog.os.replace", write):
+            manifest = self.sync()
+        self.assertEqual(manifest["summary"]["reused"], 5)
+        self.assertEqual(manifest["summary"]["fallback_assets"], 1)
+        self.assertFalse(any(url.startswith((ASSET_ROOT, FALLBACK_ASSET_ROOT)) for url, _ in self.client.requests))
+
+    def test_fallback_conditional_headers_stay_with_origin_and_primary_can_recover(self) -> None:
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        self.sync()
+        self.client.requests.clear()
+        manifest = self.sync(check_recent=True)
+        self.assertIn((primary, ""), self.client.requests)
+        self.assertIn((fallback, "sus-v1"), self.client.requests)
+        self.assertEqual(manifest["summary"]["unchanged"], 5)
+        self.client.resources[primary] = (CHANGED_SUS, "text/plain", "primary-v2")
+        self.client.requests.clear()
+        manifest = self.sync(check_recent=True)
+        self.assertEqual(manifest["songs"][0]["charts"]["master"]["source_url"], primary)
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), CHANGED_SUS.decode())
+        self.assertEqual(manifest["summary"]["fallback_assets"], 0)
+        self.assertIn((primary, ""), self.client.requests)
+        self.assertFalse(any(url == fallback for url, _ in self.client.requests))
+
+    def test_fallback_does_not_mask_permission_network_or_format_errors(self) -> None:
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        failures = [HTTPError(primary, code, "failure", {}, None) for code in (403, 429, 500)]
+        failures += [TimeoutError("network"), (b"<html>error</html>", "text/html", "bad"),
+                     (b"not sus", "text/plain", "bad")]
+        for resource in failures:
+            with self.subTest(resource=resource):
+                self.client.resources[primary] = resource
+                self.client.requests.clear()
+                manifest = self.sync()
+                self.assertNotIn("master", manifest["songs"][0]["charts"])
+                self.assertEqual(manifest["summary"]["recoverable_errors"], 1)
+                self.assertFalse(any(url == fallback for url, _ in self.client.requests))
+
+    def test_primary_304_cannot_validate_a_fallback_file(self) -> None:
+        primary = self.client.chart_url(1)
+        self.missing_with_fallback(primary)
+        self.sync()
+        get = self.client.get
+
+        def invalid_not_modified(url, **kwargs):
+            return HttpResult(304, b"") if url == primary else get(url, **kwargs)
+
+        with patch.object(self.client, "get", invalid_not_modified):
+            manifest = self.sync(check_recent=True)
+        self.assertEqual(manifest["summary"]["stale"], 1)
+        self.assertIn("没有已校验", manifest["songs"][0]["errors"][0]["message"])
+
+    def test_fallback_last_modified_header_is_not_sent_to_primary(self) -> None:
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        get = self.client.get
+        modified = "Sat, 31 Oct 2026 02:54:55 GMT"
+
+        def without_etag(url, **kwargs):
+            if url == fallback:
+                return HttpResult(200, SUS, "text/plain", last_modified=modified)
+            return get(url, **kwargs)
+
+        with patch.object(self.client, "get", without_etag):
+            self.sync()
+        with patch.object(self.client, "get", wraps=without_etag) as requests:
+            self.sync(check_recent=True)
+        calls = {call.args[0]: call.kwargs for call in requests.call_args_list}
+        self.assertEqual(calls[primary]["last_modified"], "")
+        self.assertEqual(calls[fallback]["last_modified"], modified)
+
+    def test_failed_fallback_keeps_old_file_and_retries_instead_of_reusing_stale_cache(self) -> None:
+        self.sync()
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        self.client.resources[fallback] = HTTPError(fallback, 404, "missing", {}, None)
+        failed = self.sync(check_recent=True)
+        self.assertEqual(failed["summary"]["stale"], 1)
+        message = failed["songs"][0]["errors"][0]["message"]
+        self.assertIn(primary, message)
+        self.assertIn(fallback, message)
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), SUS.decode())
+        self.client.resources[fallback] = (CHANGED_SUS, "text/plain", "fallback-v2")
+        self.client.requests.clear()
+        recovered = self.sync()
+        self.assertEqual(recovered["summary"]["stale"], 0)
+        self.assertEqual(recovered["summary"]["recoverable_errors"], 0)
+        self.assertIn((fallback, ""), self.client.requests)
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), CHANGED_SUS.decode())
+
+    def test_corrupt_fallback_file_is_redownloaded_without_conditional_headers(self) -> None:
+        fallback = self.missing_with_fallback(self.client.chart_url(1))
+        manifest = self.sync()
+        (self.root / manifest["songs"][0]["charts"]["master"]["path"]).write_bytes(CHANGED_SUS)
+        self.client.requests.clear()
+        self.assertEqual(self.sync()["summary"]["recoverable_errors"], 0)
+        self.assertIn((fallback, ""), self.client.requests)
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), SUS.decode())
+
+    def test_invalid_fallback_body_is_rejected_and_keeps_verified_old_version(self) -> None:
+        self.sync()
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        for body, content_type in [(b"<html>error</html>", "text/html"), (b"not sus", "text/plain")]:
+            with self.subTest(content_type=content_type):
+                self.client.resources[fallback] = (body, content_type, "bad")
+                manifest = self.sync(check_recent=True)
+                self.assertEqual(manifest["summary"]["stale"], 1)
+                self.assertIn(fallback, manifest["songs"][0]["errors"][0]["message"])
+                self.assertEqual(manifest["songs"][0]["charts"]["master"]["source_url"], primary)
+                self.assertEqual(ChartRepository(self.root).load_chart(1, "master"), SUS.decode())
+
+    def test_cancel_between_sources_keeps_manifest_and_does_not_request_fallback(self) -> None:
+        self.sync()
+        previous = (self.root / "manifest.json").read_bytes()
+        primary = self.client.chart_url(1)
+        fallback = self.missing_with_fallback(primary)
+        stop = threading.Event()
+        get = self.client.get
+
+        def cancel_on_missing(url, **kwargs):
+            try:
+                return get(url, **kwargs)
+            except HTTPError:
+                if url == primary:
+                    stop.set()
+                raise
+
+        self.client.requests.clear()
+        with patch.object(self.client, "get", cancel_on_missing), self.assertRaises(InterruptedError):
+            self.sync(check_recent=True, stop_requested=stop.is_set)
+        self.assertEqual((self.root / "manifest.json").read_bytes(), previous)
+        self.assertFalse(any(url == fallback for url, _ in self.client.requests))
+
+    def test_cancel_after_fallback_download_resumes_receipt_without_replacing_manifest(self) -> None:
+        self.sync()
+        previous = (self.root / "manifest.json").read_bytes()
+        primary = self.client.chart_url(1, "expert")
+        fallback = self.missing_with_fallback(primary)
+        self.client.resources[fallback] = (CHANGED_SUS, "text/plain", "fallback-v2")
+        metadata = self.client.index("musicDifficulties")
+        metadata[0]["playLevel"] = 26
+        self.client.set_index("musicDifficulties", metadata)
+        stop = threading.Event()
+        self.client.after_get = lambda url: stop.set() if url == fallback else None
+        with self.assertRaises(InterruptedError):
+            self.sync(stop_requested=stop.is_set)
+        self.assertEqual((self.root / "manifest.json").read_bytes(), previous)
+        self.client.after_get = lambda _url: None
+        self.client.requests.clear()
+        manifest = self.sync()
+        self.assertFalse(any(url in (primary, fallback) for url, _ in self.client.requests))
+        self.assertEqual(manifest["summary"]["fallback_assets"], 1)
+        self.assertEqual(ChartRepository(self.root).load_chart(1, "expert"), CHANGED_SUS.decode())
+
+    def test_explicit_disable_and_custom_source_do_not_use_builtin_fallback(self) -> None:
+        fallback = self.missing_with_fallback(self.client.chart_url(1))
+        manifest = self.sync(use_fallback=False)
+        self.assertEqual(manifest["source"]["fallback_asset_roots"], [])
+        self.assertNotIn("master", manifest["songs"][0]["charts"])
+        self.assertFalse(any(url == fallback for url, _ in self.client.requests))
+        self.client.requests.clear()
+        manifest = self.sync(asset_root="https://custom.invalid/jp")
+        self.assertEqual(manifest["source"]["fallback_asset_roots"], [])
+        self.assertFalse(any(url.startswith(FALLBACK_ASSET_ROOT) for url, _ in self.client.requests))
 
     def test_incremental_update_reuses_verified_files_without_asset_requests_and_loads_offline(self) -> None:
         first = self.sync()
@@ -493,6 +701,15 @@ class ChartCatalogTests(unittest.TestCase):
 
 
 class ChartSyncCliTests(unittest.TestCase):
+    def test_no_fallback_flag_is_forwarded_to_sync(self) -> None:
+        from scripts import sync_sekai_catalog as script
+        for args, expected in [([], True), (["--no-fallback"], False)]:
+            with self.subTest(args=args), patch("sys.argv", ["sync", *args]), \
+                    patch.object(script, "sync_catalog", return_value={"summary": {"recoverable_errors": 0}}) as sync, \
+                    patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(script.main(), 0)
+                self.assertEqual(sync.call_args.kwargs["use_fallback"], expected)
+
     def test_completion_summary_is_bound_to_this_run_and_exit_code(self) -> None:
         from scripts import sync_sekai_catalog as script
         for error_count, expected in [(0, 0), (12, 2)]:
