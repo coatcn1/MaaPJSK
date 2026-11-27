@@ -50,7 +50,7 @@ $current = @(Get-CimInstance Win32_Process -Filter "Name = 'MaaBanGDream.exe' OR
 })
 if ($current.Count -gt 0) {
     if ($StageOnly) { throw 'MaaPJSK 的 MFA 已运行；请先停止任务并关闭程序后重新部署。' }
-    Write-Host 'MaaPJSK MFA 已在运行。'
+    Write-Host 'MaaPJSK MFA 已在运行，本次未重新部署。应用源码修改请先停止任务并关闭程序，再运行同一启动命令。'
     return
 }
 
@@ -210,6 +210,19 @@ if ($VerifyAdbEndpoint) {
     }
 }
 if ($StageOnly) { return }
+
+# 开发版统一入口携带本次待验收的谱面修复；只影响子进程，不修改系统环境或用户配置。
+# 保留显式 0 供排障回退，正常启动无需额外参数或专用包装脚本。
+if ($env:MAAPJSK_SUS_EASING_DIRECTION_GUARD -ne '0') { $env:MAAPJSK_SUS_EASING_DIRECTION_GUARD = '1' }
+if ($env:MAAPJSK_NONJUDGEMENT_SLIDE_GUARD -ne '0') { $env:MAAPJSK_NONJUDGEMENT_SLIDE_GUARD = '1' }
+if ($env:MAAPJSK_TRACE_CONTACT_CHAIN_GUARD -ne '0') { $env:MAAPJSK_TRACE_CONTACT_CHAIN_GUARD = '1' }
+if ($env:MAAPJSK_COOPERATIVE_TITLE_GRAYSCALE -ne '0') { $env:MAAPJSK_COOPERATIVE_TITLE_GRAYSCALE = '1' }
+if ($env:MAAPJSK_GOLD_TAP_PAIR_GUARD -ne '0') { $env:MAAPJSK_GOLD_TAP_PAIR_GUARD = '1' }
+if ($env:MAAPJSK_GOLD_TAP_SINGLE_FOLLOWER_GUARD -ne '0') { $env:MAAPJSK_GOLD_TAP_SINGLE_FOLLOWER_GUARD = '1' }
+$easingStatus = if ($env:MAAPJSK_SUS_EASING_DIRECTION_GUARD -eq '1') { '开启' } else { '回退' }
+$hiddenChainStatus = if ($env:MAAPJSK_NONJUDGEMENT_SLIDE_GUARD -eq '1') { '开启' } else { '回退' }
+$traceContactStatus = if ($env:MAAPJSK_TRACE_CONTACT_CHAIN_GUARD -eq '1') { '开启' } else { '回退' }
+Write-Host "本次开发版启动：SUS 缓动/滑键分离=$easingStatus；无判定隐藏链修复=$hiddenChainStatus；TRACE 接触链=$traceContactStatus。"
 
 $env:PATH = "$(Split-Path -Parent $Python);$env:PATH"
 $env:MAAPJSK_TEMPLATE_CONFIG = Join-Path $targetRoot 'config\maapjsk-templates.json'

@@ -6,14 +6,14 @@ from unittest.mock import Mock
 
 import numpy as np
 
-from project_sekai.game_login import GameLogin, title_menu_ready
+from project_sekai.game_login import GameLogin
 from project_sekai.ocr import Reading
 
 
 class LoginDevice:
-    def __init__(self, state=1, *, foreground=True, destination=2, menu_ready=True):
+    def __init__(self, state=1, *, foreground=True, destination=2):
         self.state, self.is_foreground = state, foreground
-        self.destination, self.menu_ready = destination, menu_ready
+        self.destination = destination
         self.preflight, self.events = Mock(), []
         self.shell = Mock(side_effect=self._shell)
 
@@ -31,9 +31,13 @@ class LoginDevice:
     def screenshot(self):
         frame = np.full((720, 1280, 3), 255, np.uint8)
         frame[0, 0] = self.state
-        if self.menu_ready:
+        if self.state == 6:
             for y in (32, 43, 54):
                 frame[y:y + 3, 1226:1248] = 70
+        if self.state == 5:
+            for x1, y1, x2, y2 in ((1049, 31, 1053, 49), (1055, 25, 1063, 56), (1070, 20, 1082, 62)):
+                frame[y1:y2, x1:x2] = (226, 176, 8)
+            frame[26:51, 1116:1144] = (170, 95, 34)
         return frame
 
     def tap(self, x, y):
@@ -106,10 +110,10 @@ class GameLoginTests(unittest.TestCase):
         self.assertEqual(report['title_requests'], 1)
         self.assertTrue(all('force-stop' not in call.args[0] for call in device.shell.call_args_list))
 
-    def test_unready_title_or_managed_blank_times_out_without_any_click(self):
-        for state, menu_ready in ((1, False), (0, True)):
+    def test_unconfirmed_page_or_managed_blank_times_out_without_any_click(self):
+        for state in (6, 0):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
-                workflow, device, clock = self.workflow(Path(directory), state=state, menu_ready=menu_ready)
+                workflow, device, clock = self.workflow(Path(directory), state=state)
                 with self.assertRaisesRegex(TimeoutError, '60 秒'):
                     workflow.run(wait_for_home=True)
                 self.assertEqual(device.events, [])
@@ -160,10 +164,16 @@ class GameLoginTests(unittest.TestCase):
                 workflow.run(wait_for_home=True)
             self.assertEqual(device.events, [])
 
-    def test_menu_shape_alone_never_means_title_or_clicks_menu(self):
+    def test_title_branding_recognizes_login_without_old_template_or_menu_icon(self):
         with tempfile.TemporaryDirectory() as directory:
-            workflow, device, _ = self.workflow(Path(directory), state=0)
-            self.assertTrue(title_menu_ready(device.screenshot()))
+            workflow, device, _ = self.workflow(Path(directory), state=5)
+            report = workflow.run()
+        self.assertEqual(report['phase'], 'home_confirmed')
+        self.assertEqual(device.events, [('tap', (640, 620))])
+
+    def test_in_game_menu_with_three_bars_never_starts_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, device, _ = self.workflow(Path(directory), state=6)
             report = workflow.run()
         self.assertEqual(report['phase'], 'already_running')
         self.assertEqual(device.events, [])

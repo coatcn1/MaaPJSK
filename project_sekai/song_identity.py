@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
+import os
 from pathlib import Path
 import unicodedata
 
@@ -88,6 +90,7 @@ class SongMatcher:
     def __init__(self, repository: ChartRepository, ocr: LineOcr) -> None:
         self.repository = repository
         self.ocr = ocr
+        self.cooperative_title_grayscale = os.environ.get("MAAPJSK_COOPERATIVE_TITLE_GRAYSCALE") == "1"
         self.ids, features = [], []
         for song_id, song in repository.songs.items():
             jacket = song.get("jacket")
@@ -175,7 +178,18 @@ class SongMatcher:
                      and .65 <= area <= 1.45 and coverage >= .2)
         return dict(result, confirmed=bool(confirmed), inliers=count, inlier_ratio=ratio, coverage=coverage)
 
-    def identify(self, jacket: np.ndarray, title: Reading, phase: str) -> tuple[int, float, float, float]:
+    def _match_title(self, reading: Reading) -> dict:
+        titles = sorted(((title_score(reading.text, song["title"]), song_id)
+                         for song_id, song in self.repository.songs.items()), reverse=True)
+        score, title_id = titles[0] if titles else (0.0, None)
+        margin = score - (titles[1][0] if len(titles) > 1 else 0.0)
+        matched = reading.confidence >= .85 and score >= .9 and margin >= .08
+        return {"status": "matched" if matched else "unconfirmed", "text": reading.text,
+                "confidence": reading.confidence, "best_song_id": title_id, "score": score, "margin": margin,
+                "song_id": title_id if matched else None}
+
+    def identify(self, jacket: np.ndarray, title: Reading, phase: str, *,
+                 read_grayscale_title: Callable[[], Reading] | None = None) -> tuple[int, float, float, float]:
         cover = {"status": "unavailable", "song_id": None}
         scores = self.features @ thumbnail(jacket) if len(self.ids) else np.empty(0)
         ranked = np.argsort(scores)[::-1]
@@ -192,32 +206,37 @@ class SongMatcher:
                 cover["feature_checks"] = checks
                 if len(verified) == 1:
                     cover.update(status="matched", song_id=verified[0], method="features")
-        titles = sorted(((title_score(title.text, song["title"]), song_id)
-                         for song_id, song in self.repository.songs.items()), reverse=True)
-        score, title_id = titles[0] if titles else (0.0, None)
-        margin = score - (titles[1][0] if len(titles) > 1 else 0.0)
-        title_matched = title.confidence >= .85 and score >= .9 and margin >= .08
-        title_evidence = {"status": "matched" if title_matched else "unconfirmed", "text": title.text,
-                          "confidence": title.confidence, "best_song_id": title_id, "score": score, "margin": margin,
-                          "song_id": title_id if title_matched else None}
+        title_evidence = self._match_title(title)
         self.last_evidence = {"phase": phase, "cover": cover, "title": title_evidence}
         cover_id = cover["song_id"]
-        if cover_id is not None and title_matched and cover_id != title_id:
+        cover_candidate = cover.get("best_song_id")
+        if (read_grayscale_title is not None and cover_id is None and title_evidence["song_id"] is None
+                and title_evidence["confidence"] >= .85 and title_evidence["score"] >= .8
+                and title_evidence["best_song_id"] == cover_candidate
+                and cover.get("score", 0) >= .35 and cover["score"] - cover["runner_up_score"] >= .06):
+            # 二值化可能丢掉浊点笔画。灰度复读仍须唯一精确匹配，并与封面首选同曲。
+            alternate = self._match_title(read_grayscale_title())
+            if alternate["song_id"] == cover_candidate and alternate["score"] == 1.0 and alternate["confidence"] >= .9:
+                self.last_evidence["initial_title"] = title_evidence
+                self.last_evidence["title"] = title_evidence = alternate
+        title_id = title_evidence["song_id"]
+        if cover_id is not None and title_id is not None and cover_id != title_id:
             raise ValueError(f"封面与标题身份冲突：封面={cover_id}，标题={title_id}")
-        song_id = cover_id if cover_id is not None else title_id if title_matched else None
+        song_id = cover_id if cover_id is not None else title_id
         if song_id is None:
             raise ValueError(f"歌曲封面与标题均未确认：封面={cover.get('score', 0):.3f}，"
-                             f"标题={title.text!r}，相似度={score:.3f}，置信度={title.confidence:.3f}")
+                             f"标题={title.text!r}，相似度={title_evidence['score']:.3f}，置信度={title.confidence:.3f}")
         self.last_evidence["resolved_song_id"] = song_id
-        self.last_evidence["identified_by"] = ("cover_and_title" if cover_id is not None and title_matched
+        self.last_evidence["identified_by"] = ("cover_and_title" if cover_id is not None and title_id is not None
                                                else "cover" if cover_id is not None else "title")
         chosen = self.ids.index(song_id) if song_id in self.ids else None
         best = float(scores[chosen]) if chosen is not None else 0.0
         other_scores = np.delete(scores, chosen) if chosen is not None else scores
         second = float(np.max(other_scores)) if len(other_scores) else 0.0
-        return song_id, best, second, title_score(title.text, self.repository.songs[song_id]["title"])
+        return song_id, best, second, title_score(title_evidence["text"], self.repository.songs[song_id]["title"])
 
-    def read_opening_text(self, frame: np.ndarray, box: tuple[int, int, int, int], *, badge=False) -> Reading:
+    def read_opening_text(self, frame: np.ndarray, box: tuple[int, int, int, int], *, badge=False,
+                          preserve_grayscale=False) -> Reading:
         x1, y1, x2, y2 = box
         crop = frame[y1:y2, x1:x2]
         # 开场标题后有背景图案，难度条还会竖向移动；提取白字并完整裁剪，避免背景或字形边缘干扰。
@@ -235,7 +254,9 @@ class SongMatcher:
         if points is None:
             return Reading("", 0.0)
         x, y, width, height = cv2.boundingRect(points)
-        text = cv2.copyMakeBorder(255 - foreground[y:y + height, x:x + width], 5, 5, 6, 6,
+        glyphs = (cv2.cvtColor(crop[y:y + height, x:x + width], cv2.COLOR_BGR2GRAY) if preserve_grayscale
+                  else foreground[y:y + height, x:x + width])
+        text = cv2.copyMakeBorder(255 - glyphs, 5, 5, 6, 6,
                                  cv2.BORDER_CONSTANT, value=255)
         text = cv2.cvtColor(text, cv2.COLOR_GRAY2BGR)
         return self.ocr.read(text, (0, 0, text.shape[1], text.shape[0]))
@@ -277,7 +298,11 @@ class SongMatcher:
         title = (self.read_opening_text(frame, title_box) if phase in {"final", "cooperative_final", "one_shot_final"} else
                  self.read_result_title(frame, title_box) if phase == "cooperative_result" else
                  self.read_preparation_title(frame, title_box))
-        song_id, best, second, similarity = self.identify(jacket, title, phase)
+        title_options = {}
+        if phase == "cooperative_final" and getattr(self, "cooperative_title_grayscale", False):
+            title_options["read_grayscale_title"] = lambda: self.read_opening_text(frame, title_box, preserve_grayscale=True)
+        song_id, best, second, similarity = self.identify(jacket, title, phase, **title_options)
+        title = self.last_evidence["title"]
         song = self.repository.songs[song_id]
         chart = song["charts"].get(difficulty, {})
         self.last_evidence["chart_available"] = bool(chart)
@@ -300,4 +325,4 @@ class SongMatcher:
             if not confirmed:
                 raise ValueError(f"协力实际难度未选中：{difficulty}")
         return Identity(song_id, song["title"], difficulty, chart.get("play_level", 0), best, second,
-                        title.text, title.confidence, similarity, phase)
+                        title["text"], title["confidence"], similarity, phase)

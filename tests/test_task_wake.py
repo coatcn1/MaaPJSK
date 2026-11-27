@@ -151,7 +151,7 @@ class TaskWakeTests(unittest.TestCase):
                     patch('maa.resource.Resource', return_value=resource), patch('maa.tasker.Tasker', return_value=tasker), \
                     patch('maa.agent_client.AgentClient', return_value=client), \
                     patch('project_sekai.maa_device.MaaDevice'), \
-                    patch('project_sekai.diagnostics.load_policy', return_value=SimpleNamespace(disable_logging=True)), \
+                    patch('project_sekai.diagnostics.load_policy', return_value=SimpleNamespace(disable_logging=True, framework_logging=False)), \
                     patch('project_sekai.diagnostics.make_directory'), \
                     patch('subprocess.run', return_value=SimpleNamespace(returncode=0)), \
                     patch('subprocess.Popen', return_value=agent), contextlib.redirect_stdout(io.StringIO()):

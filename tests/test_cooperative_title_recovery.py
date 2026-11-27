@@ -190,8 +190,7 @@ class SettlementTitleRecoveryTests(unittest.TestCase):
         workflow.device.tap.side_effect = OSError('点击回执连接失败')
         workflow.navigator.templates = {page: None for page in ('title_screen', 'home', 'playing', 'life_hud')}
         workflow.recovery_state = CooperativeLive.recovery_state.__get__(workflow)
-        with tempfile.TemporaryDirectory() as root, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock[0]), \
-                patch('project_sekai.game_login.title_menu_ready', return_value=True):
+        with tempfile.TemporaryDirectory() as root, patch('project_sekai.cooperative_live.time.monotonic', side_effect=lambda: clock[0]):
             directory = Path(root) / 'first-report'
             service = GameLogin(workflow.device, workflow.navigator, Path(root) / 'login',
                                 stop_requested=lambda: workflow.stop_requested(), log_message=Mock(),

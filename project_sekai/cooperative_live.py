@@ -23,7 +23,7 @@ from .game_login import GameLogin
 from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, input_finished, release_finished
 from .live_exit import background_game as exit_to_emulator_home
 from .navigator import Navigator
-from .solo_live import LiveResult, SoloLive, is_light_mode
+from .solo_live import LiveResult, SoloLive, confirm_native_startup_margin, is_light_mode
 from .song_identity import COOPERATIVE_DIFFICULTIES, cooperative_difficulty_selected, read_image, write_image
 from .sus_chart import parse_sus
 
@@ -2093,6 +2093,11 @@ class CooperativeLive(SoloLive):
                         if identity is not None:
                             self.safe_log(f"抽选结果：{identity.song_id} {identity.title} {difficulty.upper()}；准备后等待实际开场")
                         epoch = self.start(chart, identity, report, attempt_dir, on_final_identity=prepare_final)
+                        fit = report.get("start_anchor", {}).get("fit") or {}
+                        opening_checks = report.get("identity_checks", {}).get("opening", ())
+                        if native_player is not None and (fit.get("gold_tap_pair_guard")
+                                or opening_checks and "initial_title" in opening_checks[-1]):
+                            confirm_native_startup_margin(epoch, events[0].time, offset_ms, report)
                         report["ready_confirmed"] = True
                         self.life_epoch = epoch
                         report["phase"] = "playing"

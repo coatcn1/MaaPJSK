@@ -5,26 +5,11 @@ import re
 import time
 from uuid import uuid4
 
-import cv2
-import numpy as np
-
 from .diagnostics import write_json as _write_json, make_directory, enabled
 from .maa_device import MaaDevice
 from .navigator import Navigator
 from .ocr import LineOcr
-
-
-def title_menu_ready(frame):
-    hsv = cv2.cvtColor(frame[27:62, 1217:1259], cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (0, 0, 0), (179, 95, 130))
-    lines = []
-    for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
-        x, y, width, height = cv2.boundingRect(contour)
-        if 12 <= width <= 30 and 1 <= height <= 5 and width >= height * 3:
-            lines.append((x + width / 2, y + height / 2))
-    lines.sort(key=lambda point: point[1])
-    return (len(lines) == 3 and max(x for x, _ in lines) - min(x for x, _ in lines) <= 4
-            and all(6 <= lines[index + 1][1] - lines[index][1] <= 15 for index in range(2)))
+from .title_screen import title_screen_visible
 
 
 class GameLogin:
@@ -77,7 +62,7 @@ class GameLogin:
                 return False
         return True
 
-    def run(self, *, wait_for_home=False, resume=False):
+    def run(self, *, wait_for_home=False, resume=False, deadline=None):
         if resume and hasattr(self, '_session'):
             directory, report = self._session
         else:
@@ -88,6 +73,8 @@ class GameLogin:
                       "title_requests": 0, "notice_requests": 0}
             self._session = directory, report
             self._deadline = self.clock() + 60.
+            if deadline is not None:
+                self._deadline = min(self._deadline, deadline)
             self._last_title = self._last_notice = float('-inf')
             self._managed_login = wait_for_home
         self.report = report
@@ -98,8 +85,8 @@ class GameLogin:
             density = self.device.shell("wm density")
             if not re.search(r"(?:Physical|Override) density: 240\b", density):
                 raise RuntimeError("游戏登录要求当前设备 DPI 为 240")
-            if not {"title_screen", "home"} <= self.navigator.templates.keys():
-                raise RuntimeError("登录模板缺失，无法安全确认标题或主页")
+            if "home" not in self.navigator.templates:
+                raise RuntimeError("主页模板缺失，无法安全确认登录完成")
             deadline = self._deadline
             stable_home = 0
             if resume and self.clock() >= deadline:
@@ -108,7 +95,7 @@ class GameLogin:
                     self.check_stop()
                     frame = self.device.screenshot()
                     if (frame.shape[:2] != (720, 1280) or not self.foreground()
-                            or not self.matches(frame, 'home') or self.matches(frame, 'title_screen')
+                            or not self.matches(frame, 'home') or title_screen_visible(frame, self.navigator)
                             or self.matches(frame, 'life_hud') or self.matches(frame, 'playing')
                             or self.known_notice(frame)):
                         raise TimeoutError("登录输入期限已耗尽，等待用户返回实际主页")
@@ -126,8 +113,7 @@ class GameLogin:
                 foreground = self.foreground()
                 if self.clock() >= deadline:
                     break
-                title = (foreground and self.matches(frame, "title_screen")
-                         and not self.matches(frame, "playing") and not self.matches(frame, "life_hud"))
+                title = foreground and title_screen_visible(frame, self.navigator)
                 if title:
                     self._managed_login = True
                 if foreground and not self._managed_login:
@@ -136,7 +122,7 @@ class GameLogin:
                     report.update(completed=True, phase="already_running")
                     persist()
                     return report
-                if foreground and self._managed_login and self.known_notice(frame):
+                if foreground and self._managed_login and not title and self.known_notice(frame):
                     stable_home = 0
                     if report['notice_requests'] < 3 and self.clock() - self._last_notice >= 1.:
                         fresh = self.device.screenshot()
@@ -151,7 +137,7 @@ class GameLogin:
                         self.device.back()
                     self.pause(.25)
                     continue
-                if foreground and self.matches(frame, "home") and not self.matches(frame, "title_screen"):
+                if foreground and self.matches(frame, "home") and not title:
                     stable_home += 1
                     if stable_home >= 2:
                         self.device.preflight()
@@ -172,20 +158,18 @@ class GameLogin:
                         self.device.shell("monkey -p com.sega.pjsekai -c android.intent.category.LAUNCHER 1")
                     else:
                         self.launch_game()
-                elif (title and title_menu_ready(frame) and report["title_requests"] < 3
+                elif (title and report["title_requests"] < 3
                       and self.clock() - self._last_title >= 5.):
                     # shell 检查可能经历页面切换，点击前必须重新取帧并再次确认标题。
                     fresh = self.device.screenshot()
                     self.check_stop()
-                    if (not self.matches(fresh, "title_screen") or not title_menu_ready(fresh)
-                            or self.matches(fresh, "playing") or self.matches(fresh, "life_hud")
-                            or not self.foreground()):
+                    if not title_screen_visible(fresh, self.navigator) or not self.foreground():
                         continue
                     report["title_requests"] += 1
                     self._last_title = self.clock()
                     persist()
                     self.check_stop()
-                    self.safe_log("已确认标题与右上三横菜单就绪，点击 TAP TO START 登录")
+                    self.safe_log("已确认游戏登录页，点击 TAP TO START 登录")
                     self.device.tap(640, 620)
                 self.pause(.25)
             raise TimeoutError("游戏启动与登录超过 60 秒，未确认实际主页")

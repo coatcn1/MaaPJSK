@@ -52,12 +52,17 @@ var result = MaaPjskCacheMaintenance.Clear(baseDirectory);
 '@
 
 $gameSettings = Join-Path $SourceRoot 'MFAAvalonia\ViewModels\UsersControls\Settings\GameSettingsUserControlModel.cs'
-Replace-Once $gameSettings 'MaaProcessor.Global.SetOption_SaveDraw\(value\);' 'MaaProcessor.Global.SetOption_SaveDraw(!MaaPjskDiagnostics.Disabled && value);'
-Replace-Once $gameSettings 'MaaProcessor.Global.SetOption\(GlobalOption.SaveOnError, value\);' 'MaaProcessor.Global.SetOption(GlobalOption.SaveOnError, !MaaPjskDiagnostics.Disabled && value);'
+Replace-Once $gameSettings 'MaaProcessor.Global.SetOption_SaveDraw\(value\);' 'MaaProcessor.Global.SetOption_SaveDraw(MaaPjskDiagnostics.ShouldSaveFrameworkFile(value));'
+Replace-Once $gameSettings 'MaaProcessor.Global.SetOption\(GlobalOption.SaveOnError, value\);' 'MaaProcessor.Global.SetOption(GlobalOption.SaveOnError, MaaPjskDiagnostics.ShouldSaveFrameworkFile(value));'
+
+Replace-Once $processor 'tasker.Global.SetOption_LogDir\(logDir\);' 'MaaPjskDiagnostics.ApplyFramework();'
+Replace-Once $processor 'LoggerHelper.Info\("截图日志目录：" \+ logDir\);' 'LoggerHelper.Info("截图使用统一的框架日志启动策略。");'
+$agentHelper = Join-Path $SourceRoot 'MFAAvalonia\Extensions\MaaFW\AgentHelper.cs'
+Replace-Once $agentHelper 'ApplyChildProcessEncodingEnvironmentVariables\(startInfo, isPythonProcess\);' 'MaaPjskDiagnostics.ApplyAgentEnvironment(startInfo); ApplyChildProcessEncodingEnvironmentVariables(startInfo, isPythonProcess);'
 
 Replace-Once $processor 'public static MaaToolkit Toolkit \{ get; \} = new\(true\);\s*public static MaaGlobal Global \{ get; \} = new\(\);' @'
 public static MaaGlobal Global { get; } = MaaPjskDiagnostics.CreateGlobal();
-    public static MaaToolkit Toolkit { get; } = new(!MaaPjskDiagnostics.Disabled);
+    public static MaaToolkit Toolkit { get; } = MaaPjskDiagnostics.CreateToolkit();
     private IDisposable? _pjskExecution;
     private MaaPjskFailureSummary? _pjskFailureSummary;
     private Func<MaaPjskTaskerObservation>? _pjskTaskerObservation = null;

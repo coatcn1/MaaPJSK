@@ -12,6 +12,9 @@ import re
 ERASED_SLIDE_GUARD = os.environ.get('MAAPJSK_ERASED_SLIDE_GUARD') == '1'
 # 隐藏首尾片段使用独立候选合同，默认关闭；运行中不重新读取开关。
 HIDDEN_SLIDE_FRAGMENT_GUARD = os.environ.get('MAAPJSK_HIDDEN_SLIDE_FRAGMENT_GUARD') == '1'
+# 两个修复候选分别冻结，便于独立验收；默认入口和既有候选保持原合同。
+SUS_EASING_DIRECTION_GUARD = os.environ.get('MAAPJSK_SUS_EASING_DIRECTION_GUARD') == '1'
+NONJUDGEMENT_SLIDE_GUARD = os.environ.get('MAAPJSK_NONJUDGEMENT_SLIDE_GUARD') == '1'
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,8 @@ def parse_sus(text: str) -> Chart:
     shorts: dict[tuple[Fraction, int], tuple[int, int]] = {}
     short_conflicts: set[tuple[Fraction, int]] = set()
     directions: dict[tuple[Fraction, int], int] = {}
+    flick_directions: dict[tuple[Fraction, int], int] = {}
+    easing_directions: dict[tuple[Fraction, int], int] = {}
     slide_rows: dict[str, list[tuple[Fraction, int, int, int]]] = {}
     for measure, channel, body in rows:
         if channel == "08" or channel[0] == "9":
@@ -161,6 +166,9 @@ def parse_sus(text: str) -> Chart:
                 if kind not in range(1, 7):
                     raise ValueError("未知 flick 或缓动方向")
                 directions[position, lane] = kind
+                # 同一节点允许分别定义缓动与滑键，不能让后出现的缓动覆盖真实滑键。
+                target = flick_directions if kind in {1, 3, 4} else easing_directions
+                target[position, lane] = kind
             else:
                 if kind not in {1, 2, 3, 4, 5}:
                     raise ValueError("未知滑条节点类型")
@@ -172,9 +180,12 @@ def parse_sus(text: str) -> Chart:
         active_critical = False
         erased_fragment = False
         hidden_fragment = False
+        nonjudgement_fragment = False
         active_start_beat = Fraction(0)
         for position, lane, width, kind in sorted(nodes, key=lambda item: (item[0], 0 if item[3] == 2 else 1)):
             direction = directions.get((position, lane), 0)
+            if SUS_EASING_DIRECTION_GUARD:
+                direction = easing_directions.get((position, lane), flick_directions.get((position, lane), 0))
             # 有短音符但没有方向的可见点只作判定；带缓动方向或没有短音符的点仍定义路径。
             path_node = kind != 3 or bool(direction) or (position, lane) not in shorts
             point = Point(seconds(position), lane, width, kind, direction, path_node)
@@ -187,6 +198,7 @@ def parse_sus(text: str) -> Chart:
                 erased_fragment = shorts.get((position, lane)) == (8, width)
                 hidden_fragment = ((position, lane) not in short_conflicts
                                    and shorts.get((position, lane)) in {(7, width), (8, width)})
+                nonjudgement_fragment = (hidden_fragment and (position, lane) not in flick_directions)
                 active_start_beat = position
             elif not active:
                 raise ValueError("滑条节点没有对应的开头")
@@ -198,18 +210,28 @@ def parse_sus(text: str) -> Chart:
                     half_beat_start = Fraction(active_start_beat // Fraction(1, 2), 2)
                     # 只排除首尾8擦除、无可判节点且严格位于同半拍格内部的装饰短链。
                     # 跨格长条、可见节点或可判短标记仍须完整触控，不能靠缩短时间或扩触点绕过拒绝。
-                    decorative = (not HIDDEN_SLIDE_FRAGMENT_GUARD and ERASED_SLIDE_GUARD and erased_fragment
+                    decorative = (not NONJUDGEMENT_SLIDE_GUARD and not HIDDEN_SLIDE_FRAGMENT_GUARD
+                                  and ERASED_SLIDE_GUARD and erased_fragment
                                   and shorts.get((position, lane)) == (8, width) and direction == 0
                                   and half_beat_start < active_start_beat < position < half_beat_start + Fraction(1, 2))
                     # 7/8隐藏首尾与4/5非判定节点都得到确认，且整链不经过全局半拍tick才可忽略。
                     # 首点direction仍是路径缓动元数据；只用尾点direction排除flick判定。
-                    decorative |= (HIDDEN_SLIDE_FRAGMENT_GUARD and hidden_fragment
+                    decorative |= (not NONJUDGEMENT_SLIDE_GUARD and HIDDEN_SLIDE_FRAGMENT_GUARD and hidden_fragment
                                    and (position, lane) not in short_conflicts
                                    and shorts.get((position, lane)) in {(7, width), (8, width)}
                                    and direction == 0
                                    and half_beat_start < active_start_beat < position < half_beat_start + Fraction(1, 2))
+                    # 首尾各自有完整隐藏标记，且所有中继均明确无判定时，位置和宽度可变化。
+                    # 自动 tick 只在首尾之间生成；首尾恰落边界允许，跨过内部边界仍保留。
+                    # 显式中继3始终可判，不能因附着短标记3而当成纯装饰；旧候选不能绕过本合同。
+                    decorative |= (NONJUDGEMENT_SLIDE_GUARD and nonjudgement_fragment
+                                   and (position, lane) not in short_conflicts
+                                   and shorts.get((position, lane)) in {(7, width), (8, width)}
+                                   and (position, lane) not in flick_directions
+                                   and active_start_beat < position <= half_beat_start + Fraction(1, 2))
                     if not decorative:
-                        gestures.append(Gesture(tuple(active), "slide", point.direction, active_critical))
+                        flick = flick_directions.get((position, lane), 0) if SUS_EASING_DIRECTION_GUARD else point.direction
+                        gestures.append(Gesture(tuple(active), "slide", flick, active_critical))
                     active = []
                 else:
                     marker = shorts.get((position, lane))
@@ -218,12 +240,21 @@ def parse_sus(text: str) -> Chart:
                     hidden_fragment = (hidden_fragment and kind in {4, 5}
                                        and (position, lane) not in short_conflicts
                                        and (marker is None or marker in {(7, width), (8, width)}))
+                    # 控制点4与隐藏路径点5不计分，但附着明确可判或冲突短标记时保守保留。
+                    nonjudgement_fragment = (nonjudgement_fragment
+                                             and (position, lane) not in short_conflicts
+                                             and (position, lane) not in flick_directions
+                                             and kind in {4, 5}
+                                             and (marker is None or marker in {
+                                                 (3, width), (7, width), (8, width)}))
         if active:
             raise ValueError("滑条没有结束节点")
     for (position, lane), (kind, width) in shorts.items():
         if (position, lane) in consumed or kind in {4, 7, 8}:
             continue
         direction = directions.get((position, lane), 0)
+        if SUS_EASING_DIRECTION_GUARD:
+            direction = flick_directions.get((position, lane), 0)
         if kind == 3 and not direction:
             direction = 1
         gestures.append(Gesture((Point(seconds(position), lane, width, kind),), "trace" if kind in {5, 6} else "tap", direction, kind in {2, 6}))
