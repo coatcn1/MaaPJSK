@@ -22,6 +22,14 @@ from project_sekai.song_identity import write_image
 
 
 class DiagnosticsPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.framework_state = patch.object(diagnostics, '_framework_configured', False)
+        self.framework_state.start()
+        self.addCleanup(self.framework_state.stop)
+        self.framework_environment = patch.dict(os.environ)
+        self.framework_environment.start()
+        self.addCleanup(self.framework_environment.stop)
+        os.environ.pop(diagnostics.FRAMEWORK_LOGGING_ENV, None)
     def tearDown(self):
         diagnostics.configure(False, framework=False)
 
@@ -37,33 +45,42 @@ class DiagnosticsPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 PerformanceSettings.load(path)
 
-    def test_agent_server_only_sets_supported_log_dir_and_keeps_fail_closed(self):
+    def test_agent_server_only_sets_supported_log_dir_and_logging_failure_is_optional(self):
         with patch("maa.library.Library.is_agent_server", return_value=True), \
              patch("maa.tasker.Tasker.set_log_dir", return_value=True) as log_dir, \
              patch("maa.tasker.Tasker.set_save_draw", side_effect=AssertionError("AgentServer 不支持此选项")), \
              patch("maa.tasker.Tasker.set_save_on_error", side_effect=AssertionError("AgentServer 不支持此选项")):
             diagnostics.configure(True)
             log_dir.assert_called_once_with("")
+        diagnostics._framework_configured = False
         with patch("maa.library.Library.is_agent_server", return_value=True), \
              patch("maa.tasker.Tasker.set_log_dir", return_value=False):
-            with self.assertRaises(RuntimeError): diagnostics.configure(True)
+            with patch.object(diagnostics, '_warn') as warning:
+                diagnostics.configure(True)
+            warning.assert_called_once()
+            self.assertFalse(diagnostics.enabled())
 
     def test_real_agent_registration_startup_has_zero_diagnostics_and_enabled_control(self):
         repo = Path(__file__).resolve().parents[1]
-        for disabled in (True, False):
-            with self.subTest(disabled=disabled), tempfile.TemporaryDirectory() as tmp:
+        for disabled, framework in [(True, True), (False, False), (False, True)]:
+            with self.subTest(disabled=disabled, framework=framework), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 (root / "config").mkdir()
                 (root / "agent").mkdir()
-                _write_json(root / "config/performance-settings.json", PerformanceSettings(disable_logging=disabled).__dict__)
+                _write_json(root / "config/performance-settings.json", PerformanceSettings(
+                    disable_logging=disabled, framework_logging=framework).__dict__)
                 shutil.copyfile(repo / "agent/server.py", root / "agent/server.py")
-                code = "import sys,runpy;sys.path.insert(0,sys.argv[1]);runpy.run_path(sys.argv[2],run_name='diagnostics_fixture')"
+                code = ("import sys,runpy;sys.path.insert(0,sys.argv[1]);runpy.run_path(sys.argv[2],run_name='diagnostics_fixture');"
+                        "from project_sekai.diagnostics import write_json;from pathlib import Path;"
+                        "write_json(Path('debug/project-evidence.json'),{'input_completed':True})")
                 result = subprocess.run([sys.executable, "-c", code, str(repo / "agent"), str(root / "agent/server.py")],
                                         cwd=root, env=dict(os.environ, PYTHONPATH=str(repo)), capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 files = list((root / "debug").rglob("*")) if (root / "debug").exists() else []
                 if disabled: self.assertEqual(files, [])
-                else: self.assertTrue((root / "debug/maafw.log").is_file())
+                else:
+                    self.assertTrue((root / "debug/project-evidence.json").is_file())
+                    self.assertEqual((root / "debug/maafw.log").is_file(), framework)
 
     def test_disabled_files_do_not_change_native_memory_or_reset_cleanup(self):
         diagnostics.configure(True, framework=False)

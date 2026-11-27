@@ -43,24 +43,40 @@ internal static partial class Program
 
     private static int LoggingProbe(string mode, string directory)
     {
+        // 先加载 SDK 再切换临时安装根目录，探针不连接或创建控制器。
+        new MaaGlobal().SetOption_SaveDraw(false);
         Directory.CreateDirectory(directory);
         Environment.CurrentDirectory = directory;
+        AppContext.SetData("APP_CONTEXT_BASE_DIRECTORY", directory);
+        var legacyOptions = Path.Combine(directory, "config", "maa_option.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(legacyOptions)!);
+        File.WriteAllText(legacyOptions, "{\"logging\":true,\"save_draw\":true,\"save_on_error\":true}");
         bool disabled = mode == "disabled";
         typeof(MaaPjskDiagnostics).GetField("_disabled", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, disabled);
+        typeof(MaaPjskDiagnostics).GetField("_startup", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null,
+            new MaaPjskFrameworkStartupOptions(mode == "enabled", 2, 85, false));
         typeof(AppPaths).GetField("_logsDirectory", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, Path.Combine(directory, "logs"));
         typeof(AppPaths).GetField("_initialized", BindingFlags.Static | BindingFlags.NonPublic)!.SetValue(null, true);
         // 初次静态初始化先设置全局日志，再初始化 Toolkit；不连接或控制设备。
         var global = MaaProcessor.Global;
         _ = MaaProcessor.Toolkit;
-        if (!disabled) global.SetOption_LogDir(Path.Combine(directory, "debug"));
         LoggerHelper.Info("startup buffered fixture");
         LoggerHelper.InitializeLogger();
         LoggerHelper.Error("startup error fixture");
         MaaTaskerGetResource(0);
         LoggerHelper.DisposeLogger();
-        var files = Directory.GetFiles(directory, "*", SearchOption.AllDirectories);
-        Require(disabled ? files.Length == 0 : files.Any(path => path.EndsWith("maafw.log")) && files.Any(path => path.EndsWith(".log")),
-            "禁日志启动须零文件，启用对照须生成实际框架和 GUI 日志。");
+        var files = Directory.GetFiles(directory, "*", SearchOption.AllDirectories)
+            .Where(path => path.EndsWith(".log") || path.EndsWith(".png")).ToArray();
+        Require(disabled ? files.Length == 0 : files.Any(path => path.EndsWith(".log")),
+            "禁日志启动须零文件，其余模式须保留 GUI 日志。");
+        Require(files.Any(path => path.EndsWith("maafw.log")) == (mode == "enabled"),
+            "框架日志须独立显式开启，默认不能随 GUI 日志打开。");
+        var startInfo = new System.Diagnostics.ProcessStartInfo();
+        startInfo.Environment[MaaPjskDiagnostics.FrameworkLoggingEnvironment] = mode == "enabled" ? "0" : "1";
+        MaaPjskDiagnostics.ApplyAgentEnvironment(startInfo);
+        Require(startInfo.Environment[MaaPjskDiagnostics.FrameworkLoggingEnvironment] == (mode == "enabled" ? "1" : "0"),
+            "GUI 必须覆盖继承的旧环境值并向 Agent 传递本次启动快照。");
+        Require(File.ReadAllText(legacyOptions).Contains("\"logging\":true"), "启动策略不得改写用户旧框架选项");
         Console.WriteLine($"GUI startup logging probe {mode}: {files.Length} files");
         return 0;
     }
@@ -149,6 +165,13 @@ internal static partial class Program
         if (args.Length == 1 && args[0] == "--first-sync-state")
             return MaaPjskFirstLiveSync.NeedsSync(["SoloChartLive"]) ? 0 : 1;
         if (args.Length == 3 && args[0] == "--logging-probe") return LoggingProbe(args[1], Path.GetFullPath(args[2]));
+        foreach (var raw in new[] { "{}", "{\"framework_logging\":false}", "{\"framework_logging\":\"true\"}",
+                     "{\"framework_logging\":null}", "{\"framework_logging\":true,\"disable_logging\":true}" })
+            Require(!MaaPjskDiagnostics.CaptureFrameworkStartup(JObject.Parse(raw),
+                new Dictionary<string, object> { ["logging"] = true }).LoggingEnabled,
+                "框架默认关闭，总开关优先，旧 logging=true 和非法值不能打开框架文件");
+        Require(MaaPjskDiagnostics.CaptureFrameworkStartup(JObject.Parse("{\"framework_logging\":true}"),
+            new Dictionary<string, object>()).LoggingEnabled, "显式布尔 true 应允许启动框架文件日志");
         var firstSyncProbe = args.Length == 4 && args[0] == "--first-sync-probe";
         if (args.Length != 2 && !firstSyncProbe)
             throw new ArgumentException("参数：python.exe 和离屏截图输出路径");
@@ -473,6 +496,8 @@ sys.exit(2 if mode == 'partial' else 0)
             "演奏设置必须提供引擎与每局体力选项");
         Require(!new PerformanceSettingsUserControlModel().CooperativeGameTimingFeedback,
             "协力 FAST / LATE 试验微调必须默认关闭");
+        Require(!new PerformanceSettingsUserControlModel().FrameworkLogging,
+            "新增框架流水与调试图必须默认关闭");
         var feedbackCheckBox = performanceControl.GetVisualDescendants().OfType<CheckBox>().Single(checkBox =>
             Equals(checkBox.Content, "协力演奏中按 FAST / LATE 微调（试验）"));
         feedbackCheckBox.IsChecked = true;
@@ -483,6 +508,38 @@ sys.exit(2 if mode == 'partial' else 0)
         performance.SaveCommand.Execute(null);
         var savedPerformance = Path.Combine(configDirectory, "performance-settings.json");
         var saved = JObject.Parse(File.ReadAllText(savedPerformance));
+        Require(saved.Value<bool?>("framework_logging") == false, "普通保存不得自动打开框架流水");
+        var frameworkCheckBox = performanceControl.GetVisualDescendants().OfType<CheckBox>().Single(checkBox =>
+            Equals(checkBox.Content, "MaaFramework 日志与调试图（排障时开启）"));
+        frameworkCheckBox.IsChecked = true;
+        Dispatcher.UIThread.RunJobs();
+        performance.SaveCommand.Execute(null);
+        Require(performance.FrameworkLogging && JObject.Parse(File.ReadAllText(savedPerformance)).Value<bool>("framework_logging"),
+            "框架开关须双向绑定并持久化");
+        Require(!MaaPjskDiagnostics.StartupFrameworkLoggingEnabled && performance.StatusText.Contains("重启 MFA"),
+            "保存新开关不能热打开框架文件流，须提示重启");
+        var frameworkReload = new PerformanceSettingsUserControlModel();
+        frameworkReload.RefreshCommand.Execute(null);
+        Require(frameworkReload.FrameworkLogging, "重开设置页须还原已保存的框架开关");
+        var frameworkSaved = File.ReadAllBytes(savedPerformance);
+        try
+        {
+            foreach (var invalid in new JToken[] { new JValue("true"), new JValue(1), JValue.CreateNull() })
+            {
+                var invalidSettings = JObject.Parse(System.Text.Encoding.UTF8.GetString(frameworkSaved));
+                invalidSettings["framework_logging"] = invalid;
+                File.WriteAllText(savedPerformance, invalidSettings.ToString());
+                var badBytes = File.ReadAllBytes(savedPerformance);
+                frameworkReload.RefreshCommand.Execute(null);
+                frameworkReload.SaveCommand.Execute(null);
+                Require(frameworkReload.StatusText.Contains("读取失败") || frameworkReload.StatusText.Contains("读取演奏设置失败"),
+                    "非法框架开关必须拒绝保存并提示修复");
+                Require(badBytes.SequenceEqual(File.ReadAllBytes(savedPerformance)), "读取失败不能用默认值覆盖旧配置");
+            }
+        }
+        finally { File.WriteAllBytes(savedPerformance, frameworkSaved); frameworkReload.RefreshCommand.Execute(null); }
+        performance.FrameworkLogging = false;
+        performance.SaveCommand.Execute(null);
         Require(saved.Value<string>("engine") == "native" && saved.Value<int>("touch_offset_ms") == -23
             && saved.Value<int>("bonus_consumption") == 5
             && saved.Value<bool>("cooperative_game_timing_feedback"), "设置必须真实保存为 Agent 可读取的配置");
@@ -493,10 +550,12 @@ sys.exit(2 if mode == 'partial' else 0)
             "重新打开设置页必须还原保存值");
         var oldPerformance = (JObject)saved.DeepClone();
         oldPerformance.Remove("cooperative_game_timing_feedback");
+        oldPerformance.Remove("framework_logging");
         File.WriteAllText(savedPerformance, oldPerformance.ToString());
         reloaded.RefreshCommand.Execute(null);
         Require(!reloaded.CooperativeGameTimingFeedback && reloaded.TouchOffsetMs == -23 && reloaded.BonusIndex == 6,
             "旧配置缺少试验开关时须恢复为关闭并保留手动偏移和体力");
+        Require(!reloaded.FrameworkLogging, "旧配置缺少框架开关时须默认关闭");
         foreach (var invalidFeedback in new JToken[] { new JValue("true"), new JValue(1), JValue.CreateNull() })
         {
             oldPerformance["cooperative_game_timing_feedback"] = invalidFeedback;

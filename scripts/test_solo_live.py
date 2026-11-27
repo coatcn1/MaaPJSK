@@ -71,7 +71,6 @@ def _run(arguments):
     from maa.controller import AdbController
     from maa.resource import Resource
     from maa.tasker import Tasker
-    from maa.toolkit import Toolkit
     from maa.agent_client import AgentClient
     from project_sekai.maa_device import MaaDevice
     from project_sekai.song_identity import write_image
@@ -86,10 +85,9 @@ def _run(arguments):
     instance = json.loads((runtime / "config/instances/default.json").read_text(encoding="utf-8-sig"))["AdbDevice"]
     debug = ROOT / ".local/solo-acceptance"
     from project_sekai.diagnostics import load_policy, make_directory
-    saved = load_policy(runtime)
+    saved = load_policy(runtime, inherit_framework_snapshot=False)
     make_directory(debug, parents=True, exist_ok=True)
-    if not saved.disable_logging:
-        Toolkit.init_option(str(debug))
+    # 禁用 Toolkit 的配置重载，避免旧 maa_option.json 再次打开框架文件日志。
     controller = AdbController(instance["AdbPath"], instance["AdbSerial"], **controller_options(instance, runtime))
     if not controller.post_connection().wait().succeeded:
         raise RuntimeError("MaaFramework 无法连接 MFA 保存的设备")
@@ -119,14 +117,16 @@ def _run(arguments):
     performance = PerformanceSettings(engine=arguments.engine, touch_offset_ms=arguments.offset_ms or 0,
                                       bonus_consumption=int(arguments.bonus_consumption),
                                       use_calibration_profile=arguments.use_calibration_profile,
-                                      disable_logging=saved.disable_logging)
+                                      disable_logging=saved.disable_logging, framework_logging=saved.framework_logging)
     if arguments.calibrate:
         saved = PerformanceSettings.load(runtime / "config/performance-settings.json")
         performance = PerformanceSettings(engine="native", touch_offset_ms=saved.touch_offset_ms,
                                           bonus_consumption=int(arguments.bonus_consumption), use_calibration_profile=False,
-                                          disable_logging=saved.disable_logging)
+                                          disable_logging=saved.disable_logging, framework_logging=saved.framework_logging)
     environment = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
                        MAAPJSK_TEST_PERFORMANCE_JSON=json.dumps(asdict(performance)))
+    from project_sekai.diagnostics import FRAMEWORK_LOGGING_ENV, framework_logging_enabled
+    environment[FRAMEWORK_LOGGING_ENV] = "1" if framework_logging_enabled() else "0"
     if arguments.allow_stamina_spend:
         environment["MAAPJSK_TEST_ALLOW_STAMINA"] = "1"
     if arguments.allow_item_use:

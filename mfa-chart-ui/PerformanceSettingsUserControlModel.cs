@@ -20,6 +20,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
     [ObservableProperty] private bool _useCalibrationProfile = true;
     [ObservableProperty] private bool _cooperativeGameTimingFeedback;
     [ObservableProperty] private bool _disableLogging;
+    [ObservableProperty] private bool _frameworkLogging;
     [ObservableProperty] private int _playFailureRetryCount;
     [ObservableProperty] private string _statusText = "保存后在下一次启动任务时生效。";
     [ObservableProperty] private string _calibrationText = "尚未生成已通过验证的校准配置。";
@@ -47,7 +48,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
             if (args.PropertyName is nameof(TouchOffsetMs)) TouchOffsetText = TouchOffsetMs.ToString(CultureInfo.InvariantCulture);
             if (args.PropertyName is nameof(PlayFailureRetryCount)) RetryCountText = PlayFailureRetryCount.ToString(CultureInfo.InvariantCulture);
             if (args.PropertyName is not (nameof(EngineIndex) or nameof(TouchOffsetMs) or nameof(BonusIndex)
-                or nameof(UseCalibrationProfile) or nameof(CooperativeGameTimingFeedback) or nameof(DisableLogging)
+                or nameof(UseCalibrationProfile) or nameof(CooperativeGameTimingFeedback) or nameof(DisableLogging) or nameof(FrameworkLogging)
                 or nameof(PlayFailureRetryCount) or nameof(TouchOffsetText) or nameof(RetryCountText))) return;
             _dirty = true;
             StatusText = "修改尚未保存，停止编辑后自动保存。";
@@ -118,6 +119,10 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 if (logging is not null && logging.Type != JTokenType.Boolean)
                     throw new InvalidDataException("禁用日志开关必须为布尔值");
                 var disableLogging = logging?.Value<bool>() ?? false;
+                var framework = value["framework_logging"];
+                if (framework is not null && framework.Type != JTokenType.Boolean)
+                    throw new InvalidDataException("MaaFramework 日志开关必须为布尔值");
+                var frameworkLogging = framework?.Value<bool>() ?? false;
                 var retry = value["play_failure_retry_count"];
                 if (retry is not null && (retry.Type != JTokenType.Integer || retry.Value<long>() is < 0 or > 99))
                     throw new InvalidDataException("中途失败重试次数必须为 0 到 99 的整数");
@@ -130,6 +135,7 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 UseCalibrationProfile = useCalibrationProfile;
                 CooperativeGameTimingFeedback = cooperativeGameTimingFeedback;
                 DisableLogging = disableLogging;
+                FrameworkLogging = frameworkLogging;
                 PlayFailureRetryCount = playFailureRetryCount;
             }
             TouchOffsetText = TouchOffsetMs.ToString(CultureInfo.InvariantCulture);
@@ -202,7 +208,8 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
                 ["bonus_consumption"] = BonusIndex == 0 ? new JValue("current") : new JValue(BonusIndex - 1),
                 ["use_calibration_profile"] = UseCalibrationProfile,
                 ["cooperative_game_timing_feedback"] = CooperativeGameTimingFeedback,
-                ["disable_logging"] = DisableLogging, ["play_failure_retry_count"] = PlayFailureRetryCount
+                ["disable_logging"] = DisableLogging, ["framework_logging"] = FrameworkLogging,
+                ["play_failure_retry_count"] = PlayFailureRetryCount
             };
             value.Merge(edited);
             MaaPjskDiagnostics.Apply(DisableLogging);
@@ -221,7 +228,9 @@ public sealed partial class PerformanceSettingsUserControlModel : ViewModelBase
             _dirty = false;
             _saved = true;
             if (!_active && !ReferenceEquals(this, Shared)) Editors.Remove(this);
-            StatusText = "演奏设置已自动保存，下次启动任务生效。";
+            StatusText = (FrameworkLogging && !DisableLogging) != MaaPjskDiagnostics.StartupFrameworkLoggingEnabled
+                ? "演奏设置已自动保存；框架日志设置须重启 MFA 后生效，其他设置在下次任务生效。"
+                : "演奏设置已自动保存，下次启动任务生效。";
         }
         catch (Exception error)
         {
