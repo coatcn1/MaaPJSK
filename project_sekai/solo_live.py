@@ -21,12 +21,14 @@ from .chart_player import ChartPlayer, StartAnchor, compile_touches, first_note_
 from .calibration import verify_profile_anchor
 from .life_monitor import LifeDepleted, LifeGuard, ZeroLifeTemplate
 from .failure_retry import FailureRetryBudget
-from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, release_finished
+from .live_end import LIFE_HUD_AREA, LiveEndGuard, blank_transition, input_finished, release_finished
+from .game_login import GameLogin
 from .navigator import Navigator, read_available_bonus, recovery_bottles
 from .ocr import LineOcr, Reading
 from .performance_trace import PerformanceTrace
 from .song_identity import SongMatcher, normalize_title, write_image
 from .sus_chart import parse_sus
+from .title_screen import TitleScreenDetected, title_screen_visible
 
 
 DIFFICULTY_POINTS = {"easy": (854, 488), "normal": (934, 492), "hard": (1016, 497),
@@ -36,8 +38,6 @@ SEARCH_QUERY_BOXES = (SEARCH_QUERY_BOX, (151, 20, 580, 65), (151, 27, 580, 57))
 SEARCH_NATIVE_QUERY_BOX = (12, 642, 460, 696)
 
 
-def settlement_loading(frame):
-    # 固定八槽转圈可出现在暗色 TIPS 和白蓝渐变上；文字散点不能仅凭数量冒充加载。
 def confirm_native_startup_margin(epoch, first_time, offset_ms, report):
     # 按实际首条触控和当前时钟检查交接，计入首 Flick 提前量和冻结的手动偏移。
     first_target = float(epoch + first_time + offset_ms / 1000)
@@ -50,6 +50,12 @@ def confirm_native_startup_margin(epoch, first_time, offset_ms, report):
         raise RuntimeError("首音实际启动余量不足，拒绝从歌曲中途开始")
 
 
+def settlement_loading(frame):
+    # 渐变空场没有转圈也可能仍在加载，极少孤立像素不能作为可操作界面的前景证明。
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if cv2.countNonZero(cv2.Canny(gray, 80, 160)) <= frame.shape[0] * frame.shape[1] // 10000:
+        return True
+    # 固定八槽转圈可出现在暗色 TIPS 和白蓝渐变上；文字散点不能仅凭数量冒充加载。
     crop = cv2.cvtColor(frame[618:710, 1185:1269], cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(crop, (0, 0, 235), (179, 50, 255))
     slots = ((36, 15), (56, 23), (64, 43), (56, 63),
@@ -146,7 +152,7 @@ class SoloLive:
             # 标题文字会淡入，模板可能被透明度干扰；在未知页面用文字复核一次。
             title = self.ocr.read(frame, (529, 599, 752, 637))
             if title.confidence >= .8 and normalize_title(title.text) == "taptostart":
-                raise RuntimeError("游戏已返回 TAP TO START 标题页，停止结算返回")
+                raise TitleScreenDetected(frame)
         return frame
 
     def native_observation_options(self, directory, *, observer=None):
@@ -477,21 +483,33 @@ class SoloLive:
         if original is None:
             raise RuntimeError("每局体力消耗数字未稳定确认，拒绝调整和开演")
         target = original if consumption == "current" else consumption
+        bonus = report["bonus"] = {"requested_consumption": consumption, "consumption": target,
+                                   "confirmed": False, "readings": [], "original_consumption": original,
+                                   "verification": []}
         # 沿用模式不调整滑条；指定数量只按用户设置调整，不因体力不足改成零或更小的数。
         if original != target:
             self.adjust_bonus_count(target, frame)
         readings = []
-        for _ in range(2):
+        for _ in range(12):
             frame = self.screenshot()
-            value, reading = self.read_bonus(frame)
-            if value != target:
-                raise RuntimeError(f"未确认用户指定的 {target} 体力消耗，拒绝开演")
-            readings.append(asdict(reading))
+            try:
+                value, reading = self.read_bonus(frame)
+            except ValueError as error:
+                bonus["verification"].append({"error": str(error)})
+                readings = []
+                self.pause(.2)
+                continue
+            bonus["verification"].append({"value": value, "reading": asdict(reading)})
+            # 滑条动画可能短暂回显旧值；只等连续两帧目标值，不重复调整或保存未确认设置。
+            readings = [*readings, asdict(reading)] if value == target else []
+            if len(readings) == 2:
+                break
             self.pause(.12)
+        else:
+            raise RuntimeError(f"未确认用户指定的 {target} 体力消耗，拒绝开演")
         if save_bonus_image:
             write_image(directory / "bonus.png", frame)
-        report["bonus"] = {"requested_consumption": consumption, "consumption": target,
-                           "confirmed": False, "readings": readings, "original_consumption": original}
+        bonus["readings"] = readings
         self.navigator.tap(762, 655, f"保存 {target} 体力消耗")
         frame = self.navigator.wait(return_page)
         # 菜单读数只证明当前选择；保存回执和实际返回成功之后才可缓存或宣称设置保留。
@@ -807,6 +825,8 @@ class SoloLive:
                        "chart_bound_head_guard": getattr(anchor, "chart_bound_head_guard", False) is True,
                        "trace_opening_head_guard": getattr(anchor, "trace_opening_head_guard", False) is True,
                        "gold_tap_mixed_context_guard": getattr(anchor, "gold_tap_mixed_context_guard", False) is True,
+                       "gold_tap_pair_guard": getattr(anchor, "gold_tap_pair_guard", False) is True,
+                       "gold_tap_single_follower_guard": getattr(anchor, "gold_tap_single_follower_guard", False) is True,
                        "legacy_first_head_seed": getattr(anchor, "legacy_first_head_seed", False) is True}
             tracker_status = getattr(getattr(anchor, 'chart_bound_tracker', None), 'status', None)
             if (attempt['chart_bound_head_guard'] or attempt['trace_opening_head_guard']
@@ -825,8 +845,6 @@ class SoloLive:
 
         def save_anchor_frames():
             # 开场尚未释放Native；这里只冻结引用，统一由run清理后的证据阶段编码。
-                       "gold_tap_pair_guard": getattr(anchor, "gold_tap_pair_guard", False) is True,
-                       "gold_tap_single_follower_guard": getattr(anchor, "gold_tap_single_follower_guard", False) is True,
             self.anchor_frames = retained_anchor_frames()
 
         frame = None
@@ -1040,7 +1058,9 @@ class SoloLive:
                     values[key] = self.read_optional_number(frame, box)
                 except ValueError:
                     values[key] = None
-            return LiveResult(**values)
+            result = LiveResult(**values)
+            result.to_dict()
+            return result
         except ValueError:
             return None
 
@@ -1437,6 +1457,45 @@ class SoloLive:
         return {'updated': asdict(updated), 'return_to_title': asdict(title),
                 'modal_box': [int(modal[0] + 220), int(modal[1] + 220), int(modal[2]), int(modal[3])]}
 
+    def recover_settlement_title(self, report, directory, error, deadline):
+        end = report.get('end_detection', {})
+        if (not input_finished(report) or report.get('phase') != 'settlement'
+                or end.get('input_and_release_complete') is not True or end.get('confirmation_frames', 0) < 2
+                or any(report.get(key) for key in ('death_confirmed', 'cancelled', 'release_error', 'playback_error'))):
+            raise error
+        self.navigator._check_stop()
+        if not title_screen_visible(error.frame, self.navigator):
+            raise error
+        # 首帧标题只阻止 BACK，间隔后的第二张明确标题才可复用登录服务；不重放已经演完的谱面。
+        self.pause(min(.8, max(0., deadline - time.monotonic())))
+        self.navigator._check_stop()
+        if time.monotonic() >= deadline:
+            raise TimeoutError('结算返回超时')
+        fresh = self.device.screenshot()
+        self.navigator._check_stop()
+        if not title_screen_visible(fresh, self.navigator):
+            return self.check_observation_frame(fresh)
+        recovery = report.setdefault('settlement_login', {'status': 'waiting', 'title_error': str(error),
+                                                        'confirmation_frames': 2})
+        write_image(directory / 'settlement-title-first.png', error.frame)
+        write_image(directory / 'settlement-title-confirmed.png', fresh)
+        if getattr(self, '_settlement_login_report', None) is not report:
+            self._settlement_login_report = report
+            self.settlement_login = GameLogin(
+                self.device, self.navigator, self.report_root.parent / 'game-login-runs',
+                stop_requested=self.stop_requested, log_message=self.log, ocr=self.ocr)
+        try:
+            self.log('结算后确认登录页，停止 BACK 并登录，回主页后计入已演出次数')
+            outcome = self.settlement_login.run(wait_for_home=True, resume=True, deadline=deadline)
+            recovery.update(status='home_confirmed', report=outcome)
+        except Exception as login_error:
+            recovery.update(status='failed', error=f'{type(login_error).__name__}: {login_error}',
+                            report=getattr(self.settlement_login, 'report', {}))
+            raise
+        self.navigator._check_stop()
+        # 登录服务的回执后仍获取实际主页，不以标题消失代替本局的返回证明。
+        return self.check_observation_frame(self.device.screenshot())
+
     def collect(self, report: dict, directory: Path):
         deadline = time.monotonic() + 120
         completed = False
@@ -1447,10 +1506,17 @@ class SoloLive:
         settlement_index = 0
         result_observation_deadline = None
         transition_started_at = None
+        transition_wait = None
         settlement_banner = False
         result_page_seen = False
         date_frames = []
         end_guard = LiveEndGuard(self.navigator, report, life_seen=getattr(getattr(self, "life_guard", None), "hud_seen", False))
+
+        def settlement_screenshot():
+            try:
+                return self.screenshot()
+            except TitleScreenDetected as error:
+                return self.recover_settlement_title(report, directory, error, deadline)
 
         def inspect_date_update(frame):
             if not release_finished({**report, 'playback': report.get('playback') or {}}):
@@ -1496,7 +1562,9 @@ class SoloLive:
                 write_image(directory / "live-failed.png", frame)
             # 标签来自本帧既有 OCR；数字尚未就绪也能证明已到成绩页，不沿用上一帧或上一局标记。
             self._result_label_visible = False
-            candidate = self.read_result(frame)
+            candidate = None
+            if result is None and (result_observation_deadline is None or time.monotonic() < result_observation_deadline):
+                candidate = self.read_result(frame)
             result_page_seen = result_page_seen or self._result_label_visible or candidate is not None
             if candidate is not None:
                 stable = stable + 1 if candidate == last_candidate else 1
@@ -1519,24 +1587,30 @@ class SoloLive:
                 return False
             if result_observation_deadline is None:
                 if not result_page_seen:
-                    # 已结束后的漫画等未知转场只受整段120秒期限约束，不能先耗尽成绩数字预算。
-                    if completed or failed or end_guard.ended:
-                        self.pause(.3)
-                        return True
                     return False
                 # 仅本次实际成绩标签或候选启动一次；标签淡出、未知重现都不能重新计时。
-                result_observation_deadline = time.monotonic() + 3.
+                result_observation_deadline = time.monotonic() + 8.
             if time.monotonic() < result_observation_deadline:
-                self.pause(.3)
+                self.pause(.2)
                 return True
             return False
 
         def wait_for_transition(frame):
-            nonlocal transition_started_at, result_observation_deadline
+            nonlocal transition_started_at, result_observation_deadline, transition_wait
             blank = blank_transition(frame)
             if blank or settlement_loading(frame):
                 if transition_started_at is None:
                     transition_started_at = time.monotonic()
+                    transition_wait = {"started_s": transition_started_at, "samples": 0}
+                    waits = report.setdefault("settlement_transition_waits", [])
+                    if len(waits) < 16:
+                        waits.append(transition_wait)
+                        if release_finished(report):
+                            name = f"settlement-transition-{len(waits):02d}.png"
+                            write_image(directory / name, frame)
+                            transition_wait["frame"] = name
+                transition_wait["samples"] += 1
+                transition_wait["last_seen_s"] = time.monotonic()
                 # 加载不是有效结束帧，也不能消耗成绩数字的剩余观察时间。
                 # 保留原黑白转场策略；固定转圈同样中断连续的 HUD 消失证明。
                 if blank:
@@ -1548,13 +1622,14 @@ class SoloLive:
                 self.pause(.3)
                 return True
             if transition_started_at is not None:
+                transition_wait["finished_s"] = time.monotonic()
                 if result_observation_deadline is not None:
                     result_observation_deadline += time.monotonic() - transition_started_at
                 transition_started_at = None
             return False
 
         while time.monotonic() < deadline:
-            frame = self.screenshot()
+            frame = settlement_screenshot()
             if inspect_date_update(frame):
                 continue
             if wait_for_transition(frame):
@@ -1593,30 +1668,33 @@ class SoloLive:
             # 未完整读出的成绩先共用有界观察，耗尽后仍保留实际数据及原未读全警告。
             if wait_for_result_digits(frame):
                 continue
-            require_current_release()
-            self.device.tap(1279, 719)
-            # 奖励退出动画会先显示模糊主页；留出切换时间后再读，避免旧帧诱发多余 BACK。
-            self.pause(1.2)
-            confirmation = self.screenshot()
+            # 协力的返回周期还包含一秒等待与新帧复查，不能只保留 BACK 后的0.8秒。
+            step = {"wait_started_s": time.monotonic()}
+            return_timing = report.setdefault("settlement_return_timing", [])
+            if len(return_timing) < 80:
+                return_timing.append(step)
+            self.pause(min(1., max(0., deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                break
+            confirmation = settlement_screenshot()
+            step["rechecked_at_s"] = time.monotonic()
             if inspect_date_update(confirmation):
                 continue
             if wait_for_transition(confirmation):
                 continue
-            # 判定页也可能在这张复查帧才出现，先取得两帧数字再返回。
             inspect_settlement(confirmation)
             if wait_for_result_digits(confirmation):
                 continue
-            # 动画加速点击可能已切换到主页；必须重新检查后才能发送 BACK。
             if self.navigator.match(confirmation, "home")[0] >= self.navigator.threshold:
+                step["home_confirmed"] = True
                 continue
             if self.navigator.match(confirmation, "playing")[0] >= self.navigator.threshold:
                 continue
-            if np.mean(confirmation.max(axis=2) < 15) > .95:
-                self.pause(.6)
-                continue
             require_current_release()
+            step["back_started_s"] = time.monotonic()
             self.device.back()
-            self.pause(1.0)
+            step["back_finished_s"] = time.monotonic()
+            self.pause(.8)
         raise TimeoutError("结算返回超时")
 
     def run(self, count: int, difficulty: str, song_mode: str, offset_ms: int = 0, *,
@@ -1900,7 +1978,7 @@ class SoloLive:
             self.performed_rounds += 1
             if report.get("completed"):
                 self.completed_rounds += 1
-            self.log(f"单人谱面演出：已完成 {self.completed_rounds} / 总数 {count}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
+            self.log(f"单人谱面演出：已完成 {self.performed_rounds} / 总数 {count}；完整成绩 {self.completed_rounds}；{("报告 " + directory.name) if enabled() else "本局未写入日志"}")
             if report.get("settlement_warning"):
                 self.log(f"{report['settlement_warning']}；已演出 {round_index}/{count}，完整记录 {self.completed_rounds}")
             if report.get("judgements"):

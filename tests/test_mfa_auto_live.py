@@ -111,10 +111,24 @@ class SongSelectionTests(unittest.TestCase):
 
 
 class StableLiveMenuTests(unittest.TestCase):
+    def test_confirmed_home_retries_ignored_live_entry_within_original_deadline(self):
+        navigator, clock, frames = self.navigator(())
+        home = np.full((720, 1280, 3), 110, np.uint8)
+        navigator.match = lambda frame, name, area=None: (
+            float((frame is home and name == 'home') or (frame is frames['menu'] and name == 'live_menu')),
+            (0, 0))
+        navigator.device.screenshot.side_effect = lambda: frames['menu'] if navigator.device.tap.called else home
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)):
+            self.assertIs(navigator.wait_stable_live_menu(), frames['menu'])
+        navigator.device.tap.assert_called_once_with(1194, 649)
+        self.assertLess(clock.now, 20.)
+
     def navigator(self, pages, *, stop_at=None):
         navigator = Navigator.__new__(Navigator)
         clock = SimpleNamespace(now=0.)
         navigator.threshold = .83
+        navigator.dry_run = False
         navigator.templates = {name: None for name in ('live_menu', 'home', 'song_select', 'prepare', 'playing', 'life_hud')}
         navigator.device = Mock()
         frames = {name: np.full((720, 1280, 3), index + 80, np.uint8)
@@ -139,6 +153,19 @@ class StableLiveMenuTests(unittest.TestCase):
         self.assertGreaterEqual(clock.now, .8)
         self.assertEqual(navigator.device.screenshot.call_count, 2)
         navigator.device.tap.assert_not_called()
+
+    def test_ignored_home_entry_has_only_two_retries_without_extending_deadline(self):
+        navigator, clock, _ = self.navigator(())
+        home = np.full((720, 1280, 3), 110, np.uint8)
+        navigator.device.screenshot.return_value = home
+        navigator.device.screenshot.side_effect = None
+        navigator.match = lambda frame, name, area=None: (float(name == 'home'), (0, 0))
+        with patch('project_sekai.navigator.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.navigator.time.sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)), \
+                self.assertRaises(TimeoutError):
+            navigator.wait_stable_live_menu(timeout=20.)
+        self.assertEqual(navigator.device.tap.call_count, 2)
+        self.assertLessEqual(clock.now, 20.)
 
     def test_unknown_frame_resets_stability_and_stop_interrupts_before_input(self):
         navigator, clock, _ = self.navigator(('menu', 'unknown', 'menu', 'menu'))
@@ -315,7 +342,7 @@ class ZeroBonusPreparationTests(unittest.TestCase):
         self.navigator.config_path = Path('unused-config.json')
         self.navigator.bonus_ocr = Mock()
         self.navigator.bonus_ocr.read.side_effect = [Reading('ライブボーナス消費', .99),
-            Reading('消費量を設定します', .99), Reading('7', .99), Reading('6', .99)]
+            Reading('消費量を設定します', .99), Reading('7', .99), *[Reading('6', .99)] * 12]
         with patch('project_sekai.navigator.time.sleep'), self.assertRaisesRegex(RuntimeError, '未确认用户指定'):
             self.navigator.current_bonus_consumption()
         self.assertNotIn((762, 655), self.taps)

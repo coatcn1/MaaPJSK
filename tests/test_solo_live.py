@@ -802,6 +802,15 @@ class SoloTests(unittest.TestCase):
         self.assertEqual(title_score('R','R'),1)
         self.assertLess(title_score('RANDOM','R'),.82)
 
+    def test_all_zero_judgements_are_unreadable_and_do_not_abort_collection(self):
+        workflow = SoloLive.__new__(SoloLive)
+        workflow.ocr = Mock()
+        workflow.ocr.read.return_value = Reading('PERFECT', .99)
+        workflow.read_judgement_number = Mock(return_value=0)
+        workflow.read_optional_number = Mock(return_value=None)
+        self.assertIsNone(workflow.read_result(np.zeros((720, 1280, 3), np.uint8)))
+
+
     def test_opening_white_text_keeps_small_japanese_voicing_marks(self):
         matcher = SongMatcher.__new__(SongMatcher)
         matcher.ocr = Mock()
@@ -850,6 +859,10 @@ class SoloTests(unittest.TestCase):
 
     def _collection(self, sequence, clear, failed, judge):
         workflow = SoloLive.__new__(SoloLive)
+        # 模拟可操作页面保留前景控件，纯色本身属于空帧，不能再用来冒充完整界面。
+        for frame in sequence:
+            if isinstance(frame, np.ndarray) and 0 < frame.min() == frame.max() < 255:
+                cv2.rectangle(frame, (10, 10), (180, 35), (0, 0, 0), -1)
         workflow.device = Mock()
         workflow.navigator = SimpleNamespace(threshold=.83,templates={'live_failed':None})
         workflow.navigator.match=lambda frame,name,*args: (1.0 if (name=='home' and frame is sequence[-1]) or
@@ -893,14 +906,14 @@ class SoloTests(unittest.TestCase):
         workflow.device.back.assert_not_called()
         self.assertFalse(report.get('requires_relogin', False))
 
-    def test_date_update_on_post_animation_confirmation_never_sends_back(self):
+    def test_date_update_after_first_back_stops_further_returns(self):
         clear, first, second = [np.full((720, 1280, 3), value, np.uint8) for value in (130, 140, 150)]
         workflow = self._collection([clear, first, second], clear, None, None)
         workflow.date_update_notice = Mock(side_effect=[None, {'date': True}, {'date': True}])
         report = {'playback': {'release_confirmed': True}}
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, '需要重新登录'):
             workflow.collect(report, Path(directory))
-        workflow.device.tap.assert_called_once_with(1279, 719)
+        workflow.device.tap.assert_not_called()
         workflow.device.back.assert_not_called()
         self.assertTrue(report['requires_relogin'])
 
@@ -920,7 +933,7 @@ class SoloTests(unittest.TestCase):
                 self.assertFalse(report.get('returned_home', False))
                 self.assertEqual(report['playback_error'], 'RuntimeError: original ACK failure')
 
-    def test_collect_rechecks_release_before_back_after_safe_animation_tap(self):
+    def test_collect_rechecks_release_before_each_back(self):
         clear, other, home = [np.full((720, 1280, 3), value, np.uint8) for value in (140, 150, 160)]
         workflow = self._collection([clear, other, home], clear, None, None)
         report = {'engine': 'native', 'playback': {'release_confirmed': True, 'sent_actions': 1,
@@ -934,7 +947,7 @@ class SoloTests(unittest.TestCase):
         workflow.screenshot.side_effect = screenshot
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(RuntimeError, '严格触点释放'):
             workflow.collect(report, Path(directory))
-        workflow.device.tap.assert_called_once_with(1279, 719)
+        workflow.device.tap.assert_not_called()
         workflow.device.back.assert_not_called()
 
     def test_failed_banner_keeps_round_failed_after_reading_judgements(self):
@@ -973,6 +986,98 @@ class SoloTests(unittest.TestCase):
         self.assertEqual(report['result_status'], 'unreadable')
         self.assertIn('继续下一曲', report['settlement_warning'])
 
+    def test_settlement_uses_back_for_unclassified_pages_until_home(self):
+        clear, judge, other, home = [np.full((720, 1280, 3), value, np.uint8)
+                                    for value in (80, 100, 120, 140)]
+        workflow = self._collection([clear, judge, judge, other, other, home, home], clear, None, judge)
+        workflow.ocr = Mock()
+        workflow.ocr.read.side_effect = AssertionError('结算不增加奖励或升级页面 OCR')
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True},
+                  'chart': {'total_note_count': 259}}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['completed'])
+        self.assertTrue(report['returned_home'])
+        self.assertEqual(workflow.device.back.call_count, 1)
+        workflow.device.tap.assert_not_called()
+
+    def test_return_wait_rechecks_home_before_back_during_pending_transition(self):
+        transition, home = [np.full((720, 1280, 3), value, np.uint8) for value in (100, 140)]
+        workflow = self._collection([transition, home], None, None, None)
+        clock = SimpleNamespace(now=0.)
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.screenshot.side_effect = lambda: home if clock.now >= 1. else transition
+        workflow.device.back.side_effect = AssertionError('返回转场结束前必须先等待并复查主页')
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['returned_home'])
+        self.assertGreaterEqual(clock.now, 1.)
+        workflow.device.tap.assert_not_called()
+
+    def test_return_wait_preserves_full_cooperative_interval_between_backs(self):
+        other, home = [np.full((720, 1280, 3), value, np.uint8) for value in (100, 140)]
+        workflow = self._collection([other, home], None, None, None)
+        clock = SimpleNamespace(now=0., backs=[])
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.screenshot.side_effect = lambda: home if len(clock.backs) == 2 else other
+        workflow.device.back.side_effect = lambda: clock.backs.append(clock.now)
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertGreaterEqual(clock.backs[0], 1.)
+        self.assertGreaterEqual(clock.backs[1] - clock.backs[0], 1.8 - 1e-6)
+        self.assertTrue(report['returned_home'])
+
+
+    def test_unreadable_digits_stop_reading_after_budget_and_continue_home(self):
+        clear, label, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
+        workflow = self._collection([clear, label, home], clear, None, None)
+        clock = SimpleNamespace(now=0., last_digit_read=None)
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.screenshot.side_effect = lambda: home if workflow.device.back.called else label
+
+        def read_result(frame):
+            workflow._result_label_visible = frame is label
+            clock.last_digit_read = clock.now
+
+        workflow.read_result = read_result
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True},
+                  'chart': {'total_note_count': 259}}
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertLess(clock.last_digit_read, 8.)
+        self.assertEqual(report['result_status'], 'unreadable')
+        self.assertTrue(report['performance_completed'])
+        self.assertFalse(report['completed'])
+        self.assertNotIn('judgements', report)
+
+    def test_missing_result_page_returns_with_back_and_skips_record(self):
+        clear, rewards, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
+        workflow = self._collection([clear, rewards, home], clear, None, None)
+        clock = SimpleNamespace(now=0.)
+        workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+        workflow.screenshot.side_effect = lambda: home if workflow.device.back.called else rewards
+        guard = SimpleNamespace(ended=True, observe=lambda frame: None)
+        report = {'engine': 'legacy', 'playback': {'release_confirmed': True}}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), \
+                patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
+            workflow.collect(report, Path(directory))
+        self.assertTrue(report['performance_completed'])
+        self.assertEqual(report['result_status'], 'unreadable')
+        self.assertNotIn('judgements', report)
+        self.assertLess(clock.now, 5.)
+
     def test_result_note_mismatch_preserves_numbers_without_stopping(self):
         clear, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (80, 100, 120)]
         workflow = self._collection([clear, judge, judge, home, home], clear, None, judge)
@@ -984,17 +1089,17 @@ class SoloTests(unittest.TestCase):
         self.assertEqual(report['result_status'], 'note_count_mismatch')
         self.assertTrue(report['returned_home'])
 
-    def test_home_after_animation_tap_prevents_another_back(self):
+    def test_home_stops_repeated_back_returns(self):
         clear,judge,other,home=[np.full((720,1280,3),value,np.uint8) for value in [180,190,200,210]]
         workflow=self._collection([clear,other,judge,judge,home,home],clear,None,judge)
         report={'engine':'legacy','playback':{'release_confirmed':True},'chart':{'total_note_count':259}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report,Path(directory))
         self.assertTrue(report['completed'])
-        self.assertEqual(workflow.device.back.call_count,0)
-        self.assertEqual(workflow.device.tap.call_args.args,(1279,719))
+        self.assertEqual(workflow.device.back.call_count,1)
+        workflow.device.tap.assert_not_called()
 
-    def test_judgement_page_arriving_in_confirmation_frame_is_read_before_back(self):
+    def test_judgement_page_after_back_is_read_before_next_back(self):
         clear,judge,home=[np.full((720,1280,3),value,np.uint8) for value in [180,190,210]]
         workflow=self._collection([clear,judge,judge,home,home],clear,None,judge)
         report={'engine':'legacy','playback':{'release_confirmed':True},'chart':{'total_note_count':259}}
@@ -1023,13 +1128,13 @@ class SoloTests(unittest.TestCase):
             workflow.collect(report, Path(directory))
         self.assertTrue(report['completed'])
 
-    def test_late_digits_after_animation_tap_are_observed_before_back(self):
+    def test_late_digits_after_unknown_pages_are_observed_before_next_back(self):
         clear, unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8) for value in (130, 150, 170, 190)]
         workflow = self._collection([clear, unknown, unknown, judge, judge, home, home], clear, None, judge)
         reads = []
         original_read = workflow.read_result
         workflow.read_result = lambda frame: (reads.append(frame), original_read(frame))[1]
-        workflow.device.back.side_effect = lambda: self.assertGreaterEqual(sum(frame is judge for frame in reads), 2)
+        workflow.device.back.side_effect = lambda: self.assertTrue(not reads or reads[-1] is not judge or sum(frame is judge for frame in reads) >= 2)
         report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
         with tempfile.TemporaryDirectory() as directory:
             workflow.collect(report, Path(directory))
@@ -1051,7 +1156,7 @@ class SoloTests(unittest.TestCase):
                 clock.judge_reads += 1
                 return LiveResult(250, 5, 2, 1, 1)
         def input_gate(*args):
-            if any(clock.current is frame for frame in (comic, label, judge)):
+            if any(clock.current is frame for frame in (label, judge)):
                 self.assertGreaterEqual(clock.judge_reads, 2, '漫画及成绩淡入不能耗尽真正数字页预算')
         workflow.screenshot.side_effect = screenshot
         workflow.read_result = read_result
@@ -1080,9 +1185,9 @@ class SoloTests(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, '结算返回超时'):
                 workflow.collect(report, Path(directory))
         self.assertGreaterEqual(clock.now, 120.)
-        self.assertLess(clock.now, 120.4)
-        workflow.device.tap.assert_called_once_with(1279, 719)
-        workflow.device.back.assert_not_called()
+        self.assertLess(clock.now, 120.9)
+        workflow.device.tap.assert_not_called()
+        self.assertGreater(workflow.device.back.call_count, 0)
         self.assertNotIn('judgements', report)
         self.assertNotIn('returned_home', report)
 
@@ -1092,19 +1197,19 @@ class SoloTests(unittest.TestCase):
         clock = SimpleNamespace(now=0., reads=0)
         def screenshot():
             clock.reads += 1
-            self.assertLess(clock.reads, 25)
-            return home if workflow.device.back.called else clear if clock.reads == 1 else label
+            self.assertLess(clock.reads, 75)
+            return home if workflow.device.back.call_count >= 2 else clear if clock.reads == 1 else label
         workflow.read_result = lambda frame: setattr(workflow, '_result_label_visible', frame is label)
         workflow.screenshot.side_effect = screenshot
         workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
         report = {'engine': 'legacy', 'playback': {'release_confirmed': True}, 'chart': {'total_note_count': 259}}
         with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now):
             workflow.collect(report, Path(directory))
-        self.assertGreaterEqual(clock.now, 4.2)
-        self.assertLess(clock.now, 10.)
+        self.assertGreaterEqual(clock.now, 8.8)
+        self.assertLess(clock.now, 14.)
         self.assertFalse(report['completed'])
         self.assertEqual(report['result_status'], 'unreadable')
-        workflow.device.back.assert_called_once()
+        self.assertEqual(workflow.device.back.call_count, 2)
 
     def test_tips_cannot_spend_digit_budget_before_clear_in_either_collection_path(self):
         for confirmation in (False, True):
@@ -1125,7 +1230,7 @@ class SoloTests(unittest.TestCase):
                         clock.judge_reads += 1
                         return LiveResult(250, 5, 2, 1, 1)
                 def input_gate(*args):
-                    if clock.current is unknown or clock.current is judge:
+                    if clock.current is judge:
                         self.assertGreaterEqual(clock.judge_reads, 2, 'TIPS 不能耗尽后续成绩数字的观察机会')
                 workflow.screenshot.side_effect = screenshot
                 workflow.read_result = read_result
@@ -1191,12 +1296,12 @@ class SoloTests(unittest.TestCase):
             workflow._result_label_visible = frame is page and clock.reads % 2 == 1
         workflow.read_result = read_result
         workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
-        workflow.device.tap.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
+        workflow.device.back.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
         guard = SimpleNamespace(ended=True, observe=lambda frame: None)
         with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
             workflow.collect({'playback': {'release_confirmed': True}}, Path(directory))
-        self.assertGreaterEqual(clock.tap_at, 3.)
-        self.assertLess(clock.tap_at, 3.6)
+        self.assertGreaterEqual(clock.tap_at, 9.)
+        self.assertLess(clock.tap_at, 9.6)
         workflow.device.back.assert_called_once()
 
     @staticmethod
@@ -1211,7 +1316,7 @@ class SoloTests(unittest.TestCase):
             cv2.circle(frame, (1185 + x, 618 + y), 3, (255, 255, 255), -1)
         return frame
 
-    def test_settlement_loading_requires_distinct_fixed_spinner_slots(self):
+    def test_settlement_loading_distinguishes_ui_from_empty_and_spinner(self):
         from project_sekai.solo_live import settlement_loading
         self.assertTrue(settlement_loading(self._settlement_loading_frame()))
         self.assertTrue(settlement_loading(self._settlement_loading_frame(light=True, slots=5)))
@@ -1220,10 +1325,60 @@ class SoloTests(unittest.TestCase):
         cv2.putText(text, '123456', (1186, 666), cv2.FONT_HERSHEY_SIMPLEX, .35, (255, 255, 255), 1)
         home, playing = [np.full((720, 1280, 3), value, np.uint8) for value in (150, 65)]
         cv2.rectangle(playing, (1008, 40), (1176, 47), (0, 255, 0), -1)
-        for frame in (text, home, playing, np.zeros_like(text), np.full_like(text, 255)):
+        for frame in (text, home, playing):
+            cv2.rectangle(frame, (10, 10), (180, 35), (255, 255, 255), -1)
+            cv2.rectangle(frame, (12, 12), (100, 30), (0, 0, 0), -1)
             self.assertFalse(settlement_loading(frame))
+        for frame in (np.zeros_like(text), np.full_like(text, 255)):
+            self.assertTrue(settlement_loading(frame))
 
-    def test_loading_in_both_collection_paths_waits_without_reading_or_input(self):
+    def test_smooth_settlement_background_without_spinner_is_loading(self):
+        from project_sekai.solo_live import settlement_loading
+        from project_sekai.live_end import blank_transition
+        frame = self._settlement_loading_frame(light=True, slots=0)
+        self.assertFalse(blank_transition(frame))
+        self.assertTrue(settlement_loading(frame))
+        frame[200, 200] = 0
+        self.assertTrue(settlement_loading(frame))
+
+    def test_delayed_home_transition_never_receives_another_back(self):
+        for loading_seconds in (3.2, 8., 20.):
+            with self.subTest(loading_seconds=loading_seconds):
+                rewards, home = [np.full((720, 1280, 3), value, np.uint8) for value in (100, 140)]
+                empty = self._settlement_loading_frame(light=True, slots=0)
+                workflow = self._collection([rewards, empty, home], rewards, None, None)
+                clock = SimpleNamespace(now=0., started=None, current=None)
+                workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+
+                def screenshot():
+                    if clock.started is None:
+                        clock.current = rewards
+                    elif clock.now - clock.started < loading_seconds:
+                        clock.current = empty
+                    else:
+                        clock.current = home
+                    return clock.current
+
+                def back():
+                    self.assertIsNot(clock.current, empty, '空转场中的 BACK 会触发游戏退出确认')
+                    clock.started = clock.now
+
+                workflow.screenshot.side_effect = screenshot
+                workflow.device.back.side_effect = back
+                workflow.life_guard = SimpleNamespace(hud_seen=True)
+                workflow.read_result = Mock(return_value=None)
+                report = {'engine': 'legacy', 'playback': {
+                    'planned_actions': 4, 'sent_actions': 4, 'release_confirmed': True}}
+                with tempfile.TemporaryDirectory() as directory, \
+                        patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now):
+                    workflow.collect(report, Path(directory))
+                workflow.device.back.assert_called_once()
+                self.assertTrue(report['returned_home'])
+                self.assertTrue(report['performance_completed'])
+                self.assertEqual(report['result_status'], 'unreadable')
+                self.assertFalse(any(call.args[0] is empty for call in workflow.read_result.call_args_list))
+
+    def test_loading_before_result_waits_without_reading_or_input(self):
         for confirmation in (False, True):
             with self.subTest(confirmation=confirmation):
                 clear, unknown, judge, home = [np.full((720, 1280, 3), value, np.uint8)
@@ -1231,7 +1386,12 @@ class SoloTests(unittest.TestCase):
                 loading = [self._settlement_loading_frame(light=bool(index % 2)) for index in range(16)]
                 sequence = ([clear] if confirmation else [unknown]) + loading + [judge, judge, home, home]
                 workflow = self._collection(sequence, clear, None, judge)
-                clock = SimpleNamespace(now=0., read_judges=0)
+                clock = SimpleNamespace(now=0., read_judges=0, current=None)
+                frames = iter(sequence)
+                def screenshot():
+                    clock.current = next(frames)
+                    return clock.current
+                workflow.screenshot.side_effect = screenshot
                 def read_result(frame):
                     self.assertFalse(any(frame is image for image in loading), '加载页不能读取判定或推进结算')
                     workflow._result_label_visible = frame is unknown
@@ -1241,10 +1401,11 @@ class SoloTests(unittest.TestCase):
                 workflow.read_result = read_result
                 workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
                 def input_gate(*args):
-                    if not (confirmation and workflow.device.tap.call_count == 1):
+                    self.assertFalse(any(clock.current is image for image in loading))
+                    if clock.current is judge:
                         self.assertGreaterEqual(clock.read_judges, 2)
                 workflow.device.tap.side_effect = input_gate
-                workflow.device.back.side_effect = lambda: self.assertGreaterEqual(clock.read_judges, 2)
+                workflow.device.back.side_effect = input_gate
                 report = {'engine': 'legacy', 'playback': {'release_confirmed': True},
                           'chart': {'total_note_count': 259}}
                 guard = SimpleNamespace(ended=True, observe=lambda frame: None)
@@ -1262,14 +1423,14 @@ class SoloTests(unittest.TestCase):
         workflow.pause = lambda seconds: setattr(clock, 'now', clock.now + seconds)
         workflow.screenshot.side_effect = lambda: (home if workflow.device.back.called else
             loading if .6 <= clock.now < 4.8 else unknown)
-        workflow.device.tap.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
+        workflow.device.back.side_effect = lambda *args: setattr(clock, 'tap_at', clock.now)
         report = {'engine': 'legacy', 'playback': {'release_confirmed': True}}
         guard = SimpleNamespace(ended=True, observe=lambda frame: None)
         guard.observe = lambda frame: setattr(guard, 'ended', True)
         with tempfile.TemporaryDirectory() as directory, patch('project_sekai.solo_live.time.monotonic', side_effect=lambda: clock.now), patch('project_sekai.solo_live.LiveEndGuard', return_value=guard):
             workflow.collect(report, Path(directory))
-        self.assertGreaterEqual(clock.tap_at, 7.2 - 1e-6)
-        self.assertLess(clock.tap_at, 7.8)
+        self.assertGreaterEqual(clock.tap_at, 13.2 - 1e-6)
+        self.assertLess(clock.tap_at, 13.9)
         self.assertEqual(report['result_status'], 'unreadable')
 
     def test_loading_does_not_extend_collection_deadline_or_hide_stop_or_title(self):
@@ -1465,6 +1626,17 @@ class SoloTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'未确认用户指定'):
                 workflow.prepare_bonus(3,{},Path(directory))
         self.assertNotIn((762,655),[call.args[:2] for call in workflow.navigator.tap.call_args_list])
+
+    def test_consumption_confirmation_waits_for_two_target_frames_after_animation(self):
+        workflow = self._bonus_workflow(5)
+        workflow.read_bonus.side_effect = [(value, Reading(str(value), .99)) for value in (5, 0, 2, 0, 0)]
+        report = {}
+        with tempfile.TemporaryDirectory() as directory:
+            workflow.prepare_bonus(0, report, Path(directory))
+        self.assertTrue(report['bonus']['confirmed'])
+        self.assertEqual(len(report['bonus']['readings']), 2)
+        self.assertEqual([item['value'] for item in report['bonus']['verification']], [0, 2, 0, 0])
+        self.assertEqual(workflow.adjust_bonus_count.call_count, 1)
 
     def test_task_snapshot_is_not_cached_after_setting_save_failure(self):
         for failure in ('save_request', 'return_page'):
@@ -1794,14 +1966,36 @@ class SoloTests(unittest.TestCase):
             def log(message):
                 if '已完成 1' in message:
                     self.assertTrue(Path(workflow.last_report['report_path']).is_file())
-                    self.assertTrue((workflow.report_root / 'results.csv').is_file())
+                    if workflow.last_report.get('judgements'):
+                        self.assertTrue((workflow.report_root / 'results.csv').is_file())
 
             workflow.log = Mock(side_effect=log)
             reports = workflow.run(2, 'easy', 'current')
         self.assertEqual(workflow.play.call_count, 2)
         self.assertEqual(workflow.completed_rounds, 1)
+        self.assertEqual(workflow.performed_rounds, 2)
+        self.assertTrue(any('已完成 1 / 总数 2；完整成绩 0' in call.args[0]
+                            for call in workflow.log.call_args_list))
+        self.assertTrue(any('已完成 2 / 总数 2；完整成绩 1' in call.args[0]
+                            for call in workflow.log.call_args_list))
         self.assertFalse(reports[0]['completed'])
         self.assertTrue(reports[1]['completed'])
+
+    def test_agent_failure_progress_uses_performed_rounds_when_scores_are_unreadable(self):
+        context = SimpleNamespace(tasker=SimpleNamespace(stopping=False))
+        argv = SimpleNamespace(task_detail=SimpleNamespace(task_id=31), custom_action_param='')
+        workflow = SimpleNamespace(performed_rounds=4, completed_rounds=0, last_report={},
+                                   run=Mock(side_effect=RuntimeError('下一局连接失败')))
+        settings = {'difficulty': 'master', 'song_mode': 'current', 'count': 5, 'recovery_mode': 'off'}
+        performance = SimpleNamespace(engine='legacy', touch_offset_ms=-51, bonus_consumption=5)
+        with patch.dict(agent._SETTINGS, {31: settings}), \
+                patch.object(agent, 'load_performance', return_value=performance), \
+                patch.object(agent, 'create_workflow', return_value=workflow), \
+                patch.object(agent, 'attach_failure_summary', return_value=None), \
+                patch.object(agent, 'finish_failure_summary', return_value=True), \
+                patch.object(agent, 'visible_log') as log, patch.object(agent.traceback, 'print_exc'):
+            self.assertFalse(agent.ProjectSekaiSoloLive().run(context, argv))
+        self.assertTrue(any('中止：已完成 4 / 总数 5' in call.args[1] for call in log.call_args_list))
 
     def test_start_detects_two_preplay_zero_frames_without_extra_capture_or_ocr(self):
         frame = np.full((720, 1280, 3), 50, np.uint8)

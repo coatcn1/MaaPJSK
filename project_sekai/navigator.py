@@ -13,6 +13,7 @@ from .device import AdbDevice
 from .chart_catalog import _write_json
 from .ocr import LineOcr, Reading
 from .live_end import blank_transition, LIFE_HUD_AREA
+from .title_screen import TitleScreenDetected, title_screen_visible
 
 
 def recovery_bottles(mode: str, available: int, consumption: int) -> int:
@@ -105,6 +106,8 @@ class Navigator:
     def wait_stable_live_menu(self, timeout: float = 20) -> np.ndarray:
         deadline = time.monotonic() + timeout
         first_seen = None
+        home_seen = None
+        entry_retries = 0
         frame = None
         while time.monotonic() < deadline:
             self._check_stop()
@@ -119,10 +122,26 @@ class Navigator:
             if safe:
                 if first_seen is not None and time.monotonic() - first_seen >= .8:
                     return frame
-                first_seen = time.monotonic()
+                if first_seen is None:
+                    first_seen = time.monotonic()
+                home_seen = None
             else:
                 first_seen = None
-            # 菜单模板可早于可点击状态出现；在同一期限内等新帧稳定，取消保持优先，不补点入口。
+                home = (not blank_transition(frame) and self.match(frame, 'home')[0] >= self.threshold
+                        and not any(name in self.templates and self.match(frame, name)[0] >= self.threshold
+                                    for name in ('live_menu', 'song_select', 'prepare', 'playing'))
+                        and not ('life_hud' in self.templates
+                                 and self.match(frame, 'life_hud', LIFE_HUD_AREA)[0] >= self.threshold))
+                if not home:
+                    home_seen = None
+                elif home_seen is None:
+                    home_seen = time.monotonic()
+                elif time.monotonic() - home_seen >= .8 and entry_retries < 2:
+                    # 入口点击可能被主页动画吞掉；仅两张间隔新帧仍为唯一主页时有限重试。
+                    entry_retries += 1
+                    self.tap(1194, 649, f'主页 Live 重试 {entry_retries}/2')
+                    home_seen = None
+            # 菜单模板可早于可点击状态出现；稳定检查和入口重试共用期限，未知页只等待。
             until = min(deadline, time.monotonic() + .8)
             while time.monotonic() < until:
                 self._check_stop()
@@ -131,10 +150,10 @@ class Navigator:
         raise TimeoutError('单人 Live 菜单未取得间隔0.8秒的安全稳定新帧')
 
     def _check_title_screen(self, frame: np.ndarray) -> None:
-        # 返回标题页后无法确认本局结果，继续 ESC 既不能登录，也不能可靠地增加完成次数。
-        if "title_screen" in self.templates and self.match(frame, "title_screen")[0] >= self.threshold:
+        # 标题页禁止继续 ESC；只有已完成输入、释放和结算门槛的调用方可以接管重登。
+        if title_screen_visible(frame, self):
             self._save_failure(frame, "unexpected_title")
-            raise RuntimeError("游戏已返回 TAP TO START 标题页，无法确认演出结果；停止 ESC 返回，完成次数保持不变")
+            raise TitleScreenDetected(frame)
 
     def _save_failure(self, frame: np.ndarray, name: str) -> None:
         destination = self.config_path.parent / f"failure-{name}.png"
